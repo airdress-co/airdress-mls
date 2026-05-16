@@ -1,6 +1,6 @@
 [package]
 name = "airdress-mls-ffi"
-version = "0.1.1-alpha.15"
+version = "0.1.1-alpha.16"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
