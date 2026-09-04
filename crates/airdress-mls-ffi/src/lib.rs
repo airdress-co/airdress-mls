@@ -12,6 +12,7 @@
 //! CS3 (`MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519`) — same as
 //! the operator's `agent/mls.rs`.
 
+pub mod canonical;
 mod engine;
 
 // The FFI layer requires unsafe at the C boundary, but the engine

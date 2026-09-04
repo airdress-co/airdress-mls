@@ -1,0 +1,176 @@
+{
+  "description": "Delegation canonicalization test vectors shared between airdress-common (operator side) and airdress-mls-ffi (client side). canonical_b64url is the exact Ed25519 signing input: the delegation object minus its top-level signature field, object keys sorted at every nesting level (RFC 8785 subset; serde_json default formatting).",
+  "vectors": [
+    {
+      "canonical_b64url": "eyJhaXJkcmVzcyI6ImFsaWNlLmh1bWFucy5haXJkcmVzcy5jbyIsImRldmljZV9sYWJlbCI6IkFsaWNlJ3MgaVBob25lIiwiZGV2aWNlX3Nlc3Npb25fcHVibGljX2tleSI6IlhqN2ZXYzBsTTNrUW05bkhxUjV0VXZZMWJaMmFDNGRFNmZHOGhJMGpLMXciLCJpc3N1ZWRfYXQiOiIyMDI2LTA0LTExVDA5OjMwOjAwWiIsInJvbGUiOiJodW1hbl9oZWxkIn0",
+      "delegation": {
+        "airdress": "alice.humans.airdress.co",
+        "device_label": "Alice's iPhone",
+        "device_session_public_key": "Xj7fWc0lM3kQm9nHqR5tUvY1bZ2aC4dE6fG8hI0jK1w",
+        "issued_at": "2026-04-11T09:30:00Z",
+        "role": "human_held",
+        "signature": "C61l2Yo0ATNvunQINe8hE89YniF2Jp-Ld9ajIGC8ZODOs_hW8k_29z0fMO81q_NVR7cqw_wGwA132SwMa-VYAQ"
+      },
+      "name": "minimal-realistic",
+      "root_public_key_b64url": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+      "root_seed_b64url": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
+    },
+    {
+      "canonical_b64url": "eyJhaXJkcmVzcyI6ImJvYi5odW1hbnMuYWlyZHJlc3MuY28iLCJkZXZpY2VfbGFiZWwiOiJCb2IncyBsYXB0b3AiLCJkZXZpY2Vfc2Vzc2lvbl9wdWJsaWNfa2V5IjoicTF3MmUzcjR0NXk2IiwiaXNzdWVkX2F0IjoiMjAyNi0wNC0xMVQwOTozMTowMFoiLCJyb2xlIjoiaHVtYW5faGVsZCJ9",
+      "delegation": {
+        "airdress": "bob.humans.airdress.co",
+        "device_label": "Bob's laptop",
+        "device_session_public_key": "q1w2e3r4t5y6",
+        "issued_at": "2026-04-11T09:31:00Z",
+        "role": "human_held",
+        "signature": "AeAyWzLYWBpO3dIngbbHEQ2y2sNJ1-hxh0E4eyQM_FyPEosi7lOSwzG4HVYKID5i89bzlQadMG3h_niz82nRBg"
+      },
+      "name": "keys-inserted-unsorted",
+      "root_public_key_b64url": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+      "root_seed_b64url": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"
+    },
+    {
+      "canonical_b64url": "eyJhaXJkcmVzcyI6InpvZS5odW1hbnMuYWlyZHJlc3MuY28iLCJkZXZpY2VfbGFiZWwiOiJab8OrJ3MgRsO8aHJlcnNjaGVpbiDwn5OxIiwiZGV2aWNlX3Nlc3Npb25fcHVibGljX2tleSI6ImFiYzEyMyIsImlzc3VlZF9hdCI6IjIwMjYtMDQtMTFUMDk6MzI6MDArMDI6MDAiLCJyb2xlIjoiaHVtYW5faGVsZCJ9",
+      "delegation": {
+        "airdress": "zoe.humans.airdress.co",
+        "device_label": "Zoë's Führerschein 📱",
+        "device_session_public_key": "abc123",
+        "issued_at": "2026-04-11T09:32:00+02:00",
+        "role": "human_held",
+        "signature": "rN7bXZYfP-sHtIUFxyjYwZqhQLTO6akTsmL2pX79WAQ1N1NJPOmm0SoHB0tSP_oOS52QFAf9DFvt0LHxULolDQ"
+      },
+      "name": "unicode-label",
+      "root_public_key_b64url": "7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E",
+      "root_seed_b64url": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"
+    },
+    {
+      "canonical_b64url": "eyJhaXJkcmVzcyI6ImNhcm9sLmh1bWFucy5haXJkcmVzcy5jbyIsImNhcGFiaWxpdGllcyI6eyJhbHBoYSI6MiwiemV0YSI6MX0sImRldmljZV9zZXNzaW9uX3B1YmxpY19rZXkiOiJra2trIiwiaXNzdWVkX2F0IjoiMjAyNi0wNC0xMVQwOTozMzowMFoifQ",
+      "delegation": {
+        "airdress": "carol.humans.airdress.co",
+        "capabilities": {
+          "alpha": 2,
+          "zeta": 1
+        },
+        "device_session_public_key": "kkkk",
+        "issued_at": "2026-04-11T09:33:00Z",
+        "signature": "Nv_qgQ3owXH3SroLejwS1e2F3fLovAnX67q4GhnwBHstg5Hq3C0pfZivMWnZ0L6blBfWZ4AyC_p0NkmC5qlpCg"
+      },
+      "name": "nested-object-keys-sorted",
+      "root_public_key_b64url": "ypOsFwUYcHHWe4PH_w7-gQjo7EUwV113JoeTM9vavnw",
+      "root_seed_b64url": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+    },
+    {
+      "canonical_b64url": "eyJhaXJkcmVzcyI6ImRhdmUuaHVtYW5zLmFpcmRyZXNzLmNvIiwiZGV2aWNlX3Nlc3Npb25fcHVibGljX2tleSI6ImRkZGQiLCJpc3N1ZWRfYXQiOiIyMDI2LTA0LTExVDA5OjM0OjAwWiIsInNjb3BlcyI6WyJjaGF0IiwiYWRtaW4iLCJhYWEiXX0",
+      "delegation": {
+        "airdress": "dave.humans.airdress.co",
+        "device_session_public_key": "dddd",
+        "issued_at": "2026-04-11T09:34:00Z",
+        "scopes": [
+          "chat",
+          "admin",
+          "aaa"
+        ],
+        "signature": "buixZxsAggaWgMAy4qV-VCibAtpeJ8j7MoNF0imUjA7NieqOIiYR4ZMVvXz2TUidJ6S-kErN9wImjj7qrH-mAg"
+      },
+      "name": "array-field",
+      "root_public_key_b64url": "bnoc3Smwt4_ROvTFWY_v9O8qlxZuPKby5Pv8zYBQW_E",
+      "root_seed_b64url": "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU"
+    },
+    {
+      "canonical_b64url": "eyJhaXJkcmVzcyI6ImVyaW4uaHVtYW5zLmFpcmRyZXNzLmNvIiwiZGV2aWNlX3Nlc3Npb25fcHVibGljX2tleSI6ImVlZWUiLCJpc3N1ZWRfYXQiOiIyMDI2LTA0LTExVDA5OjM1OjAwWiIsIm9mZnNldCI6LTcsInR0bF9zZWNvbmRzIjo4NjQwMCwid2VpZ2h0IjoxLjV9",
+      "delegation": {
+        "airdress": "erin.humans.airdress.co",
+        "device_session_public_key": "eeee",
+        "issued_at": "2026-04-11T09:35:00Z",
+        "offset": -7,
+        "signature": "hlG3i5_Wz0ds2ZC3upqsQcM4JB6hX-upNoh0NkUz3baiWr3ySbypWymTFoL5r4_n-hRW4kbH--77NKBqwrlyCg",
+        "ttl_seconds": 86400,
+        "weight": 1.5
+      },
+      "name": "numeric-fields",
+      "root_public_key_b64url": "iodf_x6zhFFXes1a_uQFRWVo3XyJ4JCGOgVXvHr0nxc",
+      "root_seed_b64url": "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY"
+    },
+    {
+      "canonical_b64url": "eyJhaXJkcmVzcyI6ImZyYW5rLmh1bWFucy5haXJkcmVzcy5jbyIsImRldmljZV9sYWJlbCI6bnVsbCwiZGV2aWNlX3Nlc3Npb25fcHVibGljX2tleSI6ImZmZmYiLCJpc3N1ZWRfYXQiOiIyMDI2LTA0LTExVDA5OjM2OjAwWiJ9",
+      "delegation": {
+        "airdress": "frank.humans.airdress.co",
+        "device_label": null,
+        "device_session_public_key": "ffff",
+        "issued_at": "2026-04-11T09:36:00Z",
+        "signature": "SF_0GYSF-0TZX6lDvfORhmTXmk_nx-t0n68-MJIRgrBIorZs02Qg-Vj2TnedArcS-WtjqtHXOP79bEGvU6ZsCQ"
+      },
+      "name": "null-field",
+      "root_public_key_b64url": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+      "root_seed_b64url": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+    },
+    {
+      "canonical_b64url": "eyJhaXJkcmVzcyI6ImdyYWNlLmh1bWFucy5haXJkcmVzcy5jbyIsImRldmljZV9zZXNzaW9uX3B1YmxpY19rZXkiOiJnZ2dnIiwiZXBoZW1lcmFsIjpmYWxzZSwiaXNzdWVkX2F0IjoiMjAyNi0wNC0xMVQwOTozNzowMFoiLCJwcmltYXJ5Ijp0cnVlfQ",
+      "delegation": {
+        "airdress": "grace.humans.airdress.co",
+        "device_session_public_key": "gggg",
+        "ephemeral": false,
+        "issued_at": "2026-04-11T09:37:00Z",
+        "primary": true,
+        "signature": "fSvNF0baPI0C5R1Hs_-mb0TvVKQsiz6O05iYTMkjIkSI44WYVEUWGvRsBkndf8fcg383kqZALbG0d92kR-d4DA"
+      },
+      "name": "boolean-fields",
+      "root_public_key_b64url": "E5j2LG0aRXxRumpLXz29L2n8qTIWIY3ImX5Ba9F9k8o",
+      "root_seed_b64url": "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+    },
+    {
+      "canonical_b64url": "eyJhYV9zb3J0c19maXJzdCI6InllcyIsImFpcmRyZXNzIjoiaGVpZGkuaHVtYW5zLmFpcmRyZXNzLmNvIiwiZGV2aWNlX3Nlc3Npb25fcHVibGljX2tleSI6ImhoaGgiLCJpc3N1ZWRfYXQiOiIyMDI2LTA0LTExVDA5OjM4OjAwWiIsInhfZnV0dXJlX2V4dGVuc2lvbiI6ImtlcHQtdmVyYmF0aW0ifQ",
+      "delegation": {
+        "aa_sorts_first": "yes",
+        "airdress": "heidi.humans.airdress.co",
+        "device_session_public_key": "hhhh",
+        "issued_at": "2026-04-11T09:38:00Z",
+        "signature": "Y7PhKCZ12u1XVFeuvQKJsP0Ry88LUx0DXWGYy-n3wEaLUxt4EnoTmPOKUqS5PWVmvXeGEWYGvWdLY6MwH2hYBA",
+        "x_future_extension": "kept-verbatim"
+      },
+      "name": "extra-unknown-fields",
+      "root_public_key_b64url": "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg",
+      "root_seed_b64url": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk"
+    },
+    {
+      "canonical_b64url": "eyJhaXJkcmVzcyI6Iml2YW4uaHVtYW5zLmFpcmRyZXNzLmNvIiwiZGV2aWNlX2xhYmVsIjoiIiwiZGV2aWNlX3Nlc3Npb25fcHVibGljX2tleSI6ImlpaWkiLCJpc3N1ZWRfYXQiOiIyMDI2LTA0LTExVDA5OjM5OjAwWiJ9",
+      "delegation": {
+        "airdress": "ivan.humans.airdress.co",
+        "device_label": "",
+        "device_session_public_key": "iiii",
+        "issued_at": "2026-04-11T09:39:00Z",
+        "signature": "RNA-61k5UQXGrt5QGXL76hbVPBNz1U1fdK-H_DWOsdTYdVb_uMUxPKggm-9AJgQSChshw5tveaRbxzwwplHqAQ"
+      },
+      "name": "empty-string-values",
+      "root_public_key_b64url": "Q6cucUQBdi32a2jCbfvfJoKq7J8kdOykYT5CSg-6_Tw",
+      "root_seed_b64url": "CgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgo"
+    },
+    {
+      "canonical_b64url": "eyJhaXJkcmVzcyI6Imp1ZHkuaHVtYW5zLmFpcmRyZXNzLmNvIiwiZGV2aWNlX3Nlc3Npb25fcHVibGljX2tleSI6ImpqamoiLCJpc3N1ZWRfYXQiOiIyMDI2LTA0LTExVDA5OjQwOjAwWiIsInNpZyI6Im5vdCB0aGUgc2lnbmF0dXJlIGZpZWxkIiwienpfYWZ0ZXJfc2lnbmF0dXJlIjoic29ydGVkIGxhc3QifQ",
+      "delegation": {
+        "airdress": "judy.humans.airdress.co",
+        "device_session_public_key": "jjjj",
+        "issued_at": "2026-04-11T09:40:00Z",
+        "sig": "not the signature field",
+        "signature": "mgORxwiqK7w-G8vbwjrCQey2CEXl-oUhEdZckZ36tpWkuTVmi9wHb_XT6OUiEkmEq6LhlqjKzhCF6Z8U7bOdDg",
+        "zz_after_signature": "sorted last"
+      },
+      "name": "key-sorting-around-signature",
+      "root_public_key_b64url": "Zr5-Myx6RTMyvZ0Kf32wVfXF7xoGraZtmLOftoEMRzo",
+      "root_seed_b64url": "CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws"
+    },
+    {
+      "canonical_b64url": "eyJhaXJkcmVzcyI6Im1hbGxvcnkuaHVtYW5zLmFpcmRyZXNzLmNvIiwiZGV2aWNlX2xhYmVsIjoibGluZTFcbmxpbmUyIFwicXVvdGVkXCIgYmFja1xcc2xhc2giLCJkZXZpY2Vfc2Vzc2lvbl9wdWJsaWNfa2V5IjoibW1tbSIsImlzc3VlZF9hdCI6IjIwMjYtMDQtMTFUMDk6NDE6MDBaIn0",
+      "delegation": {
+        "airdress": "mallory.humans.airdress.co",
+        "device_label": "line1\nline2 \"quoted\" back\\slash",
+        "device_session_public_key": "mmmm",
+        "issued_at": "2026-04-11T09:41:00Z",
+        "signature": "KOmMhLwqI0e0uDmpItrh-sfAvNAA-EdtLtuSc-qfFHdfFrXu3clkKdRGfo94pK9DgM5_CinE90hwyjRt5pBKDg"
+      },
+      "name": "escaped-characters",
+      "root_public_key_b64url": "C1E62bSSQBXKCQLtB5BE06xdvsIwbwaUjBDajrbjny0",
+      "root_seed_b64url": "DAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw"
+    }
+  ]
+}
