@@ -39,6 +39,9 @@ const GROUP_AAD_LABEL: &[u8] = b"airdress-mls-group-state-v1";
 const KEY_PACKAGE_AAD_LABEL: &[u8] = b"airdress-mls-key-package-v1";
 const KEY_PACKAGE_PUBLIC_AAD_LABEL: &[u8] = b"airdress-mls-key-package-public-v1";
 
+/// A stored item's id paired with its bytes.
+pub type StoredItem = (Vec<u8>, Vec<u8>);
+
 /// Error type shared by both storage implementations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageError(pub String);
@@ -373,13 +376,25 @@ impl SealedKeyPackageStore {
 
     /// All stored publishable public messages (unconsumed pool).
     pub fn stored_public_messages(&self) -> Result<Vec<Vec<u8>>, StorageError> {
+        Ok(self
+            .stored_public_with_ids()?
+            .into_iter()
+            .map(|(_, msg)| msg)
+            .collect())
+    }
+
+    /// All stored publishable public messages, each paired with its
+    /// storage id. The id is stable across restarts, so a host that
+    /// publishes packages under it can tell which of the stored
+    /// packages have already been handed out.
+    pub fn stored_public_with_ids(&self) -> Result<Vec<StoredItem>, StorageError> {
         let mut out = Vec::new();
         for id in self.0.list_ids("key_packages_public")? {
             if let Some(msg) =
                 self.0
                     .open_read("key_packages_public", KEY_PACKAGE_PUBLIC_AAD_LABEL, &id)?
             {
-                out.push(msg.to_vec());
+                out.push((id, msg.to_vec()));
             }
         }
         Ok(out)
