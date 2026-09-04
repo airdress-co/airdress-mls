@@ -1,10 +1,9 @@
 //! Pure-Rust MLS engine — no FFI types, fully testable.
 
-use std::collections::HashMap;
-
 use ed25519_dalek::SigningKey;
 use mls_rs::client_builder::{
-    BaseInMemoryConfig, WithCryptoProvider, WithIdentityProvider, WithMlsRules,
+    BaseInMemoryConfig, WithCryptoProvider, WithGroupStateStorage, WithIdentityProvider,
+    WithKeyPackageRepo, WithMlsRules,
 };
 use mls_rs::identity::SigningIdentity;
 use mls_rs::identity::basic::BasicCredential;
@@ -14,12 +13,22 @@ use mls_rs_core::crypto::{SignaturePublicKey, SignatureSecretKey};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 
 use crate::credential::{AirdressIdentity, AirdressIdentityProvider, RootKeyLookup};
+use crate::storage::{SealedGroupStore, SealedKeyPackageStore, SealedStore};
 
 const CIPHER_SUITE: CipherSuite = CipherSuite::CURVE25519_CHACHA;
 
 type MlsConfig = WithIdentityProvider<
     AirdressIdentityProvider,
-    WithCryptoProvider<RustCryptoProvider, WithMlsRules<DefaultMlsRules, BaseInMemoryConfig>>,
+    WithCryptoProvider<
+        RustCryptoProvider,
+        WithMlsRules<
+            DefaultMlsRules,
+            WithGroupStateStorage<
+                SealedGroupStore,
+                WithKeyPackageRepo<SealedKeyPackageStore, BaseInMemoryConfig>,
+            >,
+        >,
+    >,
 >;
 
 pub struct StartGroupOutcome {
@@ -42,7 +51,6 @@ fn uuid_like() -> String {
 
 pub struct MlsEngine {
     client: Client<MlsConfig>,
-    groups: HashMap<Vec<u8>, Group<MlsConfig>>,
     public_key: Vec<u8>,
     identity_provider: AirdressIdentityProvider,
 }
@@ -103,8 +111,6 @@ impl MlsEngine {
         if state_dir.is_empty() {
             return Err("state_dir is empty".to_owned());
         }
-        let _ = state_key; // consumed by sealed storage
-
         let signing_key = SigningKey::from_bytes(seed);
         let public_key = signing_key.verifying_key().to_bytes().to_vec();
 
@@ -121,8 +127,14 @@ impl MlsEngine {
         let credential = BasicCredential::new(identity.to_identity_bytes()?).into_credential();
         let signing_identity = SigningIdentity::new(credential, sig_pub);
 
+        let sealed = SealedStore::open(state_dir, state_key).map_err(|e| e.to_string())?;
+        let group_store = SealedGroupStore(sealed.clone());
+        let key_package_store = SealedKeyPackageStore(sealed);
+
         let identity_provider = AirdressIdentityProvider::new();
         let client = Client::builder()
+            .key_package_repo(key_package_store)
+            .group_state_storage(group_store)
             .mls_rules(DefaultMlsRules::default())
             .crypto_provider(RustCryptoProvider::default())
             .identity_provider(identity_provider.clone())
@@ -131,7 +143,6 @@ impl MlsEngine {
 
         Ok(Self {
             client,
-            groups: HashMap::new(),
             public_key,
             identity_provider,
         })
@@ -196,7 +207,9 @@ impl MlsEngine {
             .map_err(|e| format!("app serialize: {e}"))?;
 
         let group_id = group.group_id().to_vec();
-        self.groups.insert(group_id.clone(), group);
+        group
+            .write_to_storage()
+            .map_err(|e| format!("persist group: {e}"))?;
 
         Ok(StartGroupOutcome {
             group_id,
@@ -207,29 +220,46 @@ impl MlsEngine {
 
     pub fn process_welcome(&mut self, welcome_bytes: &[u8]) -> Result<Vec<u8>, String> {
         let msg = MlsMessage::from_bytes(welcome_bytes).map_err(|e| format!("bad welcome: {e}"))?;
-        let (group, _) = self
+        let (mut group, _) = self
             .client
             .join_group(None, &msg, None)
             .map_err(|e| format!("join: {e}"))?;
         let group_id = group.group_id().to_vec();
-        self.groups.insert(group_id.clone(), group);
+        group
+            .write_to_storage()
+            .map_err(|e| format!("persist group: {e}"))?;
         Ok(group_id)
     }
 
+    /// Load a group from sealed storage. An unknown group and a
+    /// group whose state file fails to unseal are both refusals — the
+    /// latter must never fall back to a fresh group.
+    fn load_group(&self, group_id: &[u8]) -> Result<Group<MlsConfig>, String> {
+        self.client
+            .load_group(group_id)
+            .map_err(|e| format!("load group: {e}"))
+    }
+
     pub fn encrypt(&mut self, group_id: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
-        let group = self.groups.get_mut(group_id).ok_or("unknown group")?;
+        let mut group = self.load_group(group_id)?;
         let msg = group
             .encrypt_application_message(plaintext, Vec::new())
             .map_err(|e| format!("encrypt: {e}"))?;
+        group
+            .write_to_storage()
+            .map_err(|e| format!("persist group: {e}"))?;
         msg.to_bytes().map_err(|e| format!("serialize: {e}"))
     }
 
     pub fn decrypt(&mut self, group_id: &[u8], message_bytes: &[u8]) -> Result<Vec<u8>, String> {
         let msg = MlsMessage::from_bytes(message_bytes).map_err(|e| format!("bad message: {e}"))?;
-        let group = self.groups.get_mut(group_id).ok_or("unknown group")?;
+        let mut group = self.load_group(group_id)?;
         let received = group
             .process_incoming_message(msg)
             .map_err(|e| format!("process: {e}"))?;
+        group
+            .write_to_storage()
+            .map_err(|e| format!("persist group: {e}"))?;
         match received {
             mls_rs::group::ReceivedMessage::ApplicationMessage(app) => Ok(app.data().to_vec()),
             _ => Err("not an application message".into()),
