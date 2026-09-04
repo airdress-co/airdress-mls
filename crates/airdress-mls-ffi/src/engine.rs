@@ -17,6 +17,12 @@ use crate::storage::{SealedGroupStore, SealedKeyPackageStore, SealedStore};
 
 const CIPHER_SUITE: CipherSuite = CipherSuite::CURVE25519_CHACHA;
 
+/// Pool size established at first init, matching the operator-side
+/// KeyPackage count. A package whose private half is lost is a
+/// Welcome the client can never join, so the private halves (and the
+/// publishable public messages) persist through the sealed store.
+pub const INITIAL_KEY_PACKAGE_POOL: usize = 16;
+
 type MlsConfig = WithIdentityProvider<
     AirdressIdentityProvider,
     WithCryptoProvider<
@@ -53,6 +59,7 @@ pub struct MlsEngine {
     client: Client<MlsConfig>,
     public_key: Vec<u8>,
     identity_provider: AirdressIdentityProvider,
+    key_packages: SealedKeyPackageStore,
 }
 
 impl MlsEngine {
@@ -133,7 +140,7 @@ impl MlsEngine {
 
         let identity_provider = AirdressIdentityProvider::new();
         let client = Client::builder()
-            .key_package_repo(key_package_store)
+            .key_package_repo(key_package_store.clone())
             .group_state_storage(group_store)
             .mls_rules(DefaultMlsRules::default())
             .crypto_provider(RustCryptoProvider::default())
@@ -141,11 +148,22 @@ impl MlsEngine {
             .signing_identity(signing_identity, secret_key, CIPHER_SUITE)
             .build();
 
-        Ok(Self {
+        let engine = Self {
             client,
             public_key,
             identity_provider,
-        })
+            key_packages: key_package_store,
+        };
+
+        // First init on this state dir: establish the pool. The
+        // publishable public messages persist alongside the private
+        // halves, so the host can publish (or re-publish) them at any
+        // point after this call — including after a restart.
+        if engine.key_package_pool_count()? == 0 {
+            engine.generate_key_packages(INITIAL_KEY_PACKAGE_POOL)?;
+        }
+
+        Ok(engine)
     }
 
     pub fn public_key(&self) -> &[u8] {
@@ -161,11 +179,62 @@ impl MlsEngine {
     }
 
     pub fn generate_key_package(&self) -> Result<Vec<u8>, String> {
-        let kp = self
-            .client
-            .generate_key_package_message(ExtensionList::default(), ExtensionList::default(), None)
-            .map_err(|e| format!("key package: {e}"))?;
-        kp.to_bytes().map_err(|e| format!("serialize: {e}"))
+        let mut generated = self.generate_key_packages(1)?;
+        generated
+            .pop()
+            .ok_or_else(|| "no key package generated".to_owned())
+    }
+
+    /// Generate `count` fresh KeyPackages. The private halves land in
+    /// the sealed store (written by mls-rs through the repo); the
+    /// publishable public messages are persisted alongside them and
+    /// returned for the host to publish. KeyPackages are single-use
+    /// (RFC 9420 §12.4): consumption deletes both halves.
+    pub fn generate_key_packages(&self, count: usize) -> Result<Vec<Vec<u8>>, String> {
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let before: std::collections::HashSet<Vec<u8>> = self
+                .key_packages
+                .pool_ids()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .collect();
+            let kp = self
+                .client
+                .generate_key_package_message(
+                    ExtensionList::default(),
+                    ExtensionList::default(),
+                    None,
+                )
+                .map_err(|e| format!("key package: {e}"))?;
+            let bytes = kp.to_bytes().map_err(|e| format!("serialize: {e}"))?;
+
+            // mls-rs inserted exactly one private half; find its id so
+            // the public message can be persisted under the same name.
+            let after = self.key_packages.pool_ids().map_err(|e| e.to_string())?;
+            let new_id = after
+                .into_iter()
+                .find(|id| !before.contains(id))
+                .ok_or("generated key package was not persisted")?;
+            self.key_packages
+                .insert_public(&new_id, &bytes)
+                .map_err(|e| e.to_string())?;
+            out.push(bytes);
+        }
+        Ok(out)
+    }
+
+    /// Number of unconsumed KeyPackage private halves in the pool.
+    pub fn key_package_pool_count(&self) -> Result<usize, String> {
+        self.key_packages.pool_count().map_err(|e| e.to_string())
+    }
+
+    /// The publishable public messages of every unconsumed KeyPackage
+    /// — what the host publishes (or re-publishes after a restart).
+    pub fn stored_key_packages(&self) -> Result<Vec<Vec<u8>>, String> {
+        self.key_packages
+            .stored_public_messages()
+            .map_err(|e| e.to_string())
     }
 
     pub fn start_group(

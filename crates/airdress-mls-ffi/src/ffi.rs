@@ -235,6 +235,111 @@ pub extern "C" fn airdress_mls_generate_key_package(handle_id: u64) -> FfiBytes 
     }
 }
 
+/// List of byte buffers returned across the FFI boundary.
+///
+/// `items` points at `len` consecutive `FfiBytes` (each with a
+/// buffer to free); the whole structure is released in one call to
+/// `airdress_mls_free_bytes_list`. `error` is non-null on failure
+/// (and `items`/`len` are zero).
+#[repr(C)]
+pub struct FfiBytesList {
+    pub items: *mut FfiBytes,
+    pub len: usize,
+    pub error: *mut c_char,
+}
+
+impl FfiBytesList {
+    fn ok(buffers: Vec<Vec<u8>>) -> Self {
+        let mut items: Box<[FfiBytes]> = buffers.into_iter().map(FfiBytes::ok).collect();
+        let ptr = items.as_mut_ptr();
+        let len = items.len();
+        std::mem::forget(items);
+        Self {
+            items: ptr,
+            len,
+            error: std::ptr::null_mut(),
+        }
+    }
+
+    fn err(msg: String) -> Self {
+        let c_str = std::ffi::CString::new(msg).unwrap_or_default();
+        Self {
+            items: std::ptr::null_mut(),
+            len: 0,
+            error: c_str.into_raw(),
+        }
+    }
+}
+
+/// Generate `count` fresh KeyPackages and return their publishable
+/// public messages. Private halves are persisted through the sealed
+/// state store so they survive restart — a KeyPackage whose private
+/// half is lost is a Welcome the client can never join. Packages are
+/// single-use; consumption deletes them from the pool.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_generate_key_packages(handle_id: u64, count: usize) -> FfiBytesList {
+    let guard = ENGINES.lock().expect("poisoned");
+    match guard.get(&handle_id) {
+        Some(engine) => match engine.generate_key_packages(count) {
+            Ok(buffers) => FfiBytesList::ok(buffers),
+            Err(e) => FfiBytesList::err(e),
+        },
+        None => FfiBytesList::err("invalid handle".into()),
+    }
+}
+
+/// The publishable public messages of every unconsumed KeyPackage in
+/// the pool — for first publish and for re-publish after a restart.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_stored_key_packages(handle_id: u64) -> FfiBytesList {
+    let guard = ENGINES.lock().expect("poisoned");
+    match guard.get(&handle_id) {
+        Some(engine) => match engine.stored_key_packages() {
+            Ok(buffers) => FfiBytesList::ok(buffers),
+            Err(e) => FfiBytesList::err(e),
+        },
+        None => FfiBytesList::err("invalid handle".into()),
+    }
+}
+
+/// Number of unconsumed KeyPackage private halves in the pool.
+/// Returns -1 for an invalid handle, -2 on a storage error.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_key_package_pool_count(handle_id: u64) -> i64 {
+    let guard = ENGINES.lock().expect("poisoned");
+    match guard.get(&handle_id) {
+        Some(engine) => match engine.key_package_pool_count() {
+            Ok(count) => i64::try_from(count).unwrap_or(i64::MAX),
+            Err(_) => -2,
+        },
+        None => -1,
+    }
+}
+
+/// Free a byte-buffer list previously returned by
+/// `airdress_mls_generate_key_packages` or
+/// `airdress_mls_stored_key_packages` (frees each buffer, each
+/// per-item error, and the list itself).
+///
+/// # Safety
+///
+/// `list` must have been returned by a Rust FFI function in this
+/// crate and must not have been freed before.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn airdress_mls_free_bytes_list(list: FfiBytesList) {
+    if !list.items.is_null() && list.len > 0 {
+        let items =
+            unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(list.items, list.len)) };
+        for item in items {
+            unsafe {
+                airdress_mls_free_bytes(item.ptr, item.len);
+                airdress_mls_free_error(item.error);
+            }
+        }
+    }
+    unsafe { airdress_mls_free_error(list.error) };
+}
+
 /// Start a group with a peer's KeyPackage.
 #[unsafe(no_mangle)]
 pub extern "C" fn airdress_mls_start_group(

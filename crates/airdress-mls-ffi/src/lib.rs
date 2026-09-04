@@ -112,6 +112,64 @@ mod tests {
     }
 
     #[test]
+    fn pool_established_at_first_init_and_only_then() {
+        let dir = tempfile::tempdir().unwrap();
+        let bob = engine_at("bob.test", 5, dir.path());
+        assert_eq!(
+            bob.key_package_pool_count().unwrap(),
+            crate::engine::INITIAL_KEY_PACKAGE_POOL
+        );
+        assert_eq!(
+            bob.stored_key_packages().unwrap().len(),
+            crate::engine::INITIAL_KEY_PACKAGE_POOL
+        );
+
+        // A restart must NOT regenerate — the existing pool survives.
+        drop(bob);
+        let bob = engine_at("bob.test", 5, dir.path());
+        assert_eq!(
+            bob.key_package_pool_count().unwrap(),
+            crate::engine::INITIAL_KEY_PACKAGE_POOL
+        );
+
+        // Explicit generation refills on top.
+        let extra = bob.generate_key_packages(2).unwrap();
+        assert_eq!(extra.len(), 2);
+        assert_eq!(
+            bob.key_package_pool_count().unwrap(),
+            crate::engine::INITIAL_KEY_PACKAGE_POOL + 2
+        );
+    }
+
+    #[test]
+    fn welcome_against_pre_restart_key_package_joins_after_restart() {
+        let alice_dir = tempfile::tempdir().unwrap();
+        let bob_dir = tempfile::tempdir().unwrap();
+        let mut alice = engine_at("alice.test", 6, alice_dir.path());
+        let bob = engine_at("bob.test", 7, bob_dir.path());
+
+        // Take a publishable package from bob's persisted pool, then
+        // restart bob BEFORE the Welcome arrives.
+        let bob_kp = bob.stored_key_packages().unwrap().pop().unwrap();
+        let pool_before = bob.key_package_pool_count().unwrap();
+        drop(bob);
+        let mut bob = engine_at("bob.test", 7, bob_dir.path());
+
+        let outcome = alice
+            .start_group(&bob_kp, b"welcome across restart")
+            .unwrap();
+        bob.process_welcome(&outcome.welcome).unwrap();
+        assert_eq!(
+            bob.decrypt(&outcome.group_id, &outcome.first_application)
+                .unwrap(),
+            b"welcome across restart"
+        );
+
+        // Single-use: joining consumed the package.
+        assert_eq!(bob.key_package_pool_count().unwrap(), pool_before - 1);
+    }
+
+    #[test]
     fn same_seed_same_public_key() {
         let seed = [42u8; 32];
         let root = [1u8; 32];

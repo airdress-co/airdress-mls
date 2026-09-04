@@ -387,7 +387,12 @@ impl SealedKeyPackageStore {
 
     /// Number of unconsumed private halves in the pool.
     pub fn pool_count(&self) -> Result<usize, StorageError> {
-        Ok(self.0.list_ids("key_packages")?.len())
+        Ok(self.pool_ids()?.len())
+    }
+
+    /// Ids of the unconsumed private halves in the pool.
+    pub fn pool_ids(&self) -> Result<Vec<Vec<u8>>, StorageError> {
+        self.0.list_ids("key_packages")
     }
 }
 
