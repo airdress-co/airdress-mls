@@ -8,7 +8,11 @@ license.workspace = true
 description = "Flutter Rust Bridge wrapper for mls-rs, exposing MLS operations to Dart"
 
 [lib]
-crate-type = ["cdylib", "staticlib"]
+# `lib` (rlib) added so `airdress-operator` (federation feature) can
+# reuse `credential.rs` — the delegation-carrying identity types — for
+# the in-process agent's MLS credential. The cdylib/staticlib outputs
+# for the Dart FFI build are unchanged.
+crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 mls-rs.workspace = true
