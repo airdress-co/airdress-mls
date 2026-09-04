@@ -173,6 +173,49 @@ pub extern "C" fn airdress_mls_create_engine_from_seed(
     }
 }
 
+/// Host-supplied root-key cache callback.
+///
+/// Called with the peer's airdress (NUL-terminated UTF-8) and a
+/// 32-byte output buffer. The host returns 1 after filling the buffer
+/// with the root public key its cache holds for that airdress (24h
+/// TTL, populated at first contact), or 0 when it has none — which
+/// rejects the peer's leaf. The callback must be thread-safe and must
+/// not call back into this library.
+pub type AirdressRootKeyLookupFn =
+    extern "C" fn(airdress: *const c_char, out_root_public_key: *mut u8) -> i32;
+
+struct CallbackRootKeyLookup(AirdressRootKeyLookupFn);
+
+impl crate::credential::RootKeyLookup for CallbackRootKeyLookup {
+    fn root_public_key(&self, airdress: &str) -> Option<[u8; 32]> {
+        let c_airdress = std::ffi::CString::new(airdress).ok()?;
+        let mut out = [0u8; 32];
+        if (self.0)(c_airdress.as_ptr(), out.as_mut_ptr()) == 1 {
+            Some(out)
+        } else {
+            None
+        }
+    }
+}
+
+/// Register the host's root-key cache and switch the engine to strict
+/// credential verification (one-way cutover). Returns 0 on success,
+/// -1 for an invalid handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_set_root_key_lookup(
+    handle_id: u64,
+    lookup: AirdressRootKeyLookupFn,
+) -> i32 {
+    let guard = ENGINES.lock().expect("poisoned");
+    match guard.get(&handle_id) {
+        Some(engine) => {
+            engine.set_root_key_lookup(std::sync::Arc::new(CallbackRootKeyLookup(lookup)));
+            0
+        }
+        None => -1,
+    }
+}
+
 /// Destroy an MLS engine and free its resources.
 #[unsafe(no_mangle)]
 pub extern "C" fn airdress_mls_destroy_engine(handle_id: u64) {

@@ -7,18 +7,18 @@ use mls_rs::client_builder::{
     BaseInMemoryConfig, WithCryptoProvider, WithIdentityProvider, WithMlsRules,
 };
 use mls_rs::identity::SigningIdentity;
-use mls_rs::identity::basic::{BasicCredential, BasicIdentityProvider};
+use mls_rs::identity::basic::BasicCredential;
 use mls_rs::mls_rules::DefaultMlsRules;
 use mls_rs::{CipherSuite, Client, ExtensionList, Group, MlsMessage};
 use mls_rs_core::crypto::{SignaturePublicKey, SignatureSecretKey};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 
-use crate::credential::AirdressIdentity;
+use crate::credential::{AirdressIdentity, AirdressIdentityProvider, RootKeyLookup};
 
 const CIPHER_SUITE: CipherSuite = CipherSuite::CURVE25519_CHACHA;
 
 type MlsConfig = WithIdentityProvider<
-    BasicIdentityProvider,
+    AirdressIdentityProvider,
     WithCryptoProvider<RustCryptoProvider, WithMlsRules<DefaultMlsRules, BaseInMemoryConfig>>,
 >;
 
@@ -44,6 +44,7 @@ pub struct MlsEngine {
     client: Client<MlsConfig>,
     groups: HashMap<Vec<u8>, Group<MlsConfig>>,
     public_key: Vec<u8>,
+    identity_provider: AirdressIdentityProvider,
 }
 
 impl MlsEngine {
@@ -60,8 +61,11 @@ impl MlsEngine {
         let mut seed = [0u8; 32];
         OsRng.fill_bytes(&mut seed);
         let root = SigningKey::from_bytes(&[7u8; 32]);
-        let delegation =
-            format!("{{\"airdress\":\"{airdress}\",\"issued_at\":\"2026-01-01T00:00:00Z\"}}");
+        let delegation = crate::credential::test_support::signed_delegation_json(
+            &root,
+            airdress,
+            &SigningKey::from_bytes(&seed).verifying_key().to_bytes(),
+        );
         Self::from_seed(
             airdress,
             &seed,
@@ -117,10 +121,11 @@ impl MlsEngine {
         let credential = BasicCredential::new(identity.to_identity_bytes()?).into_credential();
         let signing_identity = SigningIdentity::new(credential, sig_pub);
 
+        let identity_provider = AirdressIdentityProvider::new();
         let client = Client::builder()
             .mls_rules(DefaultMlsRules::default())
             .crypto_provider(RustCryptoProvider::default())
-            .identity_provider(BasicIdentityProvider::new())
+            .identity_provider(identity_provider.clone())
             .signing_identity(signing_identity, secret_key, CIPHER_SUITE)
             .build();
 
@@ -128,11 +133,20 @@ impl MlsEngine {
             client,
             groups: HashMap::new(),
             public_key,
+            identity_provider,
         })
     }
 
     pub fn public_key(&self) -> &[u8] {
         &self.public_key
+    }
+
+    /// Register the host's root-key cache and enter strict credential
+    /// verification (one-way — this is the cutover switch). From here
+    /// every accepted leaf must carry a v1 identity whose root key
+    /// matches what the peer's operator publishes.
+    pub fn set_root_key_lookup(&self, lookup: std::sync::Arc<dyn RootKeyLookup>) {
+        self.identity_provider.set_root_key_lookup(lookup);
     }
 
     pub fn generate_key_package(&self) -> Result<Vec<u8>, String> {
