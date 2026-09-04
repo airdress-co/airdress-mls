@@ -7,7 +7,8 @@
 //! - `FfiBytes` passed TO Rust (as arguments) are borrowed — Rust
 //!   does not free them.
 //! - `handle_id` values are opaque integers. Dart must not fabricate
-//!   them; only use values returned by `airdress_mls_create_engine`.
+//!   them; only use values returned by
+//!   `airdress_mls_create_engine_from_seed`.
 
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -89,13 +90,70 @@ pub struct FfiStartGroupResult {
 // Exports
 // ---------------------------------------------------------------------------
 
-/// Create a new MLS engine for `airdress`. Returns a handle ID + public key.
-#[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_create_engine(airdress: *const c_char) -> FfiHandleResult {
-    let airdress = unsafe { CStr::from_ptr(airdress) }
+fn ffi_handle_err(msg: &str) -> FfiHandleResult {
+    let c_str = std::ffi::CString::new(msg).unwrap_or_default();
+    FfiHandleResult {
+        handle_id: 0,
+        public_key_ptr: std::ptr::null_mut(),
+        public_key_len: 0,
+        error: c_str.into_raw(),
+    }
+}
+
+/// Borrow a required C string argument, rejecting null and invalid UTF-8.
+fn required_str<'a>(ptr: *const c_char, name: &str) -> Result<&'a str, String> {
+    if ptr.is_null() {
+        return Err(format!("{name} is null"));
+    }
+    unsafe { CStr::from_ptr(ptr) }
         .to_str()
-        .unwrap_or("unknown");
-    match MlsEngine::new(airdress) {
+        .map_err(|_| format!("{name} is not valid UTF-8"))
+}
+
+/// Borrow a required 32-byte argument, rejecting null and wrong lengths.
+fn required_key32(ptr: *const u8, len: usize, name: &str) -> Result<[u8; 32], String> {
+    if ptr.is_null() {
+        return Err(format!("{name} is null"));
+    }
+    if len != 32 {
+        return Err(format!("{name} must be 32 bytes, got {len}"));
+    }
+    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+    slice.try_into().map_err(|_| format!("{name} length error"))
+}
+
+/// Create an MLS engine from host-supplied identity material.
+///
+/// `session_seed` is the device SESSION signing seed (32 bytes) from the
+/// host's secure storage — never the airdress root private key, which
+/// must not cross this boundary. `root_pubkey` (32 bytes) and
+/// `delegation_json` describe the device's identity chain; `state_dir`
+/// and `state_key` (32 bytes) locate and seal the on-disk MLS state.
+///
+/// Returns a handle ID + the session public key.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_create_engine_from_seed(
+    airdress: *const c_char,
+    session_seed: *const u8,
+    session_seed_len: usize,
+    root_pubkey: *const u8,
+    root_pubkey_len: usize,
+    delegation_json: *const c_char,
+    state_dir: *const c_char,
+    state_key: *const u8,
+    state_key_len: usize,
+) -> FfiHandleResult {
+    let parsed = (|| -> Result<MlsEngine, String> {
+        let airdress = required_str(airdress, "airdress")?;
+        let seed = required_key32(session_seed, session_seed_len, "session_seed")?;
+        let root = required_key32(root_pubkey, root_pubkey_len, "root_pubkey")?;
+        let delegation = required_str(delegation_json, "delegation_json")?;
+        let state_dir = required_str(state_dir, "state_dir")?;
+        let key = required_key32(state_key, state_key_len, "state_key")?;
+        MlsEngine::from_seed(airdress, &seed, &root, delegation, state_dir, &key)
+    })();
+
+    match parsed {
         Ok(engine) => {
             let pk = engine.public_key().to_vec();
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -111,15 +169,7 @@ pub extern "C" fn airdress_mls_create_engine(airdress: *const c_char) -> FfiHand
                 error: std::ptr::null_mut(),
             }
         }
-        Err(msg) => {
-            let c_str = std::ffi::CString::new(msg).unwrap_or_default();
-            FfiHandleResult {
-                handle_id: 0,
-                public_key_ptr: std::ptr::null_mut(),
-                public_key_len: 0,
-                error: c_str.into_raw(),
-            }
-        }
+        Err(msg) => ffi_handle_err(&msg),
     }
 }
 

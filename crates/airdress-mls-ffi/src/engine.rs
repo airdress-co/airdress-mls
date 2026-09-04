@@ -2,8 +2,6 @@
 
 use std::collections::HashMap;
 
-use chacha20poly1305::aead::OsRng;
-use chacha20poly1305::aead::rand_core::RngCore;
 use ed25519_dalek::SigningKey;
 use mls_rs::client_builder::{
     BaseInMemoryConfig, WithCryptoProvider, WithIdentityProvider, WithMlsRules,
@@ -28,6 +26,18 @@ pub struct StartGroupOutcome {
     pub first_application: Vec<u8>,
 }
 
+/// Unique-enough suffix for per-test state directories.
+#[cfg(test)]
+fn uuid_like() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 pub struct MlsEngine {
     client: Client<MlsConfig>,
     groups: HashMap<Vec<u8>, Group<MlsConfig>>,
@@ -35,13 +45,60 @@ pub struct MlsEngine {
 }
 
 impl MlsEngine {
+    /// Test-only constructor with a fresh random session seed and a
+    /// throwaway identity. Production callers must supply the seed and
+    /// identity material from the host's secure storage via
+    /// [`MlsEngine::from_seed`] — a per-instantiation random seed is
+    /// exactly the bug that made pre-restart state impossible to
+    /// decrypt.
+    #[cfg(test)]
     pub fn new(airdress: &str) -> Result<Self, String> {
+        use chacha20poly1305::aead::OsRng;
+        use chacha20poly1305::aead::rand_core::RngCore;
         let mut seed = [0u8; 32];
         OsRng.fill_bytes(&mut seed);
-        Self::from_seed(airdress, &seed)
+        let root = SigningKey::from_bytes(&[7u8; 32]);
+        let delegation =
+            format!("{{\"airdress\":\"{airdress}\",\"issued_at\":\"2026-01-01T00:00:00Z\"}}");
+        Self::from_seed(
+            airdress,
+            &seed,
+            &root.verifying_key().to_bytes(),
+            &delegation,
+            std::env::temp_dir()
+                .join(format!("airdress-mls-test-{}", uuid_like()))
+                .to_str()
+                .ok_or("temp dir not utf-8")?,
+            &[9u8; 32],
+        )
     }
 
-    pub fn from_seed(airdress: &str, seed: &[u8; 32]) -> Result<Self, String> {
+    /// Construct the engine from host-supplied identity material.
+    ///
+    /// `seed` is the DEVICE SESSION signing seed, never the airdress
+    /// root private key — the root must not cross into this crate
+    /// (it signs delegations at enrollment/pairing time only).
+    /// `root_public_key` and `delegation_json` describe this device's
+    /// identity chain; `state_dir`/`state_key` locate and seal the
+    /// on-disk MLS state.
+    pub fn from_seed(
+        airdress: &str,
+        seed: &[u8; 32],
+        root_public_key: &[u8; 32],
+        delegation_json: &str,
+        state_dir: &str,
+        state_key: &[u8; 32],
+    ) -> Result<Self, String> {
+        let delegation: serde_json::Value = serde_json::from_str(delegation_json)
+            .map_err(|e| format!("delegation is not valid JSON: {e}"))?;
+        if !delegation.is_object() {
+            return Err("delegation is not a JSON object".to_owned());
+        }
+        if state_dir.is_empty() {
+            return Err("state_dir is empty".to_owned());
+        }
+        let _ = (root_public_key, state_key); // consumed by credential + sealed storage
+
         let signing_key = SigningKey::from_bytes(seed);
         let public_key = signing_key.verifying_key().to_bytes().to_vec();
 

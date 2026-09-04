@@ -27,6 +27,49 @@ mod tests {
     use super::engine::MlsEngine;
 
     #[test]
+    fn same_seed_same_public_key() {
+        let seed = [42u8; 32];
+        let root = [1u8; 32];
+        let delegation = r#"{"airdress":"alice.test"}"#;
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let a = MlsEngine::from_seed(
+            "alice.test",
+            &seed,
+            &root,
+            delegation,
+            dir_a.path().to_str().unwrap(),
+            &[3u8; 32],
+        )
+        .unwrap();
+        let b = MlsEngine::from_seed(
+            "alice.test",
+            &seed,
+            &root,
+            delegation,
+            dir_b.path().to_str().unwrap(),
+            &[3u8; 32],
+        )
+        .unwrap();
+        assert_eq!(a.public_key(), b.public_key());
+    }
+
+    #[test]
+    fn from_seed_rejects_non_object_delegation() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = MlsEngine::from_seed(
+            "alice.test",
+            &[42u8; 32],
+            &[1u8; 32],
+            "[1,2,3]",
+            dir.path().to_str().unwrap(),
+            &[3u8; 32],
+        );
+        let err = err.err().expect("non-object delegation must be rejected");
+        assert!(err.contains("JSON object"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn round_trip_welcome_and_application() {
         let mut alice = MlsEngine::new("alice.test").unwrap();
         let mut bob = MlsEngine::new("bob.test").unwrap();
