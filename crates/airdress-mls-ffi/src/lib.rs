@@ -13,6 +13,7 @@
 //! the operator's `agent/mls.rs`.
 
 pub mod canonical;
+pub mod credential;
 mod engine;
 
 // The FFI layer requires unsafe at the C boundary, but the engine

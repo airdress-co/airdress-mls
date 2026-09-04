@@ -13,6 +13,8 @@ use mls_rs::{CipherSuite, Client, ExtensionList, Group, MlsMessage};
 use mls_rs_core::crypto::{SignaturePublicKey, SignatureSecretKey};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 
+use crate::credential::AirdressIdentity;
+
 const CIPHER_SUITE: CipherSuite = CipherSuite::CURVE25519_CHACHA;
 
 type MlsConfig = WithIdentityProvider<
@@ -91,13 +93,13 @@ impl MlsEngine {
     ) -> Result<Self, String> {
         let delegation: serde_json::Value = serde_json::from_str(delegation_json)
             .map_err(|e| format!("delegation is not valid JSON: {e}"))?;
-        if !delegation.is_object() {
+        let serde_json::Value::Object(delegation) = delegation else {
             return Err("delegation is not a JSON object".to_owned());
-        }
+        };
         if state_dir.is_empty() {
             return Err("state_dir is empty".to_owned());
         }
-        let _ = (root_public_key, state_key); // consumed by credential + sealed storage
+        let _ = state_key; // consumed by sealed storage
 
         let signing_key = SigningKey::from_bytes(seed);
         let public_key = signing_key.verifying_key().to_bytes().to_vec();
@@ -105,7 +107,14 @@ impl MlsEngine {
         let secret_key = SignatureSecretKey::from(signing_key.to_keypair_bytes().to_vec());
         let sig_pub = SignaturePublicKey::from(signing_key.verifying_key().to_bytes().to_vec());
 
-        let credential = BasicCredential::new(airdress.as_bytes().to_vec()).into_credential();
+        // Identity bytes carry the full chain — airdress, root public
+        // key, and the root-signed delegation — not just the airdress.
+        let identity = AirdressIdentity {
+            airdress: airdress.to_owned(),
+            root_public_key: *root_public_key,
+            delegation,
+        };
+        let credential = BasicCredential::new(identity.to_identity_bytes()?).into_credential();
         let signing_identity = SigningIdentity::new(credential, sig_pub);
 
         let client = Client::builder()
