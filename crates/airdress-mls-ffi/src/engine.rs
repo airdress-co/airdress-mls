@@ -184,6 +184,29 @@ pub struct MlsEngine {
     /// (SPEC-061 FR-7). See the two-phase note on
     /// [`MlsEngine::commit_pending`].
     pending: std::collections::HashMap<Vec<u8>, Group<MlsConfig>>,
+    /// Proposals staged for this group's next commit, held **by
+    /// value** so the commit is the only thing that has to reach the
+    /// group (design §6.1: one `mls_commit` envelope, no proposal
+    /// envelope kind exists).
+    ///
+    /// A by-reference proposal would have to be published and
+    /// processed by every member before any commit referencing it
+    /// could be applied — otherwise they fail with "by-ref proposal
+    /// not found". Inbound bare proposals from other members are still
+    /// held by reference, through
+    /// [`MlsEngine::process_proposal`](Self::process_proposal); this
+    /// map is only for proposals this device originates.
+    staged: std::collections::HashMap<Vec<u8>, Vec<StagedProposal>>,
+}
+
+/// A proposal this device originated, waiting to be folded into its
+/// next commit by value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StagedProposal {
+    /// Serialized `KeyPackage` of the member to add.
+    Add(Vec<u8>),
+    /// Leaf index of the member to remove.
+    Remove(u32),
 }
 
 impl MlsEngine {
@@ -308,6 +331,7 @@ impl MlsEngine {
             key_packages: key_package_store,
             groups: group_store,
             pending: std::collections::HashMap::new(),
+            staged: std::collections::HashMap::new(),
         };
 
         // First init on this state dir: establish the pool. The
@@ -694,57 +718,58 @@ impl MlsEngine {
         group.current_member_index()
     }
 
-    /// Propose adding a member from its published KeyPackage
-    /// (SPEC-061 FR-3).
+    /// Stage an `Add` for this group's next commit (SPEC-061 FR-3).
     ///
-    /// Returns the bare proposal message for publication. The proposal
-    /// is also cached locally, so a subsequent
-    /// [`MlsEngine::commit_pending`] on this device includes it.
+    /// Staged **by value**: the commit built by
+    /// [`MlsEngine::commit_pending`] carries the proposal itself, so
+    /// the commit is the only message that has to reach the group.
+    /// That matches design §6.1's flow — one `mls_commit` envelope —
+    /// and it has to, because there is no proposal envelope kind for a
+    /// by-reference proposal to travel in, and a member who never saw
+    /// the reference cannot apply a commit that names it.
     ///
     /// # Errors
     ///
-    /// The group is unknown, the bytes are not a KeyPackage, or the
-    /// KeyPackage's credential fails validation.
-    pub fn propose_add(&mut self, group_id: &[u8], key_package: &[u8]) -> Result<Vec<u8>, String> {
-        let kp = MlsMessage::from_bytes(key_package).map_err(|e| format!("bad kp: {e}"))?;
-        let mut group = self.load_group(group_id)?;
-        let msg = group
-            .propose_add(kp, Vec::new())
-            .map_err(|e| format!("propose add: {e}"))?;
-        // A proposal does not advance the epoch, so persisting it is
-        // not the thing FR-7 guards against — and not persisting it
-        // would lose a proposal the caller has already published.
-        group
-            .write_to_storage()
-            .map_err(|e| format!("persist group: {e}"))?;
-        msg.to_bytes().map_err(|e| format!("serialize: {e}"))
+    /// The group is unknown or the bytes are not a KeyPackage.
+    pub fn propose_add(&mut self, group_id: &[u8], key_package: &[u8]) -> Result<(), String> {
+        MlsMessage::from_bytes(key_package).map_err(|e| format!("bad kp: {e}"))?;
+        // Refuse now if the group is not ours, rather than at commit
+        // time when the caller has forgotten why it staged this.
+        self.load_group(group_id)?;
+        self.staged
+            .entry(group_id.to_vec())
+            .or_default()
+            .push(StagedProposal::Add(key_package.to_vec()));
+        Ok(())
     }
 
-    /// Propose removing the leaf at `index` (SPEC-061 FR-2).
+    /// Stage a `Remove` of the leaf at `index` for this group's next
+    /// commit (SPEC-061 FR-2). Staged by value, for the same reason as
+    /// [`MlsEngine::propose_add`].
     ///
     /// ## Cross-airdress removal is refused here too (FR-25)
     ///
     /// [`crate::rules::AirdressMlsRules`] is the enforcement point and
     /// catches this on both the send and the receive side, including
-    /// for a hand-crafted proposal. The check repeated here is the
-    /// early refusal FR-25 asks for: it fails before the proposal is
-    /// constructed, so a caller gets a comprehensible error instead of
-    /// a commit that will not build.
+    /// for a hand-crafted proposal from a client that has had this
+    /// check patched out. The check repeated here is the early refusal
+    /// FR-25 asks for: it fails before the proposal exists, so the
+    /// caller gets a comprehensible error rather than a commit that
+    /// will not build.
     ///
     /// # Errors
     ///
     /// The group is unknown, the index names no leaf, or the leaf
     /// belongs to another airdress.
-    pub fn propose_remove(&mut self, group_id: &[u8], index: u32) -> Result<Vec<u8>, String> {
-        let mut group = self.load_group(group_id)?;
+    pub fn propose_remove(&mut self, group_id: &[u8], index: u32) -> Result<(), String> {
+        let group = self.load_group(group_id)?;
         Self::refuse_cross_airdress_removal(&group, index)?;
-        let msg = group
-            .propose_remove(index, Vec::new())
-            .map_err(|e| format!("propose remove: {e}"))?;
-        group
-            .write_to_storage()
-            .map_err(|e| format!("persist group: {e}"))?;
-        msg.to_bytes().map_err(|e| format!("serialize: {e}"))
+        drop(group);
+        self.staged
+            .entry(group_id.to_vec())
+            .or_default()
+            .push(StagedProposal::Remove(index));
+        Ok(())
     }
 
     fn refuse_cross_airdress_removal(group: &Group<MlsConfig>, index: u32) -> Result<(), String> {
@@ -765,12 +790,15 @@ impl MlsEngine {
     /// Propose replacing this device's own leaf key (SPEC-061 FR-1) —
     /// the post-compromise-security primitive.
     ///
-    /// Returns the bare proposal for publication. RFC 9420 forbids a
-    /// committer from including its **own** Update proposal, so this
-    /// is committed by another member. A device healing itself without
-    /// waiting for anyone calls [`MlsEngine::commit_pending`] instead:
-    /// a commit carries a path update, which rotates this leaf's key
-    /// with the same effect.
+    /// Returns the bare proposal for publication. This is the one
+    /// operation that MUST travel by reference: RFC 9420 forbids a
+    /// committer from including its own `Update`, so another member
+    /// holds it (via [`MlsEngine::process_proposal`]) and commits it.
+    ///
+    /// A device healing itself without waiting for anyone calls
+    /// [`MlsEngine::commit_pending`] instead: a commit carries a path
+    /// update, which rotates this leaf's key with the same effect and
+    /// needs nobody else's cooperation.
     ///
     /// # Errors
     ///
@@ -852,9 +880,22 @@ impl MlsEngine {
         }
         let mut group = self.load_group(group_id)?;
         let before = self.identity_set(&group)?;
-        let output = group
-            .commit(Vec::new())
-            .map_err(|e| format!("commit: {e}"))?;
+        let staged = self.staged.get(group_id).cloned().unwrap_or_default();
+        let mut builder = group.commit_builder();
+        for proposal in &staged {
+            builder = match proposal {
+                StagedProposal::Add(kp) => {
+                    let kp = MlsMessage::from_bytes(kp).map_err(|e| format!("bad kp: {e}"))?;
+                    builder
+                        .add_member(kp)
+                        .map_err(|e| format!("add member: {e}"))?
+                }
+                StagedProposal::Remove(index) => builder
+                    .remove_member(*index)
+                    .map_err(|e| format!("remove member: {e}"))?,
+            };
+        }
+        let output = builder.build().map_err(|e| format!("commit: {e}"))?;
         group
             .apply_pending_commit()
             .map_err(|e| format!("apply: {e}"))?;
@@ -899,6 +940,7 @@ impl MlsEngine {
         group
             .write_to_storage()
             .map_err(|e| format!("persist group: {e}"))?;
+        self.staged.remove(group_id);
         Ok(group.current_epoch())
     }
 
@@ -917,6 +959,11 @@ impl MlsEngine {
         self.pending
             .remove(group_id)
             .ok_or("no commit is awaiting confirmation for this group")?;
+        // Staged proposals are dropped too. A retry after catch-up
+        // re-proposes: leaf indices can have moved under the commit
+        // that won, so replaying the old ones would remove the wrong
+        // member (design §6.3).
+        self.staged.remove(group_id);
         // Prove the reload works rather than asserting it: the caller
         // is about to use this group again.
         let group = self.load_group(group_id)?;

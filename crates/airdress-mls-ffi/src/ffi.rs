@@ -705,8 +705,10 @@ pub extern "C" fn airdress_mls_decrypt_bound(
     }
 }
 
-/// Propose adding a member from its published KeyPackage (FR-3).
-/// Returns the bare proposal message to publish.
+/// Stage an `Add` for the group's next commit (FR-3). Staged by value
+/// — the commit built by `airdress_mls_commit_pending` carries it, so
+/// no separate proposal message goes on the wire. Returns an empty
+/// buffer on success.
 #[unsafe(no_mangle)]
 pub extern "C" fn airdress_mls_propose_add(
     handle_id: u64,
@@ -720,15 +722,16 @@ pub extern "C" fn airdress_mls_propose_add(
     let mut guard = ENGINES.lock().expect("poisoned");
     match guard.get_mut(&handle_id) {
         Some(engine) => match engine.propose_add(group_id, kp) {
-            Ok(bytes) => FfiBytes::ok(bytes),
+            Ok(()) => FfiBytes::ok(Vec::new()),
             Err(e) => FfiBytes::err(e),
         },
         None => FfiBytes::err("invalid handle".into()),
     }
 }
 
-/// Propose removing the leaf at `leaf_index` (FR-2). Refused when the
-/// leaf belongs to another airdress (FR-25).
+/// Stage a `Remove` of `leaf_index` for the group's next commit
+/// (FR-2), by value. Refused when the leaf belongs to another airdress
+/// (FR-25). Returns an empty buffer on success.
 #[unsafe(no_mangle)]
 pub extern "C" fn airdress_mls_propose_remove(
     handle_id: u64,
@@ -740,14 +743,17 @@ pub extern "C" fn airdress_mls_propose_remove(
     let mut guard = ENGINES.lock().expect("poisoned");
     match guard.get_mut(&handle_id) {
         Some(engine) => match engine.propose_remove(group_id, leaf_index) {
-            Ok(bytes) => FfiBytes::ok(bytes),
+            Ok(()) => FfiBytes::ok(Vec::new()),
             Err(e) => FfiBytes::err(e),
         },
         None => FfiBytes::err("invalid handle".into()),
     }
 }
 
-/// Propose replacing this device's own leaf key (FR-1).
+/// Propose replacing this device's own leaf key (FR-1). Returns the
+/// bare proposal for publication — the one operation that must travel
+/// by reference, because RFC 9420 forbids a committer from including
+/// its own `Update`.
 #[unsafe(no_mangle)]
 pub extern "C" fn airdress_mls_propose_update(
     handle_id: u64,
