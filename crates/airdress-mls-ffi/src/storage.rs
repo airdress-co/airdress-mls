@@ -21,6 +21,34 @@
 //! four Android ABIs, two iOS targets and desktop buys indexing we do
 //! not need at ~50 groups, where a sealed file per group is auditable
 //! in an afternoon.
+//!
+//! ## Bounded epoch retention is a security property (SPEC-061 FR-21)
+//!
+//! [`SealedGroupStore`] retains at most
+//! [`DEFAULT_MAX_EPOCH_RETENTION`] past-epoch records per group,
+//! trimming the oldest on every write. This is **not** housekeeping.
+//! `mls-rs`'s own `InMemoryGroupStateStorage` trims to the same bound
+//! and this store did not, which was harmless only for as long as no
+//! group ever advanced an epoch. Once Commits ship, an untrimmed
+//! store keeps every departed epoch's secret tree on disk forever, so
+//! anyone who later obtains the sealed file and the state key can
+//! decrypt every message ever sent in the group — inter-epoch forward
+//! secrecy destroyed at the storage layer regardless of what the
+//! protocol does correctly (SPEC-061 NFR-4).
+//!
+//! Trimming happens on the write path, inside the same re-seal. A
+//! background compaction pass would leave a window in which the
+//! records still exist, and that window is exactly the moment after
+//! an epoch advance — which is when an attacker holding the disk is
+//! most interested.
+//!
+//! **What this does not do** (SPEC-061 NFR-5): the sealed write
+//! replaces a file by rename, so the superseded ciphertext's bytes may
+//! survive on the filesystem at the filesystem's discretion. Bounded
+//! retention is a true statement about the *record*. "The old epoch
+//! secrets are gone from the disk" is not a true statement and must
+//! not be made. The same caveat already applies to the group state
+//! file and is recorded in SPEC-054 §"Delivered".
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -285,13 +313,78 @@ impl GroupRecord {
     }
 }
 
+/// How many past-epoch records a group retains on disk by default.
+///
+/// Matches `mls-rs`'s own `DEFAULT_EPOCH_RETENTION_LIMIT` (3) in
+/// `InMemoryGroupStateStorage`, deliberately: this store stands in for
+/// that one, and a different number here would mean forward secrecy
+/// depended on which provider a binary happened to build with.
+pub const DEFAULT_MAX_EPOCH_RETENTION: usize = 3;
+
 /// Sealed file-per-group implementation of `GroupStateStorage`.
+///
+/// Retains at most `max_epoch_retention` past-epoch records per group;
+/// see the module docs for why that bound is a security property and
+/// what it does not achieve.
 #[derive(Clone, Debug)]
-pub struct SealedGroupStore(pub SealedStore);
+pub struct SealedGroupStore {
+    store: SealedStore,
+    max_epoch_retention: usize,
+}
 
 impl SealedGroupStore {
+    /// A group store over `store` with the default epoch bound.
+    ///
+    /// Both engines (the FFI client engine and the operator's
+    /// in-process agent engine) construct through here, so neither can
+    /// drift from the other — SPEC-061 FR-23 is satisfied by there
+    /// being one default rather than by two call sites agreeing.
+    #[must_use]
+    pub const fn new(store: SealedStore) -> Self {
+        Self {
+            store,
+            max_epoch_retention: DEFAULT_MAX_EPOCH_RETENTION,
+        }
+    }
+
+    /// A group store with an explicit epoch bound (SPEC-061 FR-23).
+    #[must_use]
+    pub const fn with_max_epoch_retention(store: SealedStore, max_epoch_retention: usize) -> Self {
+        Self {
+            store,
+            max_epoch_retention,
+        }
+    }
+
+    /// The configured retention bound.
+    #[must_use]
+    pub const fn max_epoch_retention(&self) -> usize {
+        self.max_epoch_retention
+    }
+
+    /// The epoch ids currently retained for `group_id`, ascending.
+    ///
+    /// Exists so callers can tell "this epoch was deliberately
+    /// trimmed" from "this message is bad" (SPEC-061 FR-22) without
+    /// reaching into the record encoding.
+    pub fn retained_epoch_ids(&self, group_id: &[u8]) -> Result<Vec<u64>, StorageError> {
+        let Some(record) = self.load(group_id)? else {
+            return Ok(Vec::new());
+        };
+        let mut ids: Vec<u64> = record.epochs.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    /// The oldest epoch id still retained for `group_id`, if any.
+    pub fn oldest_retained_epoch(&self, group_id: &[u8]) -> Result<Option<u64>, StorageError> {
+        Ok(self
+            .load(group_id)?
+            .and_then(|r| r.epochs.iter().map(|(id, _)| *id).min()))
+    }
+
     fn load(&self, group_id: &[u8]) -> Result<Option<GroupRecord>, StorageError> {
-        self.0
+        self.store
             .open_read("groups", GROUP_AAD_LABEL, group_id)?
             .map(|plain| GroupRecord::decode(&plain))
             .transpose()
@@ -337,8 +430,18 @@ impl mls_rs_core::group::GroupStateStorage for SealedGroupStore {
                 slot.1 = update.data.to_vec();
             }
         }
+        // SPEC-061 FR-21 / NFR-4. Trim in the same re-seal that wrote
+        // the new epoch, so there is no window in which the departed
+        // epoch's secrets are on disk unbounded. The record encoding
+        // is unchanged: this removes entries, it does not change how
+        // they are written.
+        if record.epochs.len() > self.max_epoch_retention {
+            record.epochs.sort_unstable_by_key(|(id, _)| *id);
+            let excess = record.epochs.len() - self.max_epoch_retention;
+            record.epochs.drain(..excess);
+        }
         let plaintext = Zeroizing::new(record.encode());
-        self.0
+        self.store
             .seal_write("groups", GROUP_AAD_LABEL, &state.id, &plaintext)
     }
 
@@ -510,5 +613,90 @@ mod tests {
         assert_eq!(back.epochs, record.epochs);
         assert!(GroupRecord::decode(&[]).is_err());
         assert!(GroupRecord::decode(&[2]).is_err());
+    }
+
+    /// SPEC-061 FR-21/FR-22/FR-23 at the store level, without an MLS
+    /// group in the way: writes drive the record past the bound and
+    /// only the highest epoch ids survive, across a reopen.
+    #[test]
+    fn epoch_retention_is_bounded_and_keeps_the_newest() {
+        use mls_rs_core::group::{EpochRecord, GroupState, GroupStateStorage};
+
+        let dir = tempfile::tempdir().unwrap();
+        let group_id = vec![0xaa, 0xbb];
+        let open = || {
+            SealedGroupStore::with_max_epoch_retention(
+                SealedStore::open(dir.path().to_str().unwrap(), &[5u8; 32]).unwrap(),
+                3,
+            )
+        };
+
+        let mut store = open();
+        for epoch in 0..20u64 {
+            store
+                .write(
+                    GroupState {
+                        id: group_id.clone(),
+                        data: Zeroizing::new(vec![u8::try_from(epoch % 256).unwrap()]),
+                    },
+                    vec![EpochRecord {
+                        id: epoch,
+                        data: Zeroizing::new(vec![u8::try_from(epoch % 256).unwrap(); 4]),
+                    }],
+                    Vec::new(),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.retained_epoch_ids(&group_id).unwrap(),
+            vec![17, 18, 19]
+        );
+        assert_eq!(store.max_epoch_id(&group_id).unwrap(), Some(19));
+        assert_eq!(store.oldest_retained_epoch(&group_id).unwrap(), Some(17));
+        // Trimmed epochs are unreachable, not merely uncounted.
+        assert!(store.epoch(&group_id, 0).unwrap().is_none());
+        assert!(store.epoch(&group_id, 16).unwrap().is_none());
+        assert!(store.epoch(&group_id, 17).unwrap().is_some());
+
+        // All of it survives a reopen: the trim is in the record, not
+        // in some in-memory view of it.
+        let reopened = open();
+        assert_eq!(
+            reopened.retained_epoch_ids(&group_id).unwrap(),
+            vec![17, 18, 19]
+        );
+        assert!(reopened.epoch(&group_id, 0).unwrap().is_none());
+        assert_eq!(reopened.max_epoch_id(&group_id).unwrap(), Some(19));
+
+        // An update to a trimmed epoch is a no-op, not a resurrection.
+        let mut reopened = reopened;
+        reopened
+            .write(
+                GroupState {
+                    id: group_id.clone(),
+                    data: Zeroizing::new(vec![99]),
+                },
+                Vec::new(),
+                vec![EpochRecord {
+                    id: 0,
+                    data: Zeroizing::new(vec![0xff; 4]),
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            reopened.retained_epoch_ids(&group_id).unwrap(),
+            vec![17, 18, 19]
+        );
+    }
+
+    #[test]
+    fn default_retention_matches_mls_rs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SealedGroupStore::new(
+            SealedStore::open(dir.path().to_str().unwrap(), &[5u8; 32]).unwrap(),
+        );
+        assert_eq!(store.max_epoch_retention(), DEFAULT_MAX_EPOCH_RETENTION);
+        assert_eq!(DEFAULT_MAX_EPOCH_RETENTION, 3);
     }
 }
