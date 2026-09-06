@@ -489,6 +489,53 @@ pub extern "C" fn airdress_mls_start_group_bound(
     start_group_into_ffi(handle_id, peer_kp, first_msg, binding)
 }
 
+/// Start a group with **no other member** — the owner's self thread on
+/// a single-device owner (SPEC-061 task 7.2).
+///
+/// ## Why this export exists
+///
+/// Task 7.2 retires the `self.local` companion credential, so the self
+/// thread becomes a conversation whose members are the owner's own
+/// devices. An owner with one device has one member, and
+/// `airdress_mls_start_group[_bound]` cannot express that: they take a
+/// peer `KeyPackage`, and the only one a lone device holds is its own,
+/// which under the task 3.3 identity is a duplicate leaf. Without this
+/// the retirement would silently take the self thread away from every
+/// single-device owner.
+///
+/// The result's `welcome_len` is **always 0** — nobody was added, so
+/// there is nothing to send. Callers must not put those bytes on the
+/// wire; they must still free the (empty) buffer through the same
+/// `airdress_mls_free_bytes` contract every other buffer uses, so the
+/// three-buffer shape is kept rather than special-cased.
+///
+/// The binding arguments mirror `airdress_mls_start_group_bound`
+/// exactly: the 16 **raw** bytes of the conversation UUID and the
+/// sending airdress as a NUL-terminated UTF-8 string. Passing both as
+/// null means "no binding", legal pre-cutover and refused past it.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_start_group_solo(
+    handle_id: u64,
+    first_msg_ptr: *const u8,
+    first_msg_len: usize,
+    conversation_id_ptr: *const u8,
+    conversation_id_len: usize,
+    from_airdress: *const c_char,
+) -> FfiStartGroupResult {
+    let first_msg = unsafe { std::slice::from_raw_parts(first_msg_ptr, first_msg_len) };
+    let binding =
+        match unsafe { borrow_binding(conversation_id_ptr, conversation_id_len, from_airdress) } {
+            Ok(b) => b,
+            Err(e) => return ffi_start_group_err(&e),
+        };
+    let mut guard = ENGINES.lock().expect("poisoned");
+    let engine = match guard.get_mut(&handle_id) {
+        Some(e) => e,
+        None => return ffi_start_group_err("invalid handle"),
+    };
+    marshal_start_group(engine.start_group_solo(first_msg, binding))
+}
+
 /// The body both establishment exports share: resolve the handle, run
 /// the engine, and marshal the three buffers out. Written once so the
 /// bound and unbound forms cannot drift in their memory contract.
@@ -504,7 +551,16 @@ fn start_group_into_ffi(
         None => return ffi_start_group_err("invalid handle"),
     };
 
-    match engine.start_group(peer_kp, first_msg, binding) {
+    marshal_start_group(engine.start_group(peer_kp, first_msg, binding))
+}
+
+/// Hand three owned buffers to the caller under the Rust-allocates /
+/// Dart-frees contract. Shared by every establishment export so the
+/// memory contract exists in exactly one place.
+fn marshal_start_group(
+    outcome: Result<crate::engine::StartGroupOutcome, String>,
+) -> FfiStartGroupResult {
+    match outcome {
         Ok(outcome) => {
             let mut gid = outcome.group_id.into_boxed_slice();
             let mut welcome = outcome.welcome.into_boxed_slice();
@@ -1057,6 +1113,7 @@ mod tests {
         airdress_mls_decrypt_bound, airdress_mls_destroy_engine, airdress_mls_encrypt_bound,
         airdress_mls_generate_key_package, airdress_mls_process_welcome,
         airdress_mls_set_v2_cutover, airdress_mls_start_group, airdress_mls_start_group_bound,
+        airdress_mls_start_group_solo,
     };
 
     const CONV: [u8; 16] = [0xc3; 16];
@@ -1258,6 +1315,87 @@ mod tests {
             ))
             .expect("alice reads the reply"),
             b"hi alice"
+        );
+    }
+
+    /// **SPEC-061 task 7.2 — the self thread of a single-device owner.**
+    ///
+    /// Retiring the `self.local` companion credential makes the self
+    /// thread a conversation whose members are the owner's own devices.
+    /// An owner with one device therefore has a conversation with one
+    /// member, which no establishment export could express: they all
+    /// take a peer `KeyPackage`, and the only one a lone device holds
+    /// is its own — a duplicate member under the task 3.3 identity.
+    ///
+    /// Before this export existed the closest a lone device could get
+    /// was to consume its own package, which answers:
+    ///
+    /// ```text
+    /// commit: duplicate signature key, hpke key or identity found at
+    /// index 0
+    /// ```
+    ///
+    /// Asserted here through the FFI boundary specifically, because the
+    /// buffer contract is where an export with an intentionally EMPTY
+    /// welcome could go wrong: the caller still frees three buffers.
+    #[test]
+    fn spec_061_a_lone_device_establishes_its_own_thread() {
+        let alice = engine(ALICE, 0x41, "alice-only", true);
+        let c_alice = CString::new(ALICE).unwrap();
+
+        let started = take_start(airdress_mls_start_group_solo(
+            alice.id,
+            b"note to self".as_ptr(),
+            b"note to self".len(),
+            CONV.as_ptr(),
+            CONV.len(),
+            c_alice.as_ptr(),
+        ))
+        .expect("a single-device owner must still have a self thread");
+
+        assert!(
+            started.welcome.is_empty(),
+            "nobody was added, so there is no Welcome to put on the wire"
+        );
+        assert!(!started.group_id.is_empty());
+        assert!(!started.first_application.is_empty());
+
+        // The group works: the owner keeps writing into it.
+        let more = take_bytes(airdress_mls_encrypt_bound(
+            alice.id,
+            started.group_id.as_ptr(),
+            started.group_id.len(),
+            b"and another".as_ptr(),
+            b"and another".len(),
+            CONV.as_ptr(),
+            CONV.len(),
+            c_alice.as_ptr(),
+        ))
+        .expect("the solo group carries traffic");
+        assert!(!more.is_empty());
+    }
+
+    /// A solo establishment is refused past the cutover with no
+    /// binding, exactly as the peer form is (FR-17a, D-8). The self
+    /// lane is not an exemption — SPEC-054's self thread was the one
+    /// place a "it is only me anyway" argument could have been made,
+    /// and it is wrong: the AAD binds the CONVERSATION, and an owner
+    /// has more than one.
+    #[test]
+    fn spec_061_a_solo_establishment_is_refused_unbound_past_the_cutover() {
+        let alice = engine(ALICE, 0x42, "alice-only-2", true);
+        let err = take_start(airdress_mls_start_group_solo(
+            alice.id,
+            b"note to self".as_ptr(),
+            b"note to self".len(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+        ))
+        .expect_err("unbound past the cutover is an error, not an empty AAD");
+        assert!(
+            err.contains("conversation binding"),
+            "unexpected refusal: {err}"
         );
     }
 

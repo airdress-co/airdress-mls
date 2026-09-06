@@ -506,6 +506,74 @@ impl MlsEngine {
         })
     }
 
+    /// Create a group with **no other member** and encrypt the first
+    /// message into it.
+    ///
+    /// ## Why this exists (SPEC-061 task 7.2)
+    ///
+    /// The owner's self thread is an ordinary conversation whose
+    /// members are the owner's own devices (design §5.5). An owner
+    /// with one device therefore has a conversation with one member,
+    /// and [`Self::start_group`] cannot express it: it demands a peer
+    /// `KeyPackage`, and the only one a lone device holds is its own —
+    /// which under the task 3.3 identity (`airdress ‖ 0x1F ‖
+    /// device_id`) is the *same* member, so `mls-rs` refuses the Add
+    /// with "duplicate signature key, hpke key or identity found at
+    /// index 0".
+    ///
+    /// Before SPEC-061 that case never arose: the `self.local`
+    /// companion credential always supplied a second leaf, which is
+    /// precisely the workaround task 7.2 retires. Retiring it without
+    /// this would have left every single-device owner — the common
+    /// case — with no self thread at all, so the removal table's
+    /// "ordinary conversation" is only true once a conversation may
+    /// have one member.
+    ///
+    /// There is no Welcome, because nobody is added; the outcome's
+    /// `welcome` is empty and callers must not put it on the wire. A
+    /// second device joins later through an ordinary `Add` commit
+    /// ([`Self::propose_add`]), which does produce one — the solo group
+    /// is a starting point, not a separate kind of group.
+    ///
+    /// The binding is resolved before `create_group` for the same
+    /// reason [`Self::start_group`] does it: past the cutover an absent
+    /// binding is a refusal, and refusing after the group exists leaves
+    /// wreckage on disk for no benefit.
+    ///
+    /// # Errors
+    ///
+    /// Past the cutover, an absent `binding` (FR-17a). Otherwise group
+    /// creation, encryption or persistence failures.
+    pub fn start_group_solo(
+        &mut self,
+        first_message: &[u8],
+        binding: Option<MessageBinding<'_>>,
+    ) -> Result<StartGroupOutcome, String> {
+        let aad = aad_for(self.identity_provider.is_v2_cutover(), binding)?;
+
+        let mut group = self
+            .client
+            .create_group(ExtensionList::default(), ExtensionList::default(), None)
+            .map_err(|e| format!("create group: {e}"))?;
+
+        let app = group
+            .encrypt_application_message(first_message, aad)
+            .map_err(|e| format!("encrypt: {e}"))?
+            .to_bytes()
+            .map_err(|e| format!("app serialize: {e}"))?;
+
+        let group_id = group.group_id().to_vec();
+        group
+            .write_to_storage()
+            .map_err(|e| format!("persist group: {e}"))?;
+
+        Ok(StartGroupOutcome {
+            group_id,
+            welcome: Vec::new(),
+            first_application: app,
+        })
+    }
+
     pub fn process_welcome(&mut self, welcome_bytes: &[u8]) -> Result<Vec<u8>, String> {
         let msg = MlsMessage::from_bytes(welcome_bytes).map_err(|e| format!("bad welcome: {e}"))?;
         let (mut group, _) = self
