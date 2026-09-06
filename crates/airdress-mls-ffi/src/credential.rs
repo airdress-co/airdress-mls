@@ -458,6 +458,35 @@ impl Clock for FixedClock {
     }
 }
 
+/// The airdress a leaf belongs to, read out of its credential.
+///
+/// Both identity forms carry it: the structured form in its
+/// `airdress` field, the legacy bare-string form as the whole string.
+/// This is deliberately *not* [`AirdressIdentity::member_identity`] —
+/// that value is per-device, and the question this answers is "whose
+/// device is this?", which is what SPEC-061 FR-25 turns on.
+///
+/// Verification is a separate concern and is not performed here. A
+/// caller using this to make an authorization decision is reading an
+/// identity `mls-rs` has already validated through the identity
+/// provider.
+///
+/// # Errors
+///
+/// [`CredentialVerifyError::Malformed`] when the credential is not a
+/// basic credential or its identity bytes do not parse.
+pub fn airdress_of(
+    signing_identity: &mls_rs::identity::SigningIdentity,
+) -> Result<String, CredentialVerifyError> {
+    let basic = signing_identity.credential.as_basic().ok_or_else(|| {
+        CredentialVerifyError::Malformed("credential is not a basic credential".into())
+    })?;
+    match parse_identity(&basic.identifier).map_err(CredentialVerifyError::Malformed)? {
+        ParsedIdentity::Structured(identity) => Ok(identity.airdress),
+        ParsedIdentity::Legacy(airdress) => Ok(airdress),
+    }
+}
+
 /// Run the chain verification on a parsed identity with the system
 /// clock and no revocation lookup.
 ///

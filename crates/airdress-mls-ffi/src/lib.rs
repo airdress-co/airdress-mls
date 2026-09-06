@@ -12,9 +12,11 @@
 //! CS3 (`MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519`) — same as
 //! the operator's `agent/mls.rs`.
 
+pub mod binding;
 pub mod canonical;
 pub mod credential;
 mod engine;
+pub mod rules;
 
 // The FFI layer requires unsafe at the C boundary, but the engine
 // module (which holds all MLS logic) remains safe Rust.
@@ -22,7 +24,8 @@ mod engine;
 mod ffi;
 pub mod storage;
 
-pub use engine::{EngineError, MlsEngine};
+pub use binding::MessageBinding;
+pub use engine::{CommitOutcome, EngineError, GroupMember, MlsEngine};
 
 #[cfg(test)]
 mod tests {
@@ -57,10 +60,10 @@ mod tests {
         let mut bob = engine_at("bob.test", 2, bob_dir.path());
 
         let bob_kp = bob.generate_key_package().unwrap();
-        let outcome = alice.start_group(&bob_kp, b"hello bob").unwrap();
+        let outcome = alice.start_group(&bob_kp, b"hello bob", None).unwrap();
         bob.process_welcome(&outcome.welcome).unwrap();
         assert_eq!(
-            bob.decrypt(&outcome.group_id, &outcome.first_application)
+            bob.decrypt(&outcome.group_id, &outcome.first_application, None)
                 .unwrap(),
             b"hello bob"
         );
@@ -68,12 +71,12 @@ mod tests {
         // Encrypt BEFORE the restart; decrypt after reconstruction
         // from the same state_dir + state_key.
         let pre_restart = alice
-            .encrypt(&outcome.group_id, b"sent before restart")
+            .encrypt(&outcome.group_id, b"sent before restart", None)
             .unwrap();
         drop(bob);
         let mut bob = engine_at("bob.test", 2, bob_dir.path());
         assert_eq!(
-            bob.decrypt(&outcome.group_id, &pre_restart).unwrap(),
+            bob.decrypt(&outcome.group_id, &pre_restart, None).unwrap(),
             b"sent before restart"
         );
     }
@@ -86,7 +89,7 @@ mod tests {
         let mut bob = engine_at("bob.test", 4, bob_dir.path());
 
         let bob_kp = bob.generate_key_package().unwrap();
-        let outcome = alice.start_group(&bob_kp, b"hi").unwrap();
+        let outcome = alice.start_group(&bob_kp, b"hi", None).unwrap();
         bob.process_welcome(&outcome.welcome).unwrap();
 
         // Corrupt bob's sealed group file.
@@ -103,8 +106,8 @@ mod tests {
 
         drop(bob);
         let mut bob = engine_at("bob.test", 4, bob_dir.path());
-        let msg = alice.encrypt(&outcome.group_id, b"again").unwrap();
-        let err = match bob.decrypt(&outcome.group_id, &msg) {
+        let msg = alice.encrypt(&outcome.group_id, b"again", None).unwrap();
+        let err = match bob.decrypt(&outcome.group_id, &msg, None) {
             Err(e) => e,
             Ok(_) => panic!("corrupt state must refuse, not panic"),
         };
@@ -157,11 +160,11 @@ mod tests {
         let mut bob = engine_at("bob.test", 7, bob_dir.path());
 
         let outcome = alice
-            .start_group(&bob_kp, b"welcome across restart")
+            .start_group(&bob_kp, b"welcome across restart", None)
             .unwrap();
         bob.process_welcome(&outcome.welcome).unwrap();
         assert_eq!(
-            bob.decrypt(&outcome.group_id, &outcome.first_application)
+            bob.decrypt(&outcome.group_id, &outcome.first_application, None)
                 .unwrap(),
             b"welcome across restart"
         );
@@ -219,17 +222,17 @@ mod tests {
         let mut bob = MlsEngine::new("bob.test").unwrap();
 
         let bob_kp = bob.generate_key_package().unwrap();
-        let outcome = alice.start_group(&bob_kp, b"hello bob").unwrap();
+        let outcome = alice.start_group(&bob_kp, b"hello bob", None).unwrap();
 
         bob.process_welcome(&outcome.welcome).unwrap();
 
         let plaintext = bob
-            .decrypt(&outcome.group_id, &outcome.first_application)
+            .decrypt(&outcome.group_id, &outcome.first_application, None)
             .unwrap();
         assert_eq!(plaintext, b"hello bob");
 
-        let bob_reply = bob.encrypt(&outcome.group_id, b"hi alice").unwrap();
-        let alice_sees = alice.decrypt(&outcome.group_id, &bob_reply).unwrap();
+        let bob_reply = bob.encrypt(&outcome.group_id, b"hi alice", None).unwrap();
+        let alice_sees = alice.decrypt(&outcome.group_id, &bob_reply, None).unwrap();
         assert_eq!(alice_sees, b"hi alice");
     }
 
@@ -258,11 +261,12 @@ mod tests {
         let mut bob = engine_at("bob.test", 22, bob_dir.path());
 
         let bob_kp = bob.generate_key_package().unwrap();
-        let outcome = alice.start_group(&bob_kp, b"hello bob").unwrap();
+        let outcome = alice.start_group(&bob_kp, b"hello bob", None).unwrap();
         let group_id = outcome.group_id.clone();
         bob.process_welcome(&outcome.welcome).unwrap();
         assert_eq!(
-            bob.decrypt(&group_id, &outcome.first_application).unwrap(),
+            bob.decrypt(&group_id, &outcome.first_application, None)
+                .unwrap(),
             b"hello bob"
         );
 
@@ -270,12 +274,20 @@ mod tests {
         // replayed at the end — the "attacker with the sealed file"
         // row of the requirements threat table.
         let early_epoch = bob.group_epoch(&group_id).expect("bob is in the group");
-        let early_ciphertext = alice.encrypt(&group_id, b"the first thing said").unwrap();
+        let early_ciphertext = alice
+            .encrypt(&group_id, b"the first thing said", None)
+            .unwrap();
 
-        // Advance 20 epochs. Alice commits, Bob follows.
+        // Advance 20 epochs with real commits (Phase 4 replaced the
+        // `test_only_advance_epoch` / `test_only_process_commit`
+        // scaffolding this test used to need). Alice commits and
+        // confirms; Bob applies.
         for _ in 0..20 {
-            let commit = alice.test_only_advance_epoch(&group_id).unwrap();
-            bob.test_only_process_commit(&group_id, &commit).unwrap();
+            let outcome = alice.commit_pending(&group_id).unwrap();
+            alice.confirm_commit(&group_id).unwrap();
+            let applied = bob.process_commit(&group_id, &outcome.commit).unwrap();
+            assert_eq!(applied.epoch, outcome.epoch);
+            assert!(!applied.self_removed);
         }
 
         let retained = bob.group_store().retained_epoch_ids(&group_id).unwrap();
@@ -296,7 +308,7 @@ mod tests {
         assert!(retained.len() <= crate::storage::DEFAULT_MAX_EPOCH_RETENTION);
 
         let err = bob
-            .decrypt(&group_id, &early_ciphertext)
+            .decrypt(&group_id, &early_ciphertext, None)
             .expect_err("a trimmed epoch must not decrypt");
         match err {
             EngineError::EpochUnavailable {
@@ -327,16 +339,18 @@ mod tests {
         let mut bob = engine_at("bob.test", 24, bob_dir.path());
 
         let bob_kp = bob.generate_key_package().unwrap();
-        let outcome = alice.start_group(&bob_kp, b"hello bob").unwrap();
+        let outcome = alice.start_group(&bob_kp, b"hello bob", None).unwrap();
         bob.process_welcome(&outcome.welcome).unwrap();
-        bob.decrypt(&outcome.group_id, &outcome.first_application)
+        bob.decrypt(&outcome.group_id, &outcome.first_application, None)
             .unwrap();
 
-        let mut ciphertext = alice.encrypt(&outcome.group_id, b"current epoch").unwrap();
+        let mut ciphertext = alice
+            .encrypt(&outcome.group_id, b"current epoch", None)
+            .unwrap();
         let last = ciphertext.len() - 1;
         ciphertext[last] ^= 0x01;
         let err = bob
-            .decrypt(&outcome.group_id, &ciphertext)
+            .decrypt(&outcome.group_id, &ciphertext, None)
             .expect_err("a mangled message must not decrypt");
         assert!(
             !matches!(err, EngineError::EpochUnavailable { .. }),
@@ -364,18 +378,23 @@ mod tests {
         let mut bob = engine_at("bob.test", 26, bob_dir.path());
 
         let bob_kp = bob.generate_key_package().unwrap();
-        let outcome = alice.start_group(&bob_kp, b"hello bob").unwrap();
+        let outcome = alice.start_group(&bob_kp, b"hello bob", None).unwrap();
         let group_id = outcome.group_id.clone();
         bob.process_welcome(&outcome.welcome).unwrap();
-        bob.decrypt(&group_id, &outcome.first_application).unwrap();
+        bob.decrypt(&group_id, &outcome.first_application, None)
+            .unwrap();
 
         let epoch_before = bob.group_epoch(&group_id).expect("bob is in the group");
         let max_epoch_before = bob.group_store().max_epoch_id(&group_id).unwrap();
 
-        // A genuine Commit, misrouted onto the application path.
-        let commit = alice.test_only_commit_bytes(&group_id).unwrap();
+        // A genuine Commit, misrouted onto the application path. It
+        // is built but never confirmed, so Alice's own sealed state is
+        // untouched too — the two-phase shape (FR-7) makes producing
+        // one for this test a normal operation rather than scaffolding.
+        let commit = alice.commit_pending(&group_id).unwrap().commit;
+        alice.abort_commit(&group_id).unwrap();
         let err = bob
-            .decrypt(&group_id, &commit)
+            .decrypt(&group_id, &commit, None)
             .expect_err("a commit is not an application message");
         assert_eq!(err.to_string(), "not an application message");
 
@@ -391,7 +410,10 @@ mod tests {
         );
 
         // And the group is still usable at the epoch it was left at.
-        let msg = alice.encrypt(&group_id, b"still working").unwrap();
-        assert_eq!(bob.decrypt(&group_id, &msg).unwrap(), b"still working");
+        let msg = alice.encrypt(&group_id, b"still working", None).unwrap();
+        assert_eq!(
+            bob.decrypt(&group_id, &msg, None).unwrap(),
+            b"still working"
+        );
     }
 }

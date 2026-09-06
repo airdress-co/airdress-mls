@@ -16,7 +16,8 @@ use std::os::raw::c_char;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::engine::MlsEngine;
+use super::binding::MessageBinding;
+use super::engine::{CommitOutcome, MlsEngine};
 
 // ---------------------------------------------------------------------------
 // Handle table
@@ -339,6 +340,17 @@ impl FfiBytesList {
             error: c_str.into_raw(),
         }
     }
+
+    /// An empty list carrying no error — what the delta fields of a
+    /// failed `FfiCommitResult` hold, so the single free function has
+    /// nothing to skip.
+    const fn empty() -> Self {
+        Self {
+            items: std::ptr::null_mut(),
+            len: 0,
+            error: std::ptr::null_mut(),
+        }
+    }
 }
 
 /// Generate `count` fresh KeyPackages and return their publishable
@@ -428,7 +440,7 @@ pub extern "C" fn airdress_mls_start_group(
         None => return ffi_start_group_err("invalid handle"),
     };
 
-    match engine.start_group(peer_kp, first_msg) {
+    match engine.start_group(peer_kp, first_msg, None) {
         Ok(outcome) => {
             let mut gid = outcome.group_id.into_boxed_slice();
             let mut welcome = outcome.welcome.into_boxed_slice();
@@ -482,7 +494,7 @@ pub extern "C" fn airdress_mls_encrypt(
     let plaintext = unsafe { std::slice::from_raw_parts(plaintext_ptr, plaintext_len) };
     let mut guard = ENGINES.lock().expect("poisoned");
     match guard.get_mut(&handle_id) {
-        Some(engine) => match engine.encrypt(group_id, plaintext) {
+        Some(engine) => match engine.encrypt(group_id, plaintext, None) {
             Ok(bytes) => FfiBytes::ok(bytes),
             Err(e) => FfiBytes::err(e),
         },
@@ -503,7 +515,7 @@ pub extern "C" fn airdress_mls_decrypt(
     let message = unsafe { std::slice::from_raw_parts(message_ptr, message_len) };
     let mut guard = ENGINES.lock().expect("poisoned");
     match guard.get_mut(&handle_id) {
-        Some(engine) => match engine.decrypt(group_id, message) {
+        Some(engine) => match engine.decrypt(group_id, message, None) {
             Ok(bytes) => FfiBytes::ok(bytes),
             // SPEC-061 FR-22: the variant is distinguishable in Rust;
             // across the C boundary it is still one sentence, per the
@@ -512,6 +524,413 @@ pub extern "C" fn airdress_mls_decrypt(
             Err(e) => FfiBytes::err(e.to_string()),
         },
         None => FfiBytes::err("invalid handle".into()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-061 Phase 4: proposals, commits, and the bound application path
+// ---------------------------------------------------------------------------
+
+/// Result of a commit operation — built (`commit_pending`) or applied
+/// (`process_commit`).
+///
+/// The three-buffer shape `FfiStartGroupResult` already uses, plus the
+/// membership delta FR-4 requires. `added`, `removed` and `members`
+/// carry member identities (`airdress ‖ 0x1F ‖ device_id` under the v2
+/// credential).
+///
+/// `self_removed` is `1` when THIS device was the leaf the commit
+/// evicted. It is the signal that lets a removed device say so rather
+/// than presenting a permanent, unexplained decryption failure.
+///
+/// Free with `airdress_mls_free_commit_result` — one call releases the
+/// commit buffer, the welcome buffer, all three lists and the error.
+#[repr(C)]
+pub struct FfiCommitResult {
+    pub commit_ptr: *mut u8,
+    pub commit_len: usize,
+    pub welcome_ptr: *mut u8,
+    pub welcome_len: usize,
+    pub epoch: i64,
+    pub self_removed: i32,
+    pub added: FfiBytesList,
+    pub removed: FfiBytesList,
+    pub members: FfiBytesList,
+    pub error: *mut c_char,
+}
+
+fn ffi_commit_err(msg: &str) -> FfiCommitResult {
+    let c_str = std::ffi::CString::new(msg).unwrap_or_default();
+    FfiCommitResult {
+        commit_ptr: std::ptr::null_mut(),
+        commit_len: 0,
+        welcome_ptr: std::ptr::null_mut(),
+        welcome_len: 0,
+        epoch: -1,
+        self_removed: 0,
+        added: FfiBytesList::empty(),
+        removed: FfiBytesList::empty(),
+        members: FfiBytesList::empty(),
+        error: c_str.into_raw(),
+    }
+}
+
+fn ffi_commit_ok(outcome: CommitOutcome) -> FfiCommitResult {
+    let mut commit = outcome.commit.into_boxed_slice();
+    let commit_ptr = commit.as_mut_ptr();
+    let commit_len = commit.len();
+    std::mem::forget(commit);
+
+    let (welcome_ptr, welcome_len) = outcome.welcome.map_or_else(
+        || (std::ptr::null_mut(), 0),
+        |w| {
+            let mut boxed = w.into_boxed_slice();
+            let ptr = boxed.as_mut_ptr();
+            let len = boxed.len();
+            std::mem::forget(boxed);
+            (ptr, len)
+        },
+    );
+
+    FfiCommitResult {
+        commit_ptr,
+        commit_len,
+        welcome_ptr,
+        welcome_len,
+        epoch: i64::try_from(outcome.epoch).unwrap_or(i64::MAX),
+        self_removed: i32::from(outcome.self_removed),
+        added: FfiBytesList::ok(outcome.added),
+        removed: FfiBytesList::ok(outcome.removed),
+        members: FfiBytesList::ok(outcome.members),
+        error: std::ptr::null_mut(),
+    }
+}
+
+/// Borrow the optional AAD binding arguments (SPEC-061 FR-17a).
+///
+/// Both null means "no binding", which is legal only while the engine
+/// is pre-cutover; the engine refuses it afterwards rather than
+/// silently falling back to an empty AAD.
+///
+/// # Safety
+///
+/// `conversation_id` must point at `conversation_id_len` readable
+/// bytes when non-null; `from_airdress` must be a NUL-terminated
+/// UTF-8 string when non-null.
+unsafe fn borrow_binding<'a>(
+    conversation_id: *const u8,
+    conversation_id_len: usize,
+    from_airdress: *const c_char,
+) -> Result<Option<MessageBinding<'a>>, String> {
+    if conversation_id.is_null() && from_airdress.is_null() {
+        return Ok(None);
+    }
+    if conversation_id.is_null() || from_airdress.is_null() {
+        return Err("a message binding needs both conversation_id and from_airdress".to_owned());
+    }
+    if conversation_id_len != 16 {
+        return Err(format!(
+            "conversation_id must be 16 raw bytes, got {conversation_id_len}"
+        ));
+    }
+    let conv: [u8; 16] = unsafe { std::slice::from_raw_parts(conversation_id, 16) }
+        .try_into()
+        .map_err(|_| "conversation_id length error".to_owned())?;
+    let airdress = required_str(from_airdress, "from_airdress")?;
+    Ok(Some(MessageBinding::new(conv, airdress)))
+}
+
+/// Encrypt with the SPEC-061 FR-17a conversation binding.
+///
+/// `airdress_mls_encrypt` stays as the unbound form so a pre-cutover
+/// client keeps working unchanged; this is the symbol the client moves
+/// to at cutover. Pass a 16-byte raw `conversation_id` and the sending
+/// airdress.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_encrypt_bound(
+    handle_id: u64,
+    group_id_ptr: *const u8,
+    group_id_len: usize,
+    plaintext_ptr: *const u8,
+    plaintext_len: usize,
+    conversation_id_ptr: *const u8,
+    conversation_id_len: usize,
+    from_airdress: *const c_char,
+) -> FfiBytes {
+    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
+    let plaintext = unsafe { std::slice::from_raw_parts(plaintext_ptr, plaintext_len) };
+    let binding =
+        match unsafe { borrow_binding(conversation_id_ptr, conversation_id_len, from_airdress) } {
+            Ok(b) => b,
+            Err(e) => return FfiBytes::err(e),
+        };
+    let mut guard = ENGINES.lock().expect("poisoned");
+    match guard.get_mut(&handle_id) {
+        Some(engine) => match engine.encrypt(group_id, plaintext, binding) {
+            Ok(bytes) => FfiBytes::ok(bytes),
+            Err(e) => FfiBytes::err(e),
+        },
+        None => FfiBytes::err("invalid handle".into()),
+    }
+}
+
+/// Decrypt with the SPEC-061 FR-17a conversation binding. The
+/// counterpart to `airdress_mls_encrypt_bound`; the binding is
+/// computed from the envelope's cleartext columns before the call.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_decrypt_bound(
+    handle_id: u64,
+    group_id_ptr: *const u8,
+    group_id_len: usize,
+    message_ptr: *const u8,
+    message_len: usize,
+    conversation_id_ptr: *const u8,
+    conversation_id_len: usize,
+    from_airdress: *const c_char,
+) -> FfiBytes {
+    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
+    let message = unsafe { std::slice::from_raw_parts(message_ptr, message_len) };
+    let binding =
+        match unsafe { borrow_binding(conversation_id_ptr, conversation_id_len, from_airdress) } {
+            Ok(b) => b,
+            Err(e) => return FfiBytes::err(e),
+        };
+    let mut guard = ENGINES.lock().expect("poisoned");
+    match guard.get_mut(&handle_id) {
+        Some(engine) => match engine.decrypt(group_id, message, binding) {
+            Ok(bytes) => FfiBytes::ok(bytes),
+            Err(e) => FfiBytes::err(e.to_string()),
+        },
+        None => FfiBytes::err("invalid handle".into()),
+    }
+}
+
+/// Stage an `Add` for the group's next commit (FR-3). Staged by value
+/// — the commit built by `airdress_mls_commit_pending` carries it, so
+/// no separate proposal message goes on the wire. Returns an empty
+/// buffer on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_propose_add(
+    handle_id: u64,
+    group_id_ptr: *const u8,
+    group_id_len: usize,
+    key_package_ptr: *const u8,
+    key_package_len: usize,
+) -> FfiBytes {
+    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
+    let kp = unsafe { std::slice::from_raw_parts(key_package_ptr, key_package_len) };
+    let mut guard = ENGINES.lock().expect("poisoned");
+    match guard.get_mut(&handle_id) {
+        Some(engine) => match engine.propose_add(group_id, kp) {
+            Ok(()) => FfiBytes::ok(Vec::new()),
+            Err(e) => FfiBytes::err(e),
+        },
+        None => FfiBytes::err("invalid handle".into()),
+    }
+}
+
+/// Stage a `Remove` of `leaf_index` for the group's next commit
+/// (FR-2), by value. Refused when the leaf belongs to another airdress
+/// (FR-25). Returns an empty buffer on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_propose_remove(
+    handle_id: u64,
+    group_id_ptr: *const u8,
+    group_id_len: usize,
+    leaf_index: u32,
+) -> FfiBytes {
+    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
+    let mut guard = ENGINES.lock().expect("poisoned");
+    match guard.get_mut(&handle_id) {
+        Some(engine) => match engine.propose_remove(group_id, leaf_index) {
+            Ok(()) => FfiBytes::ok(Vec::new()),
+            Err(e) => FfiBytes::err(e),
+        },
+        None => FfiBytes::err("invalid handle".into()),
+    }
+}
+
+/// Propose replacing this device's own leaf key (FR-1). Returns the
+/// bare proposal for publication — the one operation that must travel
+/// by reference, because RFC 9420 forbids a committer from including
+/// its own `Update`.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_propose_update(
+    handle_id: u64,
+    group_id_ptr: *const u8,
+    group_id_len: usize,
+) -> FfiBytes {
+    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
+    let mut guard = ENGINES.lock().expect("poisoned");
+    match guard.get_mut(&handle_id) {
+        Some(engine) => match engine.propose_update(group_id) {
+            Ok(bytes) => FfiBytes::ok(bytes),
+            Err(e) => FfiBytes::err(e),
+        },
+        None => FfiBytes::err("invalid handle".into()),
+    }
+}
+
+/// Hold an inbound bare proposal for the next commit (FR-5). Returns
+/// an empty buffer on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_process_proposal(
+    handle_id: u64,
+    group_id_ptr: *const u8,
+    group_id_len: usize,
+    message_ptr: *const u8,
+    message_len: usize,
+) -> FfiBytes {
+    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
+    let message = unsafe { std::slice::from_raw_parts(message_ptr, message_len) };
+    let mut guard = ENGINES.lock().expect("poisoned");
+    match guard.get_mut(&handle_id) {
+        Some(engine) => match engine.process_proposal(group_id, message) {
+            Ok(()) => FfiBytes::ok(Vec::new()),
+            Err(e) => FfiBytes::err(e),
+        },
+        None => FfiBytes::err("invalid handle".into()),
+    }
+}
+
+/// Commit held proposals WITHOUT persisting (FR-7, phase one of two).
+///
+/// The caller publishes `commit_ptr` and only then calls
+/// `airdress_mls_confirm_commit`. On a `409` or a network failure it
+/// calls `airdress_mls_abort_commit`. Persisting before the operator
+/// has accepted the commit forks the group.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_commit_pending(
+    handle_id: u64,
+    group_id_ptr: *const u8,
+    group_id_len: usize,
+) -> FfiCommitResult {
+    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
+    let mut guard = ENGINES.lock().expect("poisoned");
+    match guard.get_mut(&handle_id) {
+        Some(engine) => match engine.commit_pending(group_id) {
+            Ok(outcome) => ffi_commit_ok(outcome),
+            Err(e) => ffi_commit_err(&e),
+        },
+        None => ffi_commit_err("invalid handle"),
+    }
+}
+
+/// Persist a commit built by `airdress_mls_commit_pending` (phase two).
+/// Returns the resulting epoch, `-1` for an invalid handle, `-2` when
+/// no commit was awaiting confirmation or the write failed.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_confirm_commit(
+    handle_id: u64,
+    group_id_ptr: *const u8,
+    group_id_len: usize,
+) -> i64 {
+    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
+    let mut guard = ENGINES.lock().expect("poisoned");
+    match guard.get_mut(&handle_id) {
+        Some(engine) => engine
+            .confirm_commit(group_id)
+            .map_or(-2, |e| i64::try_from(e).unwrap_or(i64::MAX)),
+        None => -1,
+    }
+}
+
+/// Discard a commit built by `airdress_mls_commit_pending`, reloading
+/// the group from sealed storage. Returns the epoch the group is back
+/// at, `-1` for an invalid handle, `-2` when nothing was pending.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_abort_commit(
+    handle_id: u64,
+    group_id_ptr: *const u8,
+    group_id_len: usize,
+) -> i64 {
+    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
+    let mut guard = ENGINES.lock().expect("poisoned");
+    match guard.get_mut(&handle_id) {
+        Some(engine) => engine
+            .abort_commit(group_id)
+            .map_or(-2, |e| i64::try_from(e).unwrap_or(i64::MAX)),
+        None => -1,
+    }
+}
+
+/// Apply another member's commit (FR-4): advance the epoch, persist,
+/// and report the membership delta. `self_removed` is `1` when this
+/// device was the leaf removed.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_process_commit(
+    handle_id: u64,
+    group_id_ptr: *const u8,
+    group_id_len: usize,
+    message_ptr: *const u8,
+    message_len: usize,
+) -> FfiCommitResult {
+    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
+    let message = unsafe { std::slice::from_raw_parts(message_ptr, message_len) };
+    let mut guard = ENGINES.lock().expect("poisoned");
+    match guard.get_mut(&handle_id) {
+        Some(engine) => match engine.process_commit(group_id, message) {
+            Ok(outcome) => ffi_commit_ok(outcome),
+            Err(e) => ffi_commit_err(&e.to_string()),
+        },
+        None => ffi_commit_err("invalid handle"),
+    }
+}
+
+/// The group's current epoch — the value the client declares as
+/// `commit_from_epoch`. Returns `-1` for an invalid handle, `-2` when
+/// the group is not on disk.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_group_epoch(
+    handle_id: u64,
+    group_id_ptr: *const u8,
+    group_id_len: usize,
+) -> i64 {
+    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
+    let guard = ENGINES.lock().expect("poisoned");
+    match guard.get(&handle_id) {
+        Some(engine) => engine
+            .group_epoch(group_id)
+            .map_or(-2, |e| i64::try_from(e).unwrap_or(i64::MAX)),
+        None => -1,
+    }
+}
+
+/// Every member identity in the group, in leaf-index order — for the
+/// membership UI and for AC-4.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_group_members(
+    handle_id: u64,
+    group_id_ptr: *const u8,
+    group_id_len: usize,
+) -> FfiBytesList {
+    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
+    let guard = ENGINES.lock().expect("poisoned");
+    match guard.get(&handle_id) {
+        Some(engine) => match engine.group_members(group_id) {
+            Ok(members) => FfiBytesList::ok(members.into_iter().map(|m| m.identity).collect()),
+            Err(e) => FfiBytesList::err(e),
+        },
+        None => FfiBytesList::err("invalid handle".into()),
+    }
+}
+
+/// Free an `FfiCommitResult` returned by `airdress_mls_commit_pending`
+/// or `airdress_mls_process_commit`.
+///
+/// # Safety
+///
+/// `result` must have been returned by one of those two functions and
+/// must not have been freed before.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn airdress_mls_free_commit_result(result: FfiCommitResult) {
+    unsafe {
+        airdress_mls_free_bytes(result.commit_ptr, result.commit_len);
+        airdress_mls_free_bytes(result.welcome_ptr, result.welcome_len);
+        airdress_mls_free_bytes_list(result.added);
+        airdress_mls_free_bytes_list(result.removed);
+        airdress_mls_free_bytes_list(result.members);
+        airdress_mls_free_error(result.error);
     }
 }
 

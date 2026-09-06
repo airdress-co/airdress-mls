@@ -7,14 +7,15 @@ use mls_rs::client_builder::{
 };
 use mls_rs::identity::SigningIdentity;
 use mls_rs::identity::basic::BasicCredential;
-use mls_rs::mls_rules::DefaultMlsRules;
 use mls_rs::{CipherSuite, Client, ExtensionList, Group, MlsMessage};
 use mls_rs_core::crypto::{SignaturePublicKey, SignatureSecretKey};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 
+use crate::binding::{MessageBinding, aad_for};
 use crate::credential::{
-    AirdressIdentity, AirdressIdentityProvider, Clock, RevocationLookup, RootKeyLookup,
+    AirdressIdentity, AirdressIdentityProvider, Clock, RevocationLookup, RootKeyLookup, airdress_of,
 };
+use crate::rules::AirdressMlsRules;
 use crate::storage::{
     DEFAULT_MAX_EPOCH_RETENTION, SealedGroupStore, SealedKeyPackageStore, SealedStore,
 };
@@ -89,7 +90,7 @@ type MlsConfig = WithIdentityProvider<
     WithCryptoProvider<
         RustCryptoProvider,
         WithMlsRules<
-            DefaultMlsRules,
+            AirdressMlsRules,
             WithGroupStateStorage<
                 SealedGroupStore,
                 WithKeyPackageRepo<SealedKeyPackageStore, BaseInMemoryConfig>,
@@ -102,6 +103,58 @@ pub struct StartGroupOutcome {
     pub group_id: Vec<u8>,
     pub welcome: Vec<u8>,
     pub first_application: Vec<u8>,
+}
+
+/// What a commit did to the membership, and what has to go on the
+/// wire because of it (SPEC-061 FR-4).
+///
+/// `added` / `removed` / `members` all carry **member identities** —
+/// `airdress ‖ 0x1F ‖ device_id` under the v2 credential, the bare
+/// airdress under v1 — because that is the value `mls-rs` uses to tell
+/// leaves apart and therefore the only value that names a device
+/// unambiguously.
+///
+/// The delta is reported rather than left implicit so that:
+///
+/// - the caller can render "Alice removed her old phone" without
+///   re-deriving it from two roster snapshots, and
+/// - **a removed device learns that it was removed.** `self_removed`
+///   is the signal that turns a silent, permanent decryption failure
+///   into a state the client can act on. Without it the removed device
+///   sees only that nothing decrypts any more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitOutcome {
+    /// The commit message to publish. Empty when this outcome
+    /// describes an inbound commit that was processed rather than one
+    /// that was built.
+    pub commit: Vec<u8>,
+    /// The Welcome for members added by this commit, if any.
+    pub welcome: Option<Vec<u8>>,
+    /// The epoch the group is at after applying the commit.
+    pub epoch: u64,
+    /// Member identities that joined.
+    pub added: Vec<Vec<u8>>,
+    /// Member identities that left.
+    pub removed: Vec<Vec<u8>>,
+    /// Whether **this** device was the one removed. When true the
+    /// group is gone: nothing sent after this commit is readable here,
+    /// and the only way back in is a rejoin (SPEC-061 FR-30).
+    pub self_removed: bool,
+    /// The full membership after the commit.
+    pub members: Vec<Vec<u8>>,
+}
+
+/// One leaf of a group, as the caller sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupMember {
+    /// Leaf index. Stable for the life of the leaf; this is what a
+    /// `Remove` names.
+    pub index: u32,
+    /// `airdress ‖ 0x1F ‖ device_id` (v2) or the bare airdress (v1).
+    pub identity: Vec<u8>,
+    /// The airdress this leaf belongs to — what SPEC-061 FR-25 turns
+    /// on.
+    pub airdress: String,
 }
 
 /// Unique-enough suffix for per-test state directories.
@@ -125,6 +178,35 @@ pub struct MlsEngine {
     /// through, so the engine can ask which epochs survived the
     /// retention trim (SPEC-061 FR-22) without decoding the record.
     groups: SealedGroupStore,
+    /// Groups carrying a commit that has been applied in memory and
+    /// deliberately NOT persisted, awaiting
+    /// [`MlsEngine::confirm_commit`] or [`MlsEngine::abort_commit`]
+    /// (SPEC-061 FR-7). See the two-phase note on
+    /// [`MlsEngine::commit_pending`].
+    pending: std::collections::HashMap<Vec<u8>, Group<MlsConfig>>,
+    /// Proposals staged for this group's next commit, held **by
+    /// value** so the commit is the only thing that has to reach the
+    /// group (design §6.1: one `mls_commit` envelope, no proposal
+    /// envelope kind exists).
+    ///
+    /// A by-reference proposal would have to be published and
+    /// processed by every member before any commit referencing it
+    /// could be applied — otherwise they fail with "by-ref proposal
+    /// not found". Inbound bare proposals from other members are still
+    /// held by reference, through
+    /// [`MlsEngine::process_proposal`](Self::process_proposal); this
+    /// map is only for proposals this device originates.
+    staged: std::collections::HashMap<Vec<u8>, Vec<StagedProposal>>,
+}
+
+/// A proposal this device originated, waiting to be folded into its
+/// next commit by value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StagedProposal {
+    /// Serialized `KeyPackage` of the member to add.
+    Add(Vec<u8>),
+    /// Leaf index of the member to remove.
+    Remove(u32),
 }
 
 impl MlsEngine {
@@ -236,7 +318,7 @@ impl MlsEngine {
         let client = Client::builder()
             .key_package_repo(key_package_store.clone())
             .group_state_storage(group_store.clone())
-            .mls_rules(DefaultMlsRules::default())
+            .mls_rules(AirdressMlsRules::new())
             .crypto_provider(RustCryptoProvider::default())
             .identity_provider(identity_provider.clone())
             .signing_identity(signing_identity, secret_key, CIPHER_SUITE)
@@ -248,6 +330,8 @@ impl MlsEngine {
             identity_provider,
             key_packages: key_package_store,
             groups: group_store,
+            pending: std::collections::HashMap::new(),
+            staged: std::collections::HashMap::new(),
         };
 
         // First init on this state dir: establish the pool. The
@@ -358,10 +442,15 @@ impl MlsEngine {
             .map_err(|e| e.to_string())
     }
 
+    /// Create a group with one peer and send the first message.
+    ///
+    /// `binding` is the SPEC-061 FR-17a AAD binding for the first
+    /// application message; see [`MlsEngine::encrypt`].
     pub fn start_group(
         &mut self,
         peer_key_package: &[u8],
         first_message: &[u8],
+        binding: Option<MessageBinding<'_>>,
     ) -> Result<StartGroupOutcome, String> {
         let peer_kp =
             MlsMessage::from_bytes(peer_key_package).map_err(|e| format!("bad kp: {e}"))?;
@@ -390,8 +479,9 @@ impl MlsEngine {
             .to_bytes()
             .map_err(|e| format!("welcome serialize: {e}"))?;
 
+        let aad = aad_for(self.identity_provider.is_v2_cutover(), binding)?;
         let app = group
-            .encrypt_application_message(first_message, Vec::new())
+            .encrypt_application_message(first_message, aad)
             .map_err(|e| format!("encrypt: {e}"))?
             .to_bytes()
             .map_err(|e| format!("app serialize: {e}"))?;
@@ -430,10 +520,31 @@ impl MlsEngine {
             .map_err(|e| format!("load group: {e}"))
     }
 
-    pub fn encrypt(&mut self, group_id: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    /// Encrypt an application message under a group's current epoch.
+    ///
+    /// ## The binding (SPEC-061 FR-17a / design D-8)
+    ///
+    /// `binding` carries the conversation id and the sending airdress.
+    /// Past the v2 cutover those bytes become the message's AAD, so a
+    /// ciphertext moved to another conversation — or re-attributed to
+    /// another sender — fails to decrypt instead of rendering under
+    /// the wrong heading with a valid signature. Before the cutover
+    /// the AAD stays empty, because a `v: 1` peer computes an empty
+    /// AAD and the two must agree byte for byte.
+    ///
+    /// Both components are cleartext columns on the envelope row, so
+    /// the receiver can compute the same value **before** it decrypts.
+    /// That constraint is what picked these two fields and not others.
+    pub fn encrypt(
+        &mut self,
+        group_id: &[u8],
+        plaintext: &[u8],
+        binding: Option<MessageBinding<'_>>,
+    ) -> Result<Vec<u8>, String> {
+        let aad = aad_for(self.identity_provider.is_v2_cutover(), binding)?;
         let mut group = self.load_group(group_id)?;
         let msg = group
-            .encrypt_application_message(plaintext, Vec::new())
+            .encrypt_application_message(plaintext, aad)
             .map_err(|e| format!("encrypt: {e}"))?;
         group
             .write_to_storage()
@@ -503,7 +614,10 @@ impl MlsEngine {
         &mut self,
         group_id: &[u8],
         message_bytes: &[u8],
+        binding: Option<MessageBinding<'_>>,
     ) -> Result<Vec<u8>, EngineError> {
+        let expected_aad =
+            aad_for(self.identity_provider.is_v2_cutover(), binding).map_err(EngineError::Other)?;
         let msg = MlsMessage::from_bytes(message_bytes)
             .map_err(|e| EngineError::Other(format!("bad message: {e}")))?;
         let message_epoch = msg.epoch();
@@ -522,6 +636,18 @@ impl MlsEngine {
         };
         match received {
             mls_rs::group::ReceivedMessage::ApplicationMessage(app) => {
+                // The AAD is authenticated by the AEAD, but mls-rs
+                // hands it back rather than checking it against an
+                // expectation — it has no way to know ours. Compare
+                // here, and reject before the plaintext is handed on:
+                // a ciphertext re-filed into another conversation or
+                // re-attributed to another sender must fail, not
+                // render under the wrong heading (FR-17a / AC-11).
+                if app.authenticated_data != expected_aad {
+                    return Err(EngineError::Other(
+                        "this message does not belong to this conversation".to_owned(),
+                    ));
+                }
                 let plaintext = app.data().to_vec();
                 // The accepting arm, and the only one that persists:
                 // decryption ratchets the secret tree forward and that
@@ -538,75 +664,407 @@ impl MlsEngine {
         }
     }
 
-    /// Build a commit for `group_id` and return its wire bytes without
-    /// applying or persisting anything.
+    // -----------------------------------------------------------------
+    // SPEC-061 Phase 4: proposals and commits
+    //
+    // Everything below replaces the Phase 1 `test_only_*` scaffolding
+    // (`test_only_commit_bytes`, `test_only_advance_epoch`,
+    // `test_only_process_commit`), which existed only so a Phase 1
+    // test could misroute a genuine Commit onto the application path.
+    // The regression tests that used it now drive the real surface.
+    // -----------------------------------------------------------------
+
+    /// Every leaf of a group, in leaf-index order.
     ///
-    /// Test-only scaffolding for SPEC-061 Phase 1: the real proposal
-    /// and commit surface lands in Phase 4 (tasks 4.1-4.4). It exists
-    /// here so a test can misroute a genuine Commit onto the
-    /// application path and assert the on-disk epoch does not move.
-    #[cfg(test)]
-    pub(crate) fn test_only_commit_bytes(
-        &mut self,
-        group_id: &[u8],
-    ) -> Result<Vec<u8>, EngineError> {
-        let mut group = self.load_group(group_id)?;
-        let output = group
-            .commit(Vec::new())
-            .map_err(|e| EngineError::Other(format!("commit: {e}")))?;
-        output
-            .commit_message
-            .to_bytes()
-            .map_err(|e| EngineError::Other(format!("commit serialize: {e}")))
+    /// # Errors
+    ///
+    /// The group is not on disk, or a leaf carries an unreadable
+    /// credential.
+    pub fn group_members(&self, group_id: &[u8]) -> Result<Vec<GroupMember>, String> {
+        let group = self.load_group(group_id)?;
+        self.roster_of(&group)
     }
 
-    /// Apply a self-commit to `group_id`, advancing and persisting the
-    /// epoch. Test-only, for the same reason as
-    /// [`MlsEngine::test_only_commit_bytes`].
-    #[cfg(test)]
-    pub(crate) fn test_only_advance_epoch(
-        &mut self,
-        group_id: &[u8],
-    ) -> Result<Vec<u8>, EngineError> {
-        let mut group = self.load_group(group_id)?;
-        let output = group
-            .commit(Vec::new())
-            .map_err(|e| EngineError::Other(format!("commit: {e}")))?;
+    fn roster_of(&self, group: &Group<MlsConfig>) -> Result<Vec<GroupMember>, String> {
         group
-            .apply_pending_commit()
-            .map_err(|e| EngineError::Other(format!("apply: {e}")))?;
+            .roster()
+            .members_iter()
+            .map(|m| {
+                Ok(GroupMember {
+                    index: m.index,
+                    identity: self.member_identity_bytes(m.signing_identity())?,
+                    airdress: airdress_of(m.signing_identity()).map_err(|e| e.to_string())?,
+                })
+            })
+            .collect()
+    }
+
+    /// The bytes `mls-rs` uses to tell one leaf from another —
+    /// `airdress ‖ 0x1F ‖ device_id` under v2. Resolved through this
+    /// engine's own identity provider, so the value matches what the
+    /// tree used and does not drift with the cutover flag.
+    fn member_identity_bytes(
+        &self,
+        signing_identity: &mls_rs::identity::SigningIdentity,
+    ) -> Result<Vec<u8>, String> {
+        use mls_rs::IdentityProvider as _;
+        self.identity_provider
+            .identity(signing_identity, &ExtensionList::default())
+            .map_err(|e| e.to_string())
+    }
+
+    /// This device's own leaf index in a group.
+    fn own_index(group: &Group<MlsConfig>) -> u32 {
+        group.current_member_index()
+    }
+
+    /// Stage an `Add` for this group's next commit (SPEC-061 FR-3).
+    ///
+    /// Staged **by value**: the commit built by
+    /// [`MlsEngine::commit_pending`] carries the proposal itself, so
+    /// the commit is the only message that has to reach the group.
+    /// That matches design §6.1's flow — one `mls_commit` envelope —
+    /// and it has to, because there is no proposal envelope kind for a
+    /// by-reference proposal to travel in, and a member who never saw
+    /// the reference cannot apply a commit that names it.
+    ///
+    /// # Errors
+    ///
+    /// The group is unknown or the bytes are not a KeyPackage.
+    pub fn propose_add(&mut self, group_id: &[u8], key_package: &[u8]) -> Result<(), String> {
+        MlsMessage::from_bytes(key_package).map_err(|e| format!("bad kp: {e}"))?;
+        // Refuse now if the group is not ours, rather than at commit
+        // time when the caller has forgotten why it staged this.
+        self.load_group(group_id)?;
+        self.staged
+            .entry(group_id.to_vec())
+            .or_default()
+            .push(StagedProposal::Add(key_package.to_vec()));
+        Ok(())
+    }
+
+    /// Stage a `Remove` of the leaf at `index` for this group's next
+    /// commit (SPEC-061 FR-2). Staged by value, for the same reason as
+    /// [`MlsEngine::propose_add`].
+    ///
+    /// ## Cross-airdress removal is refused here too (FR-25)
+    ///
+    /// [`crate::rules::AirdressMlsRules`] is the enforcement point and
+    /// catches this on both the send and the receive side, including
+    /// for a hand-crafted proposal from a client that has had this
+    /// check patched out. The check repeated here is the early refusal
+    /// FR-25 asks for: it fails before the proposal exists, so the
+    /// caller gets a comprehensible error rather than a commit that
+    /// will not build.
+    ///
+    /// # Errors
+    ///
+    /// The group is unknown, the index names no leaf, or the leaf
+    /// belongs to another airdress.
+    pub fn propose_remove(&mut self, group_id: &[u8], index: u32) -> Result<(), String> {
+        let group = self.load_group(group_id)?;
+        Self::refuse_cross_airdress_removal(&group, index)?;
+        drop(group);
+        self.staged
+            .entry(group_id.to_vec())
+            .or_default()
+            .push(StagedProposal::Remove(index));
+        Ok(())
+    }
+
+    fn refuse_cross_airdress_removal(group: &Group<MlsConfig>, index: u32) -> Result<(), String> {
+        let own = group
+            .member_at_index(Self::own_index(group))
+            .ok_or("this device has no leaf in the group")?;
+        let target = group
+            .member_at_index(index)
+            .ok_or_else(|| format!("no member at leaf {index}"))?;
+        let own_airdress = airdress_of(own.signing_identity()).map_err(|e| e.to_string())?;
+        let target_airdress = airdress_of(target.signing_identity()).map_err(|e| e.to_string())?;
+        if own_airdress == target_airdress {
+            return Ok(());
+        }
+        Err("only a device of the same airdress may remove that airdress's devices".to_owned())
+    }
+
+    /// Propose replacing this device's own leaf key (SPEC-061 FR-1) —
+    /// the post-compromise-security primitive.
+    ///
+    /// Returns the bare proposal for publication. This is the one
+    /// operation that MUST travel by reference: RFC 9420 forbids a
+    /// committer from including its own `Update`, so another member
+    /// holds it (via [`MlsEngine::process_proposal`]) and commits it.
+    ///
+    /// A device healing itself without waiting for anyone calls
+    /// [`MlsEngine::commit_pending`] instead: a commit carries a path
+    /// update, which rotates this leaf's key with the same effect and
+    /// needs nobody else's cooperation.
+    ///
+    /// # Errors
+    ///
+    /// The group is unknown, or `mls-rs` refuses the proposal.
+    pub fn propose_update(&mut self, group_id: &[u8]) -> Result<Vec<u8>, String> {
+        let mut group = self.load_group(group_id)?;
+        let msg = group
+            .propose_update(Vec::new())
+            .map_err(|e| format!("propose update: {e}"))?;
         group
             .write_to_storage()
-            .map_err(|e| EngineError::Other(format!("persist group: {e}")))?;
-        output
-            .commit_message
-            .to_bytes()
-            .map_err(|e| EngineError::Other(format!("commit serialize: {e}")))
+            .map_err(|e| format!("persist group: {e}"))?;
+        msg.to_bytes().map_err(|e| format!("serialize: {e}"))
     }
 
-    /// Process a commit produced by another member, advancing and
-    /// persisting this engine's epoch. Test-only; Phase 4 task 4.1
-    /// ships the real `process_commit`.
-    #[cfg(test)]
-    pub(crate) fn test_only_process_commit(
+    /// Hold an inbound bare proposal for the next commit (SPEC-061
+    /// FR-5).
+    ///
+    /// `ReceivedMessage::Proposal` used to be an error on every path.
+    ///
+    /// # Errors
+    ///
+    /// The group is unknown, the bytes are not a proposal, or the
+    /// proposal is refused by the MLS rules (a cross-airdress `Remove`
+    /// is refused here — FR-25's receive side).
+    pub fn process_proposal(
         &mut self,
         group_id: &[u8],
         message_bytes: &[u8],
-    ) -> Result<(), EngineError> {
-        let msg = MlsMessage::from_bytes(message_bytes)
-            .map_err(|e| EngineError::Other(format!("bad message: {e}")))?;
+    ) -> Result<(), String> {
+        let msg = MlsMessage::from_bytes(message_bytes).map_err(|e| format!("bad message: {e}"))?;
         let mut group = self.load_group(group_id)?;
         match group
             .process_incoming_message(msg)
-            .map_err(|e| EngineError::Other(format!("process: {e}")))?
+            .map_err(|e| format!("process: {e}"))?
         {
-            mls_rs::group::ReceivedMessage::Commit(_) => {
+            mls_rs::group::ReceivedMessage::Proposal(_) => {
+                // A held proposal is group state: it has to survive a
+                // restart or the commit that was meant to carry it
+                // silently drops it.
                 group
                     .write_to_storage()
-                    .map_err(|e| EngineError::Other(format!("persist group: {e}")))?;
-                Ok(())
+                    .map_err(|e| format!("persist group: {e}"))
             }
-            _ => Err(EngineError::Other("not a commit".to_owned())),
+            _ => Err("not a proposal".to_owned()),
         }
+    }
+
+    /// Commit every held proposal, advancing this device's epoch in
+    /// memory and **deliberately not persisting** (SPEC-061 FR-7).
+    ///
+    /// ## Why this is two calls and not one
+    ///
+    /// `apply_pending_commit()` moves the group to a new epoch. If the
+    /// device seals that state and then fails to publish the commit —
+    /// no network, or a `409 epoch_conflict` because another device
+    /// committed from the same epoch first — it has **forked the
+    /// group**. Every other member is at the old epoch; this one is
+    /// alone at a new one, and MLS has no way back. The fork is
+    /// unrecoverable except by rejoin.
+    ///
+    /// So: not-persisted is the default state, and confirmation is the
+    /// exception. The caller publishes the returned bytes, and only on
+    /// a `202` calls [`MlsEngine::confirm_commit`]. On anything else it
+    /// calls [`MlsEngine::abort_commit`], and the sealed state is
+    /// still where it was.
+    ///
+    /// Calling this with no held proposals is not a no-op: the commit
+    /// still carries a path update, which is exactly the self-heal
+    /// FR-1 asks for.
+    ///
+    /// # Errors
+    ///
+    /// The group is unknown, a commit is already awaiting
+    /// confirmation, or `mls-rs` refuses the commit.
+    pub fn commit_pending(&mut self, group_id: &[u8]) -> Result<CommitOutcome, String> {
+        if self.pending.contains_key(group_id) {
+            return Err("a commit for this group is already awaiting confirmation".to_owned());
+        }
+        let mut group = self.load_group(group_id)?;
+        let before = self.identity_set(&group)?;
+        let staged = self.staged.get(group_id).cloned().unwrap_or_default();
+        let mut builder = group.commit_builder();
+        for proposal in &staged {
+            builder = match proposal {
+                StagedProposal::Add(kp) => {
+                    let kp = MlsMessage::from_bytes(kp).map_err(|e| format!("bad kp: {e}"))?;
+                    builder
+                        .add_member(kp)
+                        .map_err(|e| format!("add member: {e}"))?
+                }
+                StagedProposal::Remove(index) => builder
+                    .remove_member(*index)
+                    .map_err(|e| format!("remove member: {e}"))?,
+            };
+        }
+        let output = builder.build().map_err(|e| format!("commit: {e}"))?;
+        group
+            .apply_pending_commit()
+            .map_err(|e| format!("apply: {e}"))?;
+        let commit = output
+            .commit_message
+            .to_bytes()
+            .map_err(|e| format!("commit serialize: {e}"))?;
+        let welcome = output
+            .welcome_messages
+            .into_iter()
+            .next()
+            .map(|w| w.to_bytes().map_err(|e| format!("welcome serialize: {e}")))
+            .transpose()?;
+        let after = self.identity_set(&group)?;
+        let outcome = CommitOutcome {
+            commit,
+            welcome,
+            epoch: group.current_epoch(),
+            added: after.difference_from(&before),
+            removed: before.difference_from(&after),
+            // The committer cannot have removed itself: `mls-rs`
+            // refuses a self-Remove in one's own commit.
+            self_removed: false,
+            members: after.0,
+        };
+        self.pending.insert(group_id.to_vec(), group);
+        Ok(outcome)
+    }
+
+    /// Persist a commit built by [`MlsEngine::commit_pending`], after
+    /// the operator has accepted it.
+    ///
+    /// # Errors
+    ///
+    /// No commit is awaiting confirmation for this group, or the
+    /// sealed store refuses the write.
+    pub fn confirm_commit(&mut self, group_id: &[u8]) -> Result<u64, String> {
+        let mut group = self
+            .pending
+            .remove(group_id)
+            .ok_or("no commit is awaiting confirmation for this group")?;
+        group
+            .write_to_storage()
+            .map_err(|e| format!("persist group: {e}"))?;
+        self.staged.remove(group_id);
+        Ok(group.current_epoch())
+    }
+
+    /// Discard a commit built by [`MlsEngine::commit_pending`].
+    ///
+    /// The in-memory mutation is dropped and the group reverts to
+    /// whatever the sealed store holds — which is the pre-commit
+    /// epoch, because `commit_pending` never wrote. This is a reload,
+    /// not an undo: `mls-rs` has no undo, and a hand-rolled one would
+    /// be wrong in a way that only surfaces under concurrency.
+    ///
+    /// # Errors
+    ///
+    /// No commit was awaiting confirmation for this group.
+    pub fn abort_commit(&mut self, group_id: &[u8]) -> Result<u64, String> {
+        self.pending
+            .remove(group_id)
+            .ok_or("no commit is awaiting confirmation for this group")?;
+        // Staged proposals are dropped too. A retry after catch-up
+        // re-proposes: leaf indices can have moved under the commit
+        // that won, so replaying the old ones would remove the wrong
+        // member (design §6.3).
+        self.staged.remove(group_id);
+        // Prove the reload works rather than asserting it: the caller
+        // is about to use this group again.
+        let group = self.load_group(group_id)?;
+        Ok(group.current_epoch())
+    }
+
+    /// Apply another member's commit: advance the epoch, persist, and
+    /// report the membership delta (SPEC-061 FR-4).
+    ///
+    /// `ReceivedMessage::Commit` used to be an error here, which is
+    /// why neither member removal nor post-compromise security existed.
+    ///
+    /// Persistence follows the same rule as the application path
+    /// (design D-9): it happens **inside the accepting arm**, and a
+    /// message that turns out not to be a commit persists nothing.
+    ///
+    /// # Errors
+    ///
+    /// The group is unknown, the message is not a commit, its epoch
+    /// has been trimmed ([`EngineError::EpochUnavailable`]), or
+    /// `mls-rs` refuses it.
+    pub fn process_commit(
+        &mut self,
+        group_id: &[u8],
+        message_bytes: &[u8],
+    ) -> Result<CommitOutcome, EngineError> {
+        let msg = MlsMessage::from_bytes(message_bytes)
+            .map_err(|e| EngineError::Other(format!("bad message: {e}")))?;
+        let message_epoch = msg.epoch();
+        let mut group = self.load_group(group_id)?;
+        let current_epoch = group.current_epoch();
+        let before = self.identity_set(&group).map_err(EngineError::Other)?;
+        let received = match group.process_incoming_message(msg) {
+            Ok(received) => received,
+            Err(e) => {
+                if let Some(trimmed) =
+                    self.epoch_unavailable(group_id, message_epoch, current_epoch)
+                {
+                    return Err(trimmed);
+                }
+                return Err(EngineError::Other(format!("process: {e}")));
+            }
+        };
+        let mls_rs::group::ReceivedMessage::Commit(description) = received else {
+            // Rejection arm: persists nothing and drops the group.
+            return Err(EngineError::Other("not a commit".to_owned()));
+        };
+        let self_removed = matches!(
+            description.effect,
+            mls_rs::group::CommitEffect::Removed { .. }
+        );
+        let (after, epoch) = if self_removed {
+            // A removed member's group object is spent — the roster it
+            // could report is the one it was evicted from. Report the
+            // eviction and nothing else.
+            (IdentitySet(Vec::new()), current_epoch)
+        } else {
+            (
+                self.identity_set(&group).map_err(EngineError::Other)?,
+                group.current_epoch(),
+            )
+        };
+        // The accepting arm, and the only one that persists. A removed
+        // member persists too: the state that records "you are out" is
+        // what stops the next start-up believing it is still a member.
+        group
+            .write_to_storage()
+            .map_err(|e| EngineError::Other(format!("persist group: {e}")))?;
+        Ok(CommitOutcome {
+            commit: Vec::new(),
+            welcome: None,
+            epoch,
+            added: after.difference_from(&before),
+            removed: before.difference_from(&after),
+            self_removed,
+            members: after.0,
+        })
+    }
+
+    fn identity_set(&self, group: &Group<MlsConfig>) -> Result<IdentitySet, String> {
+        let mut out = Vec::new();
+        for member in group.roster().members_iter() {
+            out.push(self.member_identity_bytes(member.signing_identity())?);
+        }
+        out.sort_unstable();
+        Ok(IdentitySet(out))
+    }
+}
+
+/// Sorted member identities, for computing a membership delta by
+/// difference rather than by decoding proposal internals — the delta
+/// is then correct for any commit, including ones carrying proposals
+/// this crate did not build.
+struct IdentitySet(Vec<Vec<u8>>);
+
+impl IdentitySet {
+    fn difference_from(&self, other: &Self) -> Vec<Vec<u8>> {
+        self.0
+            .iter()
+            .filter(|id| !other.0.contains(id))
+            .cloned()
+            .collect()
     }
 }
