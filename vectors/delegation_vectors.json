@@ -171,6 +171,22 @@
       "name": "escaped-characters",
       "root_public_key_b64url": "C1E62bSSQBXKCQLtB5BE06xdvsIwbwaUjBDajrbjny0",
       "root_seed_b64url": "DAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw"
+    },
+    {
+      "canonical_b64url": "eyJhaXJkcmVzcyI6ImFsaWNlLmh1bWFucy5haXJkcmVzcy5jbyIsImRldmljZV9pZCI6IjAxOWUyYjhjLTdmNDEtN2EzZC05YzAyLTJmNmI1ZDFhNDRlMCIsImRldmljZV9sYWJlbCI6IkFsaWNlJ3MgaVBob25lIiwiZGV2aWNlX3Nlc3Npb25fcHVibGljX2tleSI6IkFBRUNBd1FGQmdjSUNRb0xEQTBPRHhBUkVoTVVGUllYR0JrYUd4d2RIaDgiLCJleHBpcmVzX2F0IjoiMjAyNy0wMy0wNVQxMjowMDowMFoiLCJpc3N1ZWRfYXQiOiIyMDI2LTA5LTA1VDEyOjAwOjAwWiIsInJvbGUiOiJodW1hbl9oZWxkIn0",
+      "delegation": {
+        "airdress": "alice.humans.airdress.co",
+        "device_id": "019e2b8c-7f41-7a3d-9c02-2f6b5d1a44e0",
+        "device_label": "Alice's iPhone",
+        "device_session_public_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "expires_at": "2027-03-05T12:00:00Z",
+        "issued_at": "2026-09-05T12:00:00Z",
+        "role": "human_held",
+        "signature": "59eSoh_vlogh1qBNgX71z6Z2NEUjBEiotQqVvH9BfBtVBo3BElx-cNs-rcHjSEwl9TdxWdwE0PRS3hOZ4oXdAQ"
+      },
+      "name": "spec-061-v2-delegation",
+      "root_public_key_b64url": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+      "root_seed_b64url": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
     }
   ]
 }

@@ -216,6 +216,76 @@ pub extern "C" fn airdress_mls_set_root_key_lookup(
     }
 }
 
+/// Host callback answering "is this device revoked?" (SPEC-061
+/// FR-19, check 5).
+///
+/// Return `1` for an active device, `0` for a revoked one, and
+/// anything else — conventionally `-1` — for "cannot answer", which
+/// REJECTS the leaf. The callback must be thread-safe and must not
+/// call back into this library.
+pub type AirdressRevocationLookupFn = extern "C" fn(device_id: *const c_char) -> i32;
+
+struct CallbackRevocationLookup(AirdressRevocationLookupFn);
+
+impl crate::credential::RevocationLookup for CallbackRevocationLookup {
+    fn device_status(&self, device_id: &str) -> Option<crate::credential::DeviceStatus> {
+        let c_device_id = std::ffi::CString::new(device_id).ok()?;
+        match (self.0)(c_device_id.as_ptr()) {
+            1 => Some(crate::credential::DeviceStatus::Active),
+            0 => Some(crate::credential::DeviceStatus::Revoked),
+            // Unknown answers are "cannot answer", not "fine" — the
+            // caller gets RevocationUnavailable, which is a reject.
+            _ => None,
+        }
+    }
+}
+
+/// Register the host's device-revocation state (SPEC-061 FR-19).
+/// Returns 0 on success, -1 for an invalid handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_set_revocation_lookup(
+    handle_id: u64,
+    lookup: AirdressRevocationLookupFn,
+) -> i32 {
+    let guard = ENGINES.lock().expect("poisoned");
+    match guard.get(&handle_id) {
+        Some(engine) => {
+            engine.set_revocation_lookup(std::sync::Arc::new(CallbackRevocationLookup(lookup)));
+            0
+        }
+        None => -1,
+    }
+}
+
+/// Enter the SPEC-061 v2 credential cutover (FR-20): `v: 1`
+/// identities stop being accepted and the per-device member identity
+/// becomes the only form in the tree. One-way within the process, per
+/// NFR-15 — there is no symmetric "unset" export, deliberately.
+///
+/// Returns 0 on success, -1 for an invalid handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_set_v2_cutover(handle_id: u64) -> i32 {
+    let guard = ENGINES.lock().expect("poisoned");
+    match guard.get(&handle_id) {
+        Some(engine) => {
+            engine.set_v2_cutover();
+            0
+        }
+        None => -1,
+    }
+}
+
+/// Whether the v2 cutover has been entered on this engine. Returns 1
+/// for yes, 0 for no, -1 for an invalid handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_is_v2_cutover(handle_id: u64) -> i32 {
+    let guard = ENGINES.lock().expect("poisoned");
+    match guard.get(&handle_id) {
+        Some(engine) => i32::from(engine.is_v2_cutover()),
+        None => -1,
+    }
+}
+
 /// Destroy an MLS engine and free its resources.
 #[unsafe(no_mangle)]
 pub extern "C" fn airdress_mls_destroy_engine(handle_id: u64) {
