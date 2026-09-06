@@ -422,7 +422,15 @@ pub unsafe extern "C" fn airdress_mls_free_bytes_list(list: FfiBytesList) {
     unsafe { airdress_mls_free_error(list.error) };
 }
 
-/// Start a group with a peer's KeyPackage.
+/// Start a group with a peer's KeyPackage, **unbound**.
+///
+/// The pre-cutover form, kept so a `v: 1` client keeps working
+/// unchanged. Past the v2 cutover this export **refuses**: the first
+/// application message rides inside the establishment, so with no
+/// binding there is no legal AAD for it (FR-17a, design D-8), and a
+/// silent fallback to an empty one would be indistinguishable on the
+/// wire from an unbound message. Post-cutover callers use
+/// [`airdress_mls_start_group_bound`].
 #[unsafe(no_mangle)]
 pub extern "C" fn airdress_mls_start_group(
     handle_id: u64,
@@ -433,14 +441,70 @@ pub extern "C" fn airdress_mls_start_group(
 ) -> FfiStartGroupResult {
     let peer_kp = unsafe { std::slice::from_raw_parts(peer_kp_ptr, peer_kp_len) };
     let first_msg = unsafe { std::slice::from_raw_parts(first_msg_ptr, first_msg_len) };
+    start_group_into_ffi(handle_id, peer_kp, first_msg, None)
+}
 
+/// Start a group with a peer's KeyPackage, carrying the SPEC-061
+/// FR-17a conversation binding for the first application message.
+///
+/// ## Why this export exists
+///
+/// Establishment was the one operation with no bound form. Joining a
+/// group (`airdress_mls_process_welcome`) and sending into an
+/// established one (`airdress_mls_encrypt_bound`) were both bound, but
+/// the group's **first** application message rides inside
+/// `start_group` — so past the cutover a client could join and send
+/// and could not create. Since nothing else creates the first group of
+/// a conversation, no conversation could be established at all. This
+/// closes that.
+///
+/// Argument shape mirrors `airdress_mls_encrypt_bound` /
+/// `airdress_mls_decrypt_bound` exactly: the 16 **raw** bytes of the
+/// conversation UUID (never its hyphenated rendering — two spellings
+/// of one id would produce two AADs) and the sending airdress as a
+/// NUL-terminated UTF-8 string. Both are cleartext columns on the
+/// envelope row, so the receiver computes the same AAD before it
+/// decrypts.
+///
+/// Passing both as null is legal and means "no binding" — the
+/// pre-cutover behaviour, refused by the engine once past the cutover.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_start_group_bound(
+    handle_id: u64,
+    peer_kp_ptr: *const u8,
+    peer_kp_len: usize,
+    first_msg_ptr: *const u8,
+    first_msg_len: usize,
+    conversation_id_ptr: *const u8,
+    conversation_id_len: usize,
+    from_airdress: *const c_char,
+) -> FfiStartGroupResult {
+    let peer_kp = unsafe { std::slice::from_raw_parts(peer_kp_ptr, peer_kp_len) };
+    let first_msg = unsafe { std::slice::from_raw_parts(first_msg_ptr, first_msg_len) };
+    let binding =
+        match unsafe { borrow_binding(conversation_id_ptr, conversation_id_len, from_airdress) } {
+            Ok(b) => b,
+            Err(e) => return ffi_start_group_err(&e),
+        };
+    start_group_into_ffi(handle_id, peer_kp, first_msg, binding)
+}
+
+/// The body both establishment exports share: resolve the handle, run
+/// the engine, and marshal the three buffers out. Written once so the
+/// bound and unbound forms cannot drift in their memory contract.
+fn start_group_into_ffi(
+    handle_id: u64,
+    peer_kp: &[u8],
+    first_msg: &[u8],
+    binding: Option<MessageBinding<'_>>,
+) -> FfiStartGroupResult {
     let mut guard = ENGINES.lock().expect("poisoned");
     let engine = match guard.get_mut(&handle_id) {
         Some(e) => e,
         None => return ffi_start_group_err("invalid handle"),
     };
 
-    match engine.start_group(peer_kp, first_msg, None) {
+    match engine.start_group(peer_kp, first_msg, binding) {
         Ok(outcome) => {
             let mut gid = outcome.group_id.into_boxed_slice();
             let mut welcome = outcome.welcome.into_boxed_slice();
@@ -969,5 +1033,452 @@ fn ffi_start_group_err(msg: &str) -> FfiStartGroupResult {
         first_app_ptr: std::ptr::null_mut(),
         first_app_len: 0,
         error: c_str.into_raw(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! SPEC-061 FR-17a / design D-8 at the **FFI** boundary.
+    //!
+    //! The engine has taken a `MessageBinding` since Phase 4; the
+    //! exports are where a client can or cannot supply one. Group
+    //! establishment was the one operation with no bound export, so
+    //! past the cutover a client could join a group and send into an
+    //! established one but could not create one — and since nothing
+    //! else creates the first group of a conversation, no conversation
+    //! could be established at all.
+
+    use std::ffi::{CStr, CString};
+
+    use ed25519_dalek::SigningKey;
+
+    use super::{
+        FfiBytes, FfiStartGroupResult, airdress_mls_create_engine_from_seed, airdress_mls_decrypt,
+        airdress_mls_decrypt_bound, airdress_mls_destroy_engine, airdress_mls_encrypt_bound,
+        airdress_mls_generate_key_package, airdress_mls_process_welcome,
+        airdress_mls_set_v2_cutover, airdress_mls_start_group, airdress_mls_start_group_bound,
+    };
+
+    const CONV: [u8; 16] = [0xc3; 16];
+    const OTHER_CONV: [u8; 16] = [0xd4; 16];
+    const ALICE: &str = "alice.test.airdress.co";
+    const BOB: &str = "bob.test.airdress.co";
+
+    /// A live engine handle plus the state dir it must outlive.
+    struct Handle {
+        id: u64,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            airdress_mls_destroy_engine(self.id);
+        }
+    }
+
+    /// Build an engine through the export a host actually calls, and
+    /// put it past the v2 cutover when asked.
+    fn engine(airdress: &str, seed_byte: u8, device_id: &str, cutover: bool) -> Handle {
+        let dir = tempfile::tempdir().expect("state dir");
+        let seed = [seed_byte; 32];
+        let root = SigningKey::from_bytes(&[seed_byte.wrapping_add(0x40); 32]);
+        let session_pub = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        let delegation = crate::credential::test_support::signed_delegation_json_v2(
+            &root,
+            airdress,
+            &session_pub,
+            device_id,
+            "2099-01-01T00:00:00Z",
+        );
+        let c_airdress = CString::new(airdress).unwrap();
+        let c_delegation = CString::new(delegation).unwrap();
+        let c_dir = CString::new(dir.path().to_str().unwrap()).unwrap();
+        let root_pub = root.verifying_key().to_bytes();
+        let state_key = [0x77u8; 32];
+        let result = airdress_mls_create_engine_from_seed(
+            c_airdress.as_ptr(),
+            seed.as_ptr(),
+            seed.len(),
+            root_pub.as_ptr(),
+            root_pub.len(),
+            c_delegation.as_ptr(),
+            c_dir.as_ptr(),
+            state_key.as_ptr(),
+            state_key.len(),
+        );
+        assert!(
+            result.error.is_null(),
+            "create_engine_from_seed: {}",
+            unsafe { CStr::from_ptr(result.error) }.to_string_lossy()
+        );
+        unsafe { super::airdress_mls_free_bytes(result.public_key_ptr, result.public_key_len) };
+        if cutover {
+            assert_eq!(airdress_mls_set_v2_cutover(result.handle_id), 0);
+        }
+        Handle {
+            id: result.handle_id,
+            _dir: dir,
+        }
+    }
+
+    /// Consume an `FfiBytes`, freeing whichever half it carries.
+    fn take_bytes(result: FfiBytes) -> Result<Vec<u8>, String> {
+        if result.error.is_null() {
+            let bytes = unsafe { std::slice::from_raw_parts(result.ptr, result.len) }.to_vec();
+            unsafe { super::airdress_mls_free_bytes(result.ptr, result.len) };
+            Ok(bytes)
+        } else {
+            let msg = unsafe { CStr::from_ptr(result.error) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { super::airdress_mls_free_error(result.error) };
+            Err(msg)
+        }
+    }
+
+    /// The three buffers of a start-group outcome, or the refusal.
+    #[derive(Debug)]
+    struct Started {
+        group_id: Vec<u8>,
+        welcome: Vec<u8>,
+        first_application: Vec<u8>,
+    }
+
+    fn take_start(result: FfiStartGroupResult) -> Result<Started, String> {
+        if !result.error.is_null() {
+            let msg = unsafe { CStr::from_ptr(result.error) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { super::airdress_mls_free_error(result.error) };
+            return Err(msg);
+        }
+        let started = Started {
+            group_id: unsafe {
+                std::slice::from_raw_parts(result.group_id_ptr, result.group_id_len)
+            }
+            .to_vec(),
+            welcome: unsafe { std::slice::from_raw_parts(result.welcome_ptr, result.welcome_len) }
+                .to_vec(),
+            first_application: unsafe {
+                std::slice::from_raw_parts(result.first_app_ptr, result.first_app_len)
+            }
+            .to_vec(),
+        };
+        unsafe {
+            super::airdress_mls_free_bytes(result.group_id_ptr, result.group_id_len);
+            super::airdress_mls_free_bytes(result.welcome_ptr, result.welcome_len);
+            super::airdress_mls_free_bytes(result.first_app_ptr, result.first_app_len);
+        }
+        Ok(started)
+    }
+
+    fn key_package(handle: &Handle) -> Vec<u8> {
+        take_bytes(airdress_mls_generate_key_package(handle.id)).expect("key package")
+    }
+
+    /// **SPEC-061 FR-17a / D-8 — the cutover blocker.**
+    ///
+    /// Past the cutover a client must be able to CREATE a group. Join
+    /// and send were already bound; establishment was not, and since
+    /// nothing else creates the first group of a conversation, no
+    /// conversation could be established at all.
+    ///
+    /// Fails before this change — there was no bound establishment
+    /// export, so the only one available answered:
+    ///
+    /// ```text
+    /// a client past the cutover must be able to establish a
+    /// conversation: "application messages must carry their
+    /// conversation binding after the SPEC-061 cutover"
+    /// ```
+    #[test]
+    fn spec_061_a_conversation_can_be_established_past_the_cutover() {
+        let alice = engine(ALICE, 0x31, "alice-a", true);
+        let bob = engine(BOB, 0x32, "bob-a", true);
+
+        let bob_kp = key_package(&bob);
+        let c_alice = CString::new(ALICE).unwrap();
+        let started = take_start(airdress_mls_start_group_bound(
+            alice.id,
+            bob_kp.as_ptr(),
+            bob_kp.len(),
+            b"hello bob".as_ptr(),
+            b"hello bob".len(),
+            CONV.as_ptr(),
+            CONV.len(),
+            c_alice.as_ptr(),
+        ))
+        .expect("a client past the cutover must be able to establish a conversation");
+
+        take_bytes(airdress_mls_process_welcome(
+            bob.id,
+            started.welcome.as_ptr(),
+            started.welcome.len(),
+        ))
+        .expect("bob joins");
+
+        let plaintext = take_bytes(airdress_mls_decrypt_bound(
+            bob.id,
+            started.group_id.as_ptr(),
+            started.group_id.len(),
+            started.first_application.as_ptr(),
+            started.first_application.len(),
+            CONV.as_ptr(),
+            CONV.len(),
+            c_alice.as_ptr(),
+        ))
+        .expect("the establishment's first message decrypts under its binding");
+        assert_eq!(plaintext, b"hello bob");
+
+        // And the group is a working group afterwards, not just a
+        // successful call: the conversation carries traffic in both
+        // directions under the same binding.
+        let c_bob = CString::new(BOB).unwrap();
+        let reply = take_bytes(airdress_mls_encrypt_bound(
+            bob.id,
+            started.group_id.as_ptr(),
+            started.group_id.len(),
+            b"hi alice".as_ptr(),
+            b"hi alice".len(),
+            CONV.as_ptr(),
+            CONV.len(),
+            c_bob.as_ptr(),
+        ))
+        .expect("bob replies into the established group");
+        assert_eq!(
+            take_bytes(airdress_mls_decrypt_bound(
+                alice.id,
+                started.group_id.as_ptr(),
+                started.group_id.len(),
+                reply.as_ptr(),
+                reply.len(),
+                CONV.as_ptr(),
+                CONV.len(),
+                c_bob.as_ptr(),
+            ))
+            .expect("alice reads the reply"),
+            b"hi alice"
+        );
+    }
+
+    /// The unbound export **refuses** past the cutover rather than
+    /// establishing an unbound group — the convention the agent lane
+    /// (PR #97) and the client's self lane both already follow. A
+    /// silent fallback to an empty AAD is indistinguishable on the wire
+    /// from an unbound message, which would make the binding
+    /// attacker-selectable.
+    ///
+    /// It refuses *before* consuming the peer's `KeyPackage` or
+    /// building a Commit: the peer's package is single-use, and a
+    /// refusal that burns one leaves the peer a leaf short for a group
+    /// that was never created.
+    #[test]
+    fn spec_061_unbound_establishment_is_refused_past_the_cutover() {
+        let alice = engine(ALICE, 0x33, "alice-b", true);
+        let bob = engine(BOB, 0x34, "bob-b", true);
+
+        let bob_kp = key_package(&bob);
+        let err = take_start(airdress_mls_start_group(
+            alice.id,
+            bob_kp.as_ptr(),
+            bob_kp.len(),
+            b"hello bob".as_ptr(),
+            b"hello bob".len(),
+        ))
+        .expect_err("an unbound establishment past the cutover must be refused");
+        assert!(
+            err.contains("must carry their conversation binding"),
+            "unexpected refusal: {err}"
+        );
+
+        // Nothing was created. Alice's state dir holds no group, so
+        // the refusal cost the caller nothing to retry from.
+        assert!(
+            !alice._dir.path().join("groups").exists()
+                || std::fs::read_dir(alice._dir.path().join("groups"))
+                    .expect("groups dir")
+                    .next()
+                    .is_none(),
+            "the refused establishment left a group on disk"
+        );
+
+        // The same call with a binding succeeds against the SAME
+        // KeyPackage — proof the refusal did not consume it.
+        let c_alice = CString::new(ALICE).unwrap();
+        take_start(airdress_mls_start_group_bound(
+            alice.id,
+            bob_kp.as_ptr(),
+            bob_kp.len(),
+            b"hello bob".as_ptr(),
+            b"hello bob".len(),
+            CONV.as_ptr(),
+            CONV.len(),
+            c_alice.as_ptr(),
+        ))
+        .expect("the bound form succeeds where the unbound one refused");
+    }
+
+    /// **AC-11 at the establishment path.** MLS transmits
+    /// `authenticated_data` in the clear, so binding the AAD is only
+    /// half the mechanism — the receiver must recompute it and compare.
+    /// An establishment's first message re-filed into another
+    /// conversation, or re-attributed to another sender, must fail to
+    /// decrypt rather than render under the wrong heading with a valid
+    /// signature.
+    #[test]
+    fn spec_061_a_refiled_establishment_message_does_not_decrypt() {
+        let alice = engine(ALICE, 0x35, "alice-c", true);
+        let bob = engine(BOB, 0x36, "bob-c", true);
+
+        let bob_kp = key_package(&bob);
+        let c_alice = CString::new(ALICE).unwrap();
+        let started = take_start(airdress_mls_start_group_bound(
+            alice.id,
+            bob_kp.as_ptr(),
+            bob_kp.len(),
+            b"hello bob".as_ptr(),
+            b"hello bob".len(),
+            CONV.as_ptr(),
+            CONV.len(),
+            c_alice.as_ptr(),
+        ))
+        .expect("establish");
+        take_bytes(airdress_mls_process_welcome(
+            bob.id,
+            started.welcome.as_ptr(),
+            started.welcome.len(),
+        ))
+        .expect("bob joins");
+
+        // Re-filed into another conversation.
+        let err = take_bytes(airdress_mls_decrypt_bound(
+            bob.id,
+            started.group_id.as_ptr(),
+            started.group_id.len(),
+            started.first_application.as_ptr(),
+            started.first_application.len(),
+            OTHER_CONV.as_ptr(),
+            OTHER_CONV.len(),
+            c_alice.as_ptr(),
+        ))
+        .expect_err("a re-filed establishment message must not decrypt");
+        assert!(
+            err.contains("does not belong to this conversation"),
+            "unexpected error: {err}"
+        );
+
+        // Re-attributed to another sender.
+        let c_bob = CString::new(BOB).unwrap();
+        take_bytes(airdress_mls_decrypt_bound(
+            bob.id,
+            started.group_id.as_ptr(),
+            started.group_id.len(),
+            started.first_application.as_ptr(),
+            started.first_application.len(),
+            CONV.as_ptr(),
+            CONV.len(),
+            c_bob.as_ptr(),
+        ))
+        .expect_err("a re-attributed establishment message must not decrypt");
+
+        // And an UNBOUND decrypt of it is refused too, so a receiver
+        // cannot sidestep the comparison by dropping the binding.
+        take_bytes(airdress_mls_decrypt(
+            bob.id,
+            started.group_id.as_ptr(),
+            started.group_id.len(),
+            started.first_application.as_ptr(),
+            started.first_application.len(),
+        ))
+        .expect_err("an unbound decrypt past the cutover must be refused");
+
+        // The honest binding still works after all three rejections —
+        // no rejection ratcheted the group forward behind the caller.
+        assert_eq!(
+            take_bytes(airdress_mls_decrypt_bound(
+                bob.id,
+                started.group_id.as_ptr(),
+                started.group_id.len(),
+                started.first_application.as_ptr(),
+                started.first_application.len(),
+                CONV.as_ptr(),
+                CONV.len(),
+                c_alice.as_ptr(),
+            ))
+            .expect("the correctly bound decrypt still works"),
+            b"hello bob"
+        );
+    }
+
+    /// Back-compat: before the cutover the unbound export is still the
+    /// right call and still works, AAD empty on both sides.
+    #[test]
+    fn spec_061_unbound_establishment_still_works_before_the_cutover() {
+        let alice = engine(ALICE, 0x37, "alice-d", false);
+        let bob = engine(BOB, 0x38, "bob-d", false);
+
+        let bob_kp = key_package(&bob);
+        let started = take_start(airdress_mls_start_group(
+            alice.id,
+            bob_kp.as_ptr(),
+            bob_kp.len(),
+            b"hello bob".as_ptr(),
+            b"hello bob".len(),
+        ))
+        .expect("pre-cutover establishment is unchanged");
+        take_bytes(airdress_mls_process_welcome(
+            bob.id,
+            started.welcome.as_ptr(),
+            started.welcome.len(),
+        ))
+        .expect("bob joins");
+        assert_eq!(
+            take_bytes(airdress_mls_decrypt(
+                bob.id,
+                started.group_id.as_ptr(),
+                started.group_id.len(),
+                started.first_application.as_ptr(),
+                started.first_application.len(),
+            ))
+            .expect("unbound decrypt"),
+            b"hello bob"
+        );
+    }
+
+    /// A binding supplied by halves is a caller bug, not an unbound
+    /// call — the same rule `borrow_binding` already applies to
+    /// encrypt and decrypt.
+    #[test]
+    fn spec_061_a_half_binding_is_rejected_at_the_boundary() {
+        let alice = engine(ALICE, 0x39, "alice-e", true);
+        let bob = engine(BOB, 0x3a, "bob-e", true);
+        let bob_kp = key_package(&bob);
+
+        let err = take_start(airdress_mls_start_group_bound(
+            alice.id,
+            bob_kp.as_ptr(),
+            bob_kp.len(),
+            b"hi".as_ptr(),
+            b"hi".len(),
+            CONV.as_ptr(),
+            CONV.len(),
+            std::ptr::null(),
+        ))
+        .expect_err("conversation id without a sender must be refused");
+        assert!(err.contains("needs both"), "unexpected error: {err}");
+
+        let c_alice = CString::new(ALICE).unwrap();
+        let err = take_start(airdress_mls_start_group_bound(
+            alice.id,
+            bob_kp.as_ptr(),
+            bob_kp.len(),
+            b"hi".as_ptr(),
+            b"hi".len(),
+            CONV.as_ptr(),
+            8,
+            c_alice.as_ptr(),
+        ))
+        .expect_err("a conversation id that is not 16 raw bytes must be refused");
+        assert!(err.contains("16 raw bytes"), "unexpected error: {err}");
     }
 }

@@ -446,12 +446,21 @@ impl MlsEngine {
     ///
     /// `binding` is the SPEC-061 FR-17a AAD binding for the first
     /// application message; see [`MlsEngine::encrypt`].
+    ///
+    /// ## The binding is resolved before any group exists
+    ///
+    /// `aad_for` runs first, not just before the encryption. Past the
+    /// cutover an absent binding is a refusal, and a refusal raised
+    /// after `create_group` would have burned a peer `KeyPackage` and
+    /// built a Commit for a group that is then thrown away. The caller
+    /// gets the same error either way; only the wreckage differs.
     pub fn start_group(
         &mut self,
         peer_key_package: &[u8],
         first_message: &[u8],
         binding: Option<MessageBinding<'_>>,
     ) -> Result<StartGroupOutcome, String> {
+        let aad = aad_for(self.identity_provider.is_v2_cutover(), binding)?;
         let peer_kp =
             MlsMessage::from_bytes(peer_key_package).map_err(|e| format!("bad kp: {e}"))?;
 
@@ -479,7 +488,6 @@ impl MlsEngine {
             .to_bytes()
             .map_err(|e| format!("welcome serialize: {e}"))?;
 
-        let aad = aad_for(self.identity_provider.is_v2_cutover(), binding)?;
         let app = group
             .encrypt_application_message(first_message, aad)
             .map_err(|e| format!("encrypt: {e}"))?
