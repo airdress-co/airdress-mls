@@ -11,7 +11,7 @@ use mls_rs::{CipherSuite, Client, ExtensionList, Group, MlsMessage};
 use mls_rs_core::crypto::{SignaturePublicKey, SignatureSecretKey};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 
-use crate::binding::{MessageBinding, aad_for};
+use crate::binding::aad_for;
 use crate::credential::{
     AirdressIdentity, AirdressIdentityProvider, Clock, RevocationLookup, RootKeyLookup, airdress_of,
 };
@@ -444,23 +444,17 @@ impl MlsEngine {
 
     /// Create a group with one peer and send the first message.
     ///
-    /// `binding` is the SPEC-061 FR-17a AAD binding for the first
-    /// application message; see [`MlsEngine::encrypt`].
-    ///
-    /// ## The binding is resolved before any group exists
-    ///
-    /// `aad_for` runs first, not just before the encryption. Past the
-    /// cutover an absent binding is a refusal, and a refusal raised
-    /// after `create_group` would have burned a peer `KeyPackage` and
-    /// built a Commit for a group that is then thrown away. The caller
-    /// gets the same error either way; only the wreckage differs.
+    /// `from_airdress` is the sender component of the SPEC-061 FR-17a
+    /// AAD binding; see [`MlsEngine::encrypt`]. The group component is
+    /// the group this call is about to create, so — unlike D-8's
+    /// version — there is nothing here that can fail to be computable
+    /// and nothing to resolve before `create_group`.
     pub fn start_group(
         &mut self,
         peer_key_package: &[u8],
         first_message: &[u8],
-        binding: Option<MessageBinding<'_>>,
+        from_airdress: &str,
     ) -> Result<StartGroupOutcome, String> {
-        let aad = aad_for(self.identity_provider.is_v2_cutover(), binding)?;
         let peer_kp =
             MlsMessage::from_bytes(peer_key_package).map_err(|e| format!("bad kp: {e}"))?;
 
@@ -488,13 +482,18 @@ impl MlsEngine {
             .to_bytes()
             .map_err(|e| format!("welcome serialize: {e}"))?;
 
+        let group_id = group.group_id().to_vec();
+        let aad = aad_for(
+            self.identity_provider.is_v2_cutover(),
+            &group_id,
+            from_airdress,
+        );
         let app = group
             .encrypt_application_message(first_message, aad)
             .map_err(|e| format!("encrypt: {e}"))?
             .to_bytes()
             .map_err(|e| format!("app serialize: {e}"))?;
 
-        let group_id = group.group_id().to_vec();
         group
             .write_to_storage()
             .map_err(|e| format!("persist group: {e}"))?;
@@ -535,34 +534,34 @@ impl MlsEngine {
     /// ([`Self::propose_add`]), which does produce one — the solo group
     /// is a starting point, not a separate kind of group.
     ///
-    /// The binding is resolved before `create_group` for the same
-    /// reason [`Self::start_group`] does it: past the cutover an absent
-    /// binding is a refusal, and refusing after the group exists leaves
-    /// wreckage on disk for no benefit.
+    /// The AAD binds the group this call creates and `from_airdress`
+    /// (FR-17a, design D-10).
     ///
     /// # Errors
     ///
-    /// Past the cutover, an absent `binding` (FR-17a). Otherwise group
-    /// creation, encryption or persistence failures.
+    /// Group creation, encryption or persistence failures.
     pub fn start_group_solo(
         &mut self,
         first_message: &[u8],
-        binding: Option<MessageBinding<'_>>,
+        from_airdress: &str,
     ) -> Result<StartGroupOutcome, String> {
-        let aad = aad_for(self.identity_provider.is_v2_cutover(), binding)?;
-
         let mut group = self
             .client
             .create_group(ExtensionList::default(), ExtensionList::default(), None)
             .map_err(|e| format!("create group: {e}"))?;
 
+        let group_id = group.group_id().to_vec();
+        let aad = aad_for(
+            self.identity_provider.is_v2_cutover(),
+            &group_id,
+            from_airdress,
+        );
         let app = group
             .encrypt_application_message(first_message, aad)
             .map_err(|e| format!("encrypt: {e}"))?
             .to_bytes()
             .map_err(|e| format!("app serialize: {e}"))?;
 
-        let group_id = group.group_id().to_vec();
         group
             .write_to_storage()
             .map_err(|e| format!("persist group: {e}"))?;
@@ -598,27 +597,35 @@ impl MlsEngine {
 
     /// Encrypt an application message under a group's current epoch.
     ///
-    /// ## The binding (SPEC-061 FR-17a / design D-8)
+    /// ## The binding (SPEC-061 FR-17a / design D-10)
     ///
-    /// `binding` carries the conversation id and the sending airdress.
-    /// Past the v2 cutover those bytes become the message's AAD, so a
-    /// ciphertext moved to another conversation — or re-attributed to
-    /// another sender — fails to decrypt instead of rendering under
-    /// the wrong heading with a valid signature. Before the cutover
-    /// the AAD stays empty, because a `v: 1` peer computes an empty
-    /// AAD and the two must agree byte for byte.
+    /// Past the v2 cutover the message's AAD is the group id plus
+    /// `from_airdress`, so a ciphertext re-attributed to another
+    /// sender fails to decrypt instead of rendering under the wrong
+    /// heading with a valid signature, and a ciphertext moved to
+    /// another conversation is filed by the group it decrypted under
+    /// rather than by whatever the operator asserted. Before the
+    /// cutover the AAD stays empty, because a `v: 1` peer computes an
+    /// empty AAD and the two must agree byte for byte.
     ///
-    /// Both components are cleartext columns on the envelope row, so
-    /// the receiver can compute the same value **before** it decrypts.
-    /// That constraint is what picked these two fields and not others.
+    /// The group id is read off the framing in the clear (RFC 9420),
+    /// so the receiver can compute the same value **before** it
+    /// decrypts — the constraint that shaped D-8 and shapes this.
+    /// Unlike D-8's conversation id it is also the *same* value on
+    /// both sides no matter which owner, principal or operator each
+    /// member sits behind (design D-10).
     pub fn encrypt(
         &mut self,
         group_id: &[u8],
         plaintext: &[u8],
-        binding: Option<MessageBinding<'_>>,
+        from_airdress: &str,
     ) -> Result<Vec<u8>, String> {
-        let aad = aad_for(self.identity_provider.is_v2_cutover(), binding)?;
         let mut group = self.load_group(group_id)?;
+        let aad = aad_for(
+            self.identity_provider.is_v2_cutover(),
+            group.group_id(),
+            from_airdress,
+        );
         let msg = group
             .encrypt_application_message(plaintext, aad)
             .map_err(|e| format!("encrypt: {e}"))?;
@@ -690,14 +697,21 @@ impl MlsEngine {
         &mut self,
         group_id: &[u8],
         message_bytes: &[u8],
-        binding: Option<MessageBinding<'_>>,
+        from_airdress: &str,
     ) -> Result<Vec<u8>, EngineError> {
-        let expected_aad =
-            aad_for(self.identity_provider.is_v2_cutover(), binding).map_err(EngineError::Other)?;
         let msg = MlsMessage::from_bytes(message_bytes)
             .map_err(|e| EngineError::Other(format!("bad message: {e}")))?;
         let message_epoch = msg.epoch();
         let mut group = self.load_group(group_id)?;
+        // The group actually loaded is the group component of the
+        // expected AAD — never a value the caller or the operator
+        // asserted. mls-rs refuses a message framed for a different
+        // group, so by the time the comparison runs the two agree.
+        let expected_aad = aad_for(
+            self.identity_provider.is_v2_cutover(),
+            group.group_id(),
+            from_airdress,
+        );
         let current_epoch = group.current_epoch();
         let received = match group.process_incoming_message(msg) {
             Ok(received) => received,
@@ -716,12 +730,12 @@ impl MlsEngine {
                 // hands it back rather than checking it against an
                 // expectation — it has no way to know ours. Compare
                 // here, and reject before the plaintext is handed on:
-                // a ciphertext re-filed into another conversation or
-                // re-attributed to another sender must fail, not
-                // render under the wrong heading (FR-17a / AC-11).
+                // a ciphertext re-attributed to another sender must
+                // fail, not render under the wrong heading (FR-17a /
+                // AC-11).
                 if app.authenticated_data != expected_aad {
                     return Err(EngineError::Other(
-                        "this message does not belong to this conversation".to_owned(),
+                        "this message does not belong to this group or sender".to_owned(),
                     ));
                 }
                 let plaintext = app.data().to_vec();
