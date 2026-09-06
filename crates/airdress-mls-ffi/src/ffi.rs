@@ -435,7 +435,11 @@ pub extern "C" fn airdress_mls_decrypt(
     match guard.get_mut(&handle_id) {
         Some(engine) => match engine.decrypt(group_id, message) {
             Ok(bytes) => FfiBytes::ok(bytes),
-            Err(e) => FfiBytes::err(e),
+            // SPEC-061 FR-22: the variant is distinguishable in Rust;
+            // across the C boundary it is still one sentence, per the
+            // `credential.rs` discipline. Phase 6 gives the client a
+            // structured form when it has somewhere to route it.
+            Err(e) => FfiBytes::err(e.to_string()),
         },
         None => FfiBytes::err("invalid handle".into()),
     }
