@@ -12,7 +12,9 @@ use mls_rs::{CipherSuite, Client, ExtensionList, Group, MlsMessage};
 use mls_rs_core::crypto::{SignaturePublicKey, SignatureSecretKey};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 
-use crate::credential::{AirdressIdentity, AirdressIdentityProvider, RootKeyLookup};
+use crate::credential::{
+    AirdressIdentity, AirdressIdentityProvider, Clock, RevocationLookup, RootKeyLookup,
+};
 use crate::storage::{
     DEFAULT_MAX_EPOCH_RETENTION, SealedGroupStore, SealedKeyPackageStore, SealedStore,
 };
@@ -215,11 +217,13 @@ impl MlsEngine {
 
         // Identity bytes carry the full chain — airdress, root public
         // key, and the root-signed delegation — not just the airdress.
-        let identity = AirdressIdentity {
-            airdress: airdress.to_owned(),
-            root_public_key: *root_public_key,
-            delegation,
-        };
+        // The version follows the delegation the host handed us: one
+        // carrying `device_id` + `expires_at` is v2 (SPEC-061 FR-15),
+        // anything else is v1. Whoever signs the delegation decides
+        // the version by deciding what to put in it, which is why no
+        // version argument crosses the FFI.
+        let identity =
+            AirdressIdentity::from_delegation(airdress.to_owned(), *root_public_key, delegation);
         let credential = BasicCredential::new(identity.to_identity_bytes()?).into_credential();
         let signing_identity = SigningIdentity::new(credential, sig_pub);
 
@@ -262,11 +266,37 @@ impl MlsEngine {
     }
 
     /// Register the host's root-key cache and enter strict credential
-    /// verification (one-way — this is the cutover switch). From here
-    /// every accepted leaf must carry a v1 identity whose root key
-    /// matches what the peer's operator publishes.
+    /// verification (one-way). From here every accepted leaf must
+    /// carry a structured identity whose root key matches what the
+    /// peer's operator publishes.
     pub fn set_root_key_lookup(&self, lookup: std::sync::Arc<dyn RootKeyLookup>) {
         self.identity_provider.set_root_key_lookup(lookup);
+    }
+
+    /// Register the host's device-revocation state (SPEC-061 FR-19,
+    /// check 5). The host answers from the enrollment revocation
+    /// state it already maintains; this crate fetches nothing.
+    pub fn set_revocation_lookup(&self, revocation: std::sync::Arc<dyn RevocationLookup>) {
+        self.identity_provider.set_revocation_lookup(revocation);
+    }
+
+    /// Replace the wall clock used for delegation expiry when
+    /// `mls-rs` supplies no timestamp (SPEC-061 FR-18). Production
+    /// leaves this at the system clock.
+    pub fn set_clock(&self, clock: std::sync::Arc<dyn Clock>) {
+        self.identity_provider.set_clock(clock);
+    }
+
+    /// Enter the SPEC-061 v2 cutover (FR-20): `v: 1` identities stop
+    /// being accepted. One-way, per NFR-15.
+    pub fn set_v2_cutover(&self) {
+        self.identity_provider.set_v2_cutover();
+    }
+
+    /// Whether the v2 cutover has been entered.
+    #[must_use]
+    pub fn is_v2_cutover(&self) -> bool {
+        self.identity_provider.is_v2_cutover()
     }
 
     pub fn generate_key_package(&self) -> Result<Vec<u8>, String> {
