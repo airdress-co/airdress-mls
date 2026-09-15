@@ -81,7 +81,7 @@
 ///
 /// `-v2` is D-10's group-id binding; `-v1` was D-8's conversation-id
 /// binding, which no deployed client ever sent.
-pub const AAD_LABEL: &[u8] = b"airdress-spec-061-v2";
+pub const AAD_LABEL: &[u8] = b"airdress-spec-061-v2"; // allow-doc-number: MLS sender-binding AAD shared with airdress-chat; changing it breaks interop
 
 /// Field separator. `0x1F` (ASCII unit separator) cannot occur in a
 /// hostname or in the UTF-8 encoding of one, which is what makes the
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn the_label_is_v2_because_the_construction_changed() {
-        assert_eq!(AAD_LABEL, b"airdress-spec-061-v2");
+        assert_eq!(AAD_LABEL, b"airdress-spec-061-v2"); // allow-doc-number: MLS sender-binding AAD shared with airdress-chat; changing it breaks interop
     }
 
     #[test]

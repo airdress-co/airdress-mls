@@ -184,7 +184,7 @@
         "role": "human_held",
         "signature": "59eSoh_vlogh1qBNgX71z6Z2NEUjBEiotQqVvH9BfBtVBo3BElx-cNs-rcHjSEwl9TdxWdwE0PRS3hOZ4oXdAQ"
       },
-      "name": "spec-061-v2-delegation",
+      "name": "v2-delegation",
       "root_public_key_b64url": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
       "root_seed_b64url": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
     }
