@@ -458,7 +458,8 @@ fn refuse_unbound_past_cutover(handle_id: u64) -> Option<String> {
     let guard = ENGINES.lock().expect("poisoned");
     let engine = guard.get(&handle_id)?;
     engine.is_v2_cutover().then(|| {
-        "application messages must carry their sender binding after the SPEC-061 cutover".to_owned()
+        "application messages must carry their sender binding after the v2 credential cutover"
+            .to_owned()
     })
 }
 
@@ -561,7 +562,7 @@ fn start_group_into_ffi(
         None if engine.is_v2_cutover() => {
             return ffi_start_group_err(
                 "application messages must carry their sender binding after the \
-                 SPEC-061 cutover",
+                 v2 credential cutover",
             );
         }
         // Pre-cutover the AAD is empty regardless, so the value is

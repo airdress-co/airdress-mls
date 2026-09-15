@@ -1200,7 +1200,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|v| v["name"] == json!("spec-061-v2-delegation"))
+            .find(|v| v["name"] == json!("v2-delegation"))
             .expect("fixture carries the v2 vector");
         AirdressIdentity {
             version: IdentityVersion::V2,
