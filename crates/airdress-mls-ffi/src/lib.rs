@@ -251,7 +251,7 @@ mod tests {
     /// without limit, so all 20 survived and the epoch-1 ciphertext
     /// decrypted happily.
     #[test]
-    fn spec_061_epoch_retention_is_bounded_and_trimmed_epochs_are_distinguishable() {
+    fn epoch_retention_is_bounded_and_trimmed_epochs_are_distinguishable() {
         use crate::engine::EngineError;
 
         let alice_dir = tempfile::tempdir().unwrap();
@@ -330,7 +330,7 @@ mod tests {
     /// fails at all, as an ordinary error — `EpochUnavailable` must not
     /// become the answer to every decrypt problem.
     #[test]
-    fn spec_061_a_corrupt_message_is_not_reported_as_a_trimmed_epoch() {
+    fn a_corrupt_message_is_not_reported_as_a_trimmed_epoch() {
         use crate::engine::EngineError;
 
         let alice_dir = tempfile::tempdir().unwrap();
@@ -368,7 +368,7 @@ mod tests {
     /// engine sealed the advanced state, and only then returned "not
     /// an application message".
     #[test]
-    fn spec_061_a_commit_on_the_application_path_does_not_advance_the_stored_epoch() {
+    fn a_commit_on_the_application_path_does_not_advance_the_stored_epoch() {
         use mls_rs_core::group::GroupStateStorage as _;
 
         let alice_dir = tempfile::tempdir().unwrap();

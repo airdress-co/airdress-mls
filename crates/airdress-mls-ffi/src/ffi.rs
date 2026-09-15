@@ -1265,7 +1265,7 @@ mod tests {
     /// sender binding after the SPEC-061 cutover"
     /// ```
     #[test]
-    fn spec_061_a_conversation_can_be_established_past_the_cutover() {
+    fn a_conversation_can_be_established_past_the_cutover() {
         let alice = engine(ALICE, 0x31, "alice-a", true);
         let bob = engine(BOB, 0x32, "bob-a", true);
 
@@ -1347,7 +1347,7 @@ mod tests {
     /// buffer contract is where an export with an intentionally EMPTY
     /// welcome could go wrong: the caller still frees three buffers.
     #[test]
-    fn spec_061_a_lone_device_establishes_its_own_thread() {
+    fn a_lone_device_establishes_its_own_thread() {
         let alice = engine(ALICE, 0x41, "alice-only", true);
         let c_alice = CString::new(ALICE).unwrap();
 
@@ -1386,7 +1386,7 @@ mod tests {
     /// binds the sender as well as the group, and an operator relaying
     /// a sibling copy is the party that asserts it.
     #[test]
-    fn spec_061_a_solo_establishment_without_a_sender_is_refused() {
+    fn a_solo_establishment_without_a_sender_is_refused() {
         let alice = engine(ALICE, 0x42, "alice-only-2", true);
         let err = take_start(airdress_mls_start_group_solo(
             alice.id,
@@ -1410,7 +1410,7 @@ mod tests {
     /// refusal that burns one leaves the peer a leaf short for a group
     /// that was never created.
     #[test]
-    fn spec_061_unbound_establishment_is_refused_past_the_cutover() {
+    fn unbound_establishment_is_refused_past_the_cutover() {
         let alice = engine(ALICE, 0x33, "alice-b", true);
         let bob = engine(BOB, 0x34, "bob-b", true);
 
@@ -1461,7 +1461,7 @@ mod tests {
     /// rather than render under the wrong heading with a valid
     /// signature.
     #[test]
-    fn spec_061_a_misrouted_establishment_message_does_not_decrypt() {
+    fn a_misrouted_establishment_message_does_not_decrypt() {
         let alice = engine(ALICE, 0x35, "alice-c", true);
         let bob = engine(BOB, 0x36, "bob-c", true);
 
@@ -1561,7 +1561,7 @@ mod tests {
     /// Back-compat: before the cutover the unbound export is still the
     /// right call and still works, AAD empty on both sides.
     #[test]
-    fn spec_061_unbound_establishment_still_works_before_the_cutover() {
+    fn unbound_establishment_still_works_before_the_cutover() {
         let alice = engine(ALICE, 0x37, "alice-d", false);
         let bob = engine(BOB, 0x38, "bob-d", false);
 
@@ -1599,7 +1599,7 @@ mod tests {
     /// left of it, and it still has to be an error rather than a
     /// silently empty AAD.
     #[test]
-    fn spec_061_a_missing_sender_is_rejected_at_the_boundary() {
+    fn a_missing_sender_is_rejected_at_the_boundary() {
         let alice = engine(ALICE, 0x39, "alice-e", true);
         let bob = engine(BOB, 0x3a, "bob-e", true);
         let bob_kp = key_package(&bob);
@@ -1639,7 +1639,7 @@ mod tests {
     /// sent for and that is establishment-time trust, unchanged by
     /// D-10.
     #[test]
-    fn spec_061_the_group_id_is_readable_off_the_framing() {
+    fn the_group_id_is_readable_off_the_framing() {
         let alice = engine(ALICE, 0x3b, "alice-f", true);
         let bob = engine(BOB, 0x3c, "bob-f", true);
 

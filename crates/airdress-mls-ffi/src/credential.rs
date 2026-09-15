@@ -1515,7 +1515,7 @@ mod tests {
     // -- FR-16: the member identity is per-device --
 
     #[test]
-    fn spec_061_two_devices_of_one_airdress_get_different_identities() {
+    fn two_devices_of_one_airdress_get_different_identities() {
         // The hinge of the whole spec: with the airdress as the member
         // identity these two collide in mls-rs tree validation, and a
         // multi-leaf group is unrepresentable.
@@ -1552,7 +1552,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_061_v1_identity_is_still_the_bare_airdress() {
+    fn v1_identity_is_still_the_bare_airdress() {
         let (identity, _, session_pub) = chain_fixture();
         let provider = AirdressIdentityProvider::new();
         assert_eq!(
@@ -1567,7 +1567,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_061_a_separator_byte_in_either_component_is_refused() {
+    fn a_separator_byte_in_either_component_is_refused() {
         let root = SigningKey::from_bytes(&[11u8; 32]);
         let (sneaky, sneaky_pub) = v2_identity(
             &root,
@@ -1587,7 +1587,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_061_v2_without_a_device_id_is_refused() {
+    fn v2_without_a_device_id_is_refused() {
         let root = SigningKey::from_bytes(&[11u8; 32]);
         let (mut identity, session_pub) = v2_identity(
             &root,
@@ -1610,7 +1610,7 @@ mod tests {
     // -- FR-17: valid_successor --
 
     #[test]
-    fn spec_061_a_sibling_device_is_not_a_valid_successor() {
+    fn a_sibling_device_is_not_a_valid_successor() {
         // THE HOLE. Before this change `valid_successor` compared
         // airdresses, so device B's credential succeeded device A's
         // leaf: a silent leaf takeover inside one airdress, needing no
@@ -1645,7 +1645,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_061_a_re_delegated_device_keeps_its_leaf() {
+    fn a_re_delegated_device_keeps_its_leaf() {
         // Same device, new session key, re-signed delegation: still
         // the same member. This is what forbids deriving the identity
         // from the session public key.
@@ -1679,7 +1679,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_061_the_same_device_under_a_different_root_is_not_a_successor() {
+    fn the_same_device_under_a_different_root_is_not_a_successor() {
         // SPEC-060: after a root recovery, leaves under the old root
         // must not be silently succeeded by leaves under the new one.
         let old_root = SigningKey::from_bytes(&[11u8; 32]);
@@ -1712,7 +1712,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_061_a_v1_leaf_cannot_be_succeeded_by_a_v2_leaf() {
+    fn a_v1_leaf_cannot_be_succeeded_by_a_v2_leaf() {
         let root = SigningKey::from_bytes(&[11u8; 32]);
         let (v1, _, v1_pub) = chain_fixture();
         let (v2, v2_pub) = v2_identity(
@@ -1738,7 +1738,7 @@ mod tests {
     // -- FR-18: expiry --
 
     #[test]
-    fn spec_061_an_expired_delegation_is_rejected_with_and_without_a_timestamp() {
+    fn an_expired_delegation_is_rejected_with_and_without_a_timestamp() {
         let root = SigningKey::from_bytes(&[11u8; 32]);
         let root_pub = root.verifying_key().to_bytes();
         let (expired, session_pub) = v2_identity(
@@ -1768,7 +1768,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_061_a_delegation_expiring_in_an_hour_is_accepted() {
+    fn a_delegation_expiring_in_an_hour_is_accepted() {
         let root = SigningKey::from_bytes(&[11u8; 32]);
         let root_pub = root.verifying_key().to_bytes();
         let (fresh, session_pub) = v2_identity(
@@ -1796,7 +1796,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_061_a_v1_delegation_carrying_an_expiry_is_still_held_to_it() {
+    fn a_v1_delegation_carrying_an_expiry_is_still_held_to_it() {
         // Labelling a delegation v1 must not be a way to keep an
         // expiry field and escape the check.
         let root = SigningKey::from_bytes(&[11u8; 32]);
@@ -1833,7 +1833,7 @@ mod tests {
     // -- FR-19: revocation --
 
     #[test]
-    fn spec_061_a_revoked_device_is_rejected_and_an_unavailable_answer_is_too() {
+    fn a_revoked_device_is_rejected_and_an_unavailable_answer_is_too() {
         let root = SigningKey::from_bytes(&[11u8; 32]);
         let root_pub = root.verifying_key().to_bytes();
         let (identity, session_pub) = v2_identity(
@@ -1865,7 +1865,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_061_revocation_is_keyed_on_the_device_id() {
+    fn revocation_is_keyed_on_the_device_id() {
         let root = SigningKey::from_bytes(&[11u8; 32]);
         let root_pub = root.verifying_key().to_bytes();
         let (identity, session_pub) = v2_identity(
@@ -1895,7 +1895,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_061_the_revocation_socket_is_inert_until_a_host_registers_one() {
+    fn the_revocation_socket_is_inert_until_a_host_registers_one() {
         // Same posture as check 2: a host that has not wired the
         // socket is in the pre-cutover state, not in a state where
         // nothing validates.
@@ -1961,7 +1961,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_061_the_cutover_is_one_way_and_retires_v1() {
+    fn the_cutover_is_one_way_and_retires_v1() {
         let root = SigningKey::from_bytes(&[11u8; 32]);
         let root_pub = root.verifying_key().to_bytes();
         let (v1, _, v1_pub) = chain_fixture();
