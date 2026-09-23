@@ -413,4 +413,46 @@ mod tests {
         let msg = alice.encrypt(&group_id, b"still working", "").unwrap();
         assert_eq!(bob.decrypt(&group_id, &msg, "").unwrap(), b"still working");
     }
+
+    /// A staged `Add` the commit builder refuses must not outlive the
+    /// failed build: it used to stay staged with no way to clear it
+    /// (`abort_commit` refuses when nothing is pending), so every later
+    /// commit on the group failed on the same proposal. SPEC-111 phase A.
+    #[test]
+    fn a_commit_that_fails_to_build_drops_what_was_staged() {
+        let alice_dir = tempfile::tempdir().unwrap();
+        let bob_dir = tempfile::tempdir().unwrap();
+
+        let mut alice = engine_at("alice.test", 27, alice_dir.path());
+        let mut bob = engine_at("bob.test", 28, bob_dir.path());
+
+        let bob_kp = bob.generate_key_package().unwrap();
+        let outcome = alice.start_group(&bob_kp, b"hello bob", "").unwrap();
+        let group_id = outcome.group_id.clone();
+        bob.process_welcome(&outcome.welcome).unwrap();
+
+        // Parses as an MLS message, so `propose_add` accepts it, and is
+        // not a KeyPackage, so the builder refuses it — the cheapest
+        // stand-in for a package the identity rules reject.
+        alice.propose_add(&group_id, &outcome.welcome).unwrap();
+        let err = alice
+            .commit_pending(&group_id)
+            .expect_err("a Welcome is not a member to add");
+        assert!(err.starts_with("add member:"), "{err}");
+        assert!(
+            alice.abort_commit(&group_id).is_err(),
+            "nothing is pending after a build that failed"
+        );
+
+        // The refused proposal is gone: the next commit is the plain
+        // self-commit, and it reaches Bob.
+        let commit = alice
+            .commit_pending(&group_id)
+            .expect("the failed Add did not poison the group")
+            .commit;
+        let epoch = alice.confirm_commit(&group_id).unwrap();
+        let applied = bob.process_commit(&group_id, &commit).unwrap();
+        assert_eq!(applied.epoch, epoch);
+        assert!(applied.added.is_empty());
+    }
 }

@@ -960,6 +960,22 @@ impl MlsEngine {
     /// still carries a path update, which is exactly the self-heal
     /// FR-1 asks for.
     ///
+    /// ## A commit that fails to build drops what was staged
+    ///
+    /// The staged proposals used to survive a failed build, because
+    /// only [`MlsEngine::confirm_commit`] and
+    /// [`MlsEngine::abort_commit`] cleared them — and `abort_commit`
+    /// refuses to run when nothing is pending, which after a failed
+    /// build is exactly the state. So one `Add` of a `KeyPackage` the
+    /// rules refuse (a sibling whose delegation chains to a root this
+    /// device does not hold) stayed staged for the life of the engine,
+    /// and every later commit on that group — the next sibling pass,
+    /// the post-compromise self-commit, the revocation sweep — failed
+    /// on the same stale proposal. Measured on three phones on
+    /// 2026-09-23 (SPEC-111 phase A). The caller re-proposes from a
+    /// fresh read of the tree on its next pass, which is the same
+    /// contract `abort_commit` already gives it.
+    ///
     /// # Errors
     ///
     /// The group is unknown, a commit is already awaiting
@@ -968,9 +984,9 @@ impl MlsEngine {
         if self.pending.contains_key(group_id) {
             return Err("a commit for this group is already awaiting confirmation".to_owned());
         }
+        let staged = self.staged.remove(group_id).unwrap_or_default();
         let mut group = self.load_group(group_id)?;
         let before = self.identity_set(&group)?;
-        let staged = self.staged.get(group_id).cloned().unwrap_or_default();
         let mut builder = group.commit_builder();
         for proposal in &staged {
             builder = match proposal {
