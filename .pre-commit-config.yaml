@@ -1,0 +1,35 @@
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --check
+        language: system
+        files: \.rs$
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets -- -D warnings
+        language: system
+        files: \.rs$
+        pass_filenames: false
+
+      - id: public-hygiene
+        name: no internal names in a public repository
+        entry: scripts/check-public.sh
+        language: system
+        pass_filenames: false
+
+      - id: doc-numbers
+        name: document numbers stay out of code
+        entry: scripts/check-doc-numbers.sh
+        language: system
+        pass_filenames: false
+
+      - id: third-party
+        name: THIRD-PARTY.md matches the lockfile
+        entry: scripts/third-party.sh --check
+        language: system
+        files: ^(Cargo\.lock|Cargo\.toml|crates/.*/Cargo\.toml|THIRD-PARTY\.md)$
+        pass_filenames: false
