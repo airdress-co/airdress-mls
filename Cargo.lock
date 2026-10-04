@@ -58,9 +58,12 @@ name = "airdress-mls-ffi"
 version = "0.2.0"
 dependencies = [
  "airdress-mls",
+ "base64",
  "ed25519-dalek",
  "mls-rs",
+ "serde_json",
  "tempfile",
+ "zeroize",
 ]
 
 [[package]]

@@ -749,6 +749,38 @@ const fn days_in_month(year: i64, month: i64) -> i64 {
     }
 }
 
+/// Format seconds since the Unix epoch as `YYYY-MM-DDThh:mm:ssZ`, the
+/// form [`parse_rfc3339_seconds`] reads back exactly. `None` past year
+/// 9999, which a four-digit year cannot carry.
+pub(crate) fn format_rfc3339_seconds(unix: u64) -> Option<String> {
+    let secs = i64::try_from(unix).ok()?;
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (year, month, day) = civil_from_days(days);
+    if year > 9999 {
+        return None;
+    }
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3_600,
+        rem % 3_600 / 60,
+        rem % 60
+    ))
+}
+
+/// The inverse of [`days_from_civil`] (Howard Hinnant's `civil_from_days`).
+const fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    (year, month, day)
+}
+
 /// Days since 1970-01-01 for a proleptic-Gregorian date (Howard
 /// Hinnant's `days_from_civil`).
 const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
@@ -1362,6 +1394,21 @@ mod tests {
             parse_rfc3339_seconds("2024-02-29T00:00:00Z"),
             Some(1_709_164_800)
         );
+    }
+
+    #[test]
+    fn rfc3339_formatting_round_trips() {
+        use super::format_rfc3339_seconds;
+        for unix in [0, 951_782_400, 1_709_164_800, 1_791_201_600, 4_102_444_799] {
+            let text = format_rfc3339_seconds(unix).unwrap();
+            assert_eq!(parse_rfc3339_seconds(&text), Some(unix), "{text}");
+        }
+        assert_eq!(
+            format_rfc3339_seconds(1_791_201_600).as_deref(),
+            Some("2026-10-05T12:00:00Z")
+        );
+        assert_eq!(format_rfc3339_seconds(u64::MAX), None);
+        assert_eq!(format_rfc3339_seconds(253_402_300_800), None);
     }
 
     #[test]

@@ -1073,6 +1073,65 @@ pub unsafe extern "C" fn airdress_mls_free_commit_result(result: FfiCommitResult
     }
 }
 
+/// Mint a root-signed delegation for an agent device.
+///
+/// The ONE export that borrows the airdress root seed: the device that
+/// holds the root (the phone) approves an agent device by signing a
+/// delegation naming the agent's own key, and never seals the seed to it.
+/// The seed is copied once, used for one signature and zeroized; nothing
+/// keeps it. Every other export takes a session seed, never this one.
+///
+/// `device_public_key` is the agent's Ed25519 key (32 bytes), which is
+/// also its MLS signing key. `harness` (`[a-z][a-z0-9-]{0,31}`) names the
+/// program running the agent and `device_label` is what people are shown.
+/// `issued_at_unix` is now, in seconds; the delegation expires thirty days
+/// later ([`airdress_mls::delegation::AGENT_DELEGATION_LIFETIME_SECS`]).
+///
+/// Returns the delegation as UTF-8 JSON (keys sorted, `signature`
+/// included), freed with `airdress_mls_free_bytes`, or an error naming the
+/// field that failed its shape check.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)] // a flat C ABI: one argument per field
+pub extern "C" fn airdress_mls_mint_agent_delegation(
+    root_seed: *const u8,
+    root_seed_len: usize,
+    airdress: *const c_char,
+    device_id: *const c_char,
+    device_public_key: *const u8,
+    device_public_key_len: usize,
+    harness: *const c_char,
+    device_label: *const c_char,
+    issued_at_unix: u64,
+) -> FfiBytes {
+    let minted = (|| -> Result<Vec<u8>, String> {
+        let mut seed = required_key32(root_seed, root_seed_len, "root_seed")?;
+        let req = (|| -> Result<_, String> {
+            Ok(airdress_mls::delegation::AgentDelegationRequest {
+                airdress: required_str(airdress, "airdress")?,
+                device_id: required_str(device_id, "device_id")?,
+                device_public_key: required_key32(
+                    device_public_key,
+                    device_public_key_len,
+                    "device_public_key",
+                )?,
+                harness: required_str(harness, "harness")?,
+                device_label: required_str(device_label, "device_label")?,
+                issued_at_unix,
+            })
+        })();
+        let out = req.and_then(|req| {
+            airdress_mls::delegation::mint_agent_delegation(&seed, &req).map_err(|e| e.to_string())
+        });
+        zeroize::Zeroize::zeroize(&mut seed);
+        let delegation = out?;
+        serde_json::to_vec(&serde_json::Value::Object(delegation)).map_err(|e| e.to_string())
+    })();
+    match minted {
+        Ok(bytes) => FfiBytes::ok(bytes),
+        Err(msg) => FfiBytes::err(msg),
+    }
+}
+
 /// Free a byte buffer previously returned by any `airdress_mls_*` function.
 ///
 /// # Safety
@@ -1677,5 +1736,54 @@ mod tests {
             18,
         ))
         .expect_err("garbage is a parse error, not a group id");
+    }
+
+    /// The minting export, through the C boundary: the vector's inputs give
+    /// the vector's delegation, and a malformed key is an error naming it.
+    #[test]
+    fn mint_agent_delegation_reproduces_the_vector() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        use super::airdress_mls_mint_agent_delegation;
+
+        let fixture: serde_json::Value =
+            serde_json::from_str(airdress_mls::vectors::DELEGATION).unwrap();
+        let v = fixture["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "agent-delegation")
+            .unwrap();
+        let m = &v["mint"];
+        let b64 = |x: &serde_json::Value| URL_SAFE_NO_PAD.decode(x.as_str().unwrap()).unwrap();
+        let cs = |x: &serde_json::Value| CString::new(x.as_str().unwrap()).unwrap();
+        let seed = b64(&v["root_seed_b64url"]);
+        let key = b64(&m["device_public_key_b64url"]);
+        let (airdress, device_id, harness, label) = (
+            cs(&m["airdress"]),
+            cs(&m["device_id"]),
+            cs(&m["harness"]),
+            cs(&m["device_label"]),
+        );
+        let mint = |key: &[u8]| {
+            take_bytes(airdress_mls_mint_agent_delegation(
+                seed.as_ptr(),
+                seed.len(),
+                airdress.as_ptr(),
+                device_id.as_ptr(),
+                key.as_ptr(),
+                key.len(),
+                harness.as_ptr(),
+                label.as_ptr(),
+                m["issued_at_unix"].as_u64().unwrap(),
+            ))
+        };
+        let json = mint(&key).expect("minted");
+        let minted: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(minted, v["delegation"]);
+
+        let err = mint(&key[..31]).expect_err("a short key is refused");
+        assert!(err.contains("device_public_key"), "{err}");
     }
 }
