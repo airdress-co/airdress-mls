@@ -1,0 +1,17 @@
+airdress-mls
+Copyright 2026 Airdress Co.
+
+This product includes software developed at Airdress Co.
+(https://airdress.co).
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+Extracted from airdress-operator on 2026-10-04 with its commit history
+intact. Commits before that date were authored inside that repository,
+under the same copyright, and are relicensed here under Apache-2.0 by
+the copyright holder.
+
+Third-party dependencies and their licences are listed in
+THIRD-PARTY.md, which is generated from the lockfile; `cargo deny check
+licenses` is the gate that keeps the list to licences this project may
+ship.
