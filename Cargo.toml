@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = ["crates/airdress-mls", "crates/airdress-mls-ffi"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0"
+repository = "https://github.com/airdress-co/airdress-mls"
+publish = false
+
+[workspace.dependencies]
+airdress-mls = { path = "crates/airdress-mls", version = "0.2.0" }
+
+mls-rs = { version = "0.54", default-features = false, features = ["std", "rfc_compliant", "fast_serialize"] }
+mls-rs-core = { version = "0.26", default-features = false, features = ["std", "rfc_compliant", "fast_serialize"] }
+mls-rs-crypto-rustcrypto = "0.21"
+ed25519-dalek = { version = "2.1", features = ["rand_core", "zeroize"] }
+chacha20poly1305 = "0.10"
+# NOTE: serde_json's `preserve_order` feature must never be enabled —
+# canonicalization (`canonical.rs`) relies on the default BTreeMap
+# representation sorting object keys at every nesting level. Every
+# consumer that links this crate shares one serde_json, so the ban holds
+# for the consumer's whole graph too.
+serde_json = "1"
+base64 = "0.22"
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+tempfile = "3"

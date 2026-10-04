@@ -14,7 +14,7 @@ set -euo pipefail
 # to copy into the Flutter project's platform-specific native dirs.
 
 CRATE_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$CRATE_DIR/../.."  # workspace root
+cd "$CRATE_DIR/../.."  # workspace root (this repository)
 
 TARGETS="${1:-host}"
 BUILD_DIR="$CRATE_DIR/build"

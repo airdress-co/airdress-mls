@@ -7,8 +7,8 @@
 //! pulls tokio/reqwest/figment into its tree, none of which belong in
 //! a `cdylib` built for four Android ABIs and two iOS targets. The
 //! byte-level agreement is enforced instead by the shared fixture at
-//! `airdress-common/tests/fixtures/delegation_vectors.json`, which
-//! both crates test against.
+//! `vectors/delegation_vectors.json` in this repository (exposed as
+//! [`crate::vectors::DELEGATION`]), which both crates test against.
 //!
 //! # RFC 8785 subset — do not widen, do not enable `preserve_order`
 //!
@@ -47,10 +47,7 @@ mod tests {
     use super::canonical_delegation_bytes;
 
     /// The shared cross-crate fixture — see module docs.
-    const FIXTURE: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../airdress-common/tests/fixtures/delegation_vectors.json"
-    ));
+    const FIXTURE: &str = crate::vectors::DELEGATION;
 
     #[test]
     fn matches_shared_delegation_vectors() {
