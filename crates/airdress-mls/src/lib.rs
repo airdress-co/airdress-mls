@@ -17,6 +17,7 @@
 //!   proposals and two-phase commits.
 //! * [`credential`] — the delegation-carrying identity and its checks.
 //! * [`canonical`] — the delegation's signing bytes.
+//! * [`delegation`] — minting an agent device's delegation with the root.
 //! * [`binding`] — the authenticated data every application message
 //!   carries and every receiver recomputes.
 //! * [`rules`] — the group membership rules mls-rs enforces for us.
@@ -26,6 +27,7 @@
 pub mod binding;
 pub mod canonical;
 pub mod credential;
+pub mod delegation;
 pub mod engine;
 pub mod rules;
 pub mod storage;

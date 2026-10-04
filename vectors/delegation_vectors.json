@@ -187,6 +187,33 @@
       "name": "v2-delegation",
       "root_public_key_b64url": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
       "root_seed_b64url": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+    },
+    {
+      "name": "agent-delegation",
+      "root_seed_b64url": "CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws",
+      "root_public_key_b64url": "Zr5-Myx6RTMyvZ0Kf32wVfXF7xoGraZtmLOftoEMRzo",
+      "canonical_b64url": "eyJhaXJkcmVzcyI6ImFsaWNlLmh1bWFucy5haXJkcmVzcy5jbyIsImRldmljZV9jbGFzcyI6ImFnZW50IiwiZGV2aWNlX2lkIjoiMDE5ZjBhMWMtM2I1ZC03ZTJmLThhNDEtNmM5ZDBiMmU0ZjE3IiwiZGV2aWNlX2tpbmQiOiJhZ2VudCIsImRldmljZV9sYWJlbCI6IkNsYXVkZSBDb2RlIG9uIGJ1aWxkLWhvc3QiLCJkZXZpY2Vfc2Vzc2lvbl9wdWJsaWNfa2V5IjoiR1g5ckktRnNoVExHcThnNC1zMWVwNG0tREhheWtnTTBBNXY2aXowMmpXRSIsImV4cGlyZXNfYXQiOiIyMDI2LTExLTA0VDEyOjAwOjAwWiIsImhhcm5lc3MiOiJjbGF1ZGUtY29kZSIsImlzc3VlZF9hdCI6IjIwMjYtMTAtMDVUMTI6MDA6MDBaIiwicm9sZSI6Imh1bWFuX2hlbGQifQ",
+      "delegation": {
+        "airdress": "alice.humans.airdress.co",
+        "device_class": "agent",
+        "device_id": "019f0a1c-3b5d-7e2f-8a41-6c9d0b2e4f17",
+        "device_kind": "agent",
+        "device_label": "Claude Code on build-host",
+        "device_session_public_key": "GX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE",
+        "expires_at": "2026-11-04T12:00:00Z",
+        "harness": "claude-code",
+        "issued_at": "2026-10-05T12:00:00Z",
+        "role": "human_held",
+        "signature": "OOZP2Iz3agg4pLtEsytfwl9D9RnphGmNX9QoVyc_QnzWLh5CInC0uCnSbnQ_SvOKNSLOFdQdK53oFEnw2_uQDQ"
+      },
+      "mint": {
+        "airdress": "alice.humans.airdress.co",
+        "device_id": "019f0a1c-3b5d-7e2f-8a41-6c9d0b2e4f17",
+        "device_public_key_b64url": "GX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE",
+        "harness": "claude-code",
+        "device_label": "Claude Code on build-host",
+        "issued_at_unix": 1791201600
+      }
     }
   ]
 }

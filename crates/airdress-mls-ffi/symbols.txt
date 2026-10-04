@@ -75,3 +75,11 @@ airdress_mls_start_group_solo
 # operator asserts on the SSE event. RFC 9420 puts `group_id` in the
 # clear, so this is a parse with no key material and no engine handle.
 airdress_mls_message_group_id
+
+# SPEC-133 §9.2 — approving an agent device by delegation.
+#
+# The phone holds the root and the agent never does: the phone signs a
+# thirty-day delegation naming the agent's own key (device_class `agent`,
+# its device id, harness and label) and the operator admits the agent on
+# it. The one export that borrows the root seed, for one signature.
+airdress_mls_mint_agent_delegation

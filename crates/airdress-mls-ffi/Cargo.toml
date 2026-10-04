@@ -16,8 +16,11 @@ crate-type = ["lib", "cdylib", "staticlib"]
 [dependencies]
 airdress-mls.workspace = true
 mls-rs.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 ed25519-dalek.workspace = true
 airdress-mls = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

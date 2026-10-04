@@ -29,7 +29,7 @@ jobs:
       # crates.io, which is what lets a public checkout build.
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Tests (both crates — 56 engine, 8 C-boundary)
+      - name: Tests (both crates — 60 engine, 9 C-boundary)
         run: cargo test --workspace --locked
       - name: Document numbers stay out of code
         run: scripts/check-doc-numbers.sh
@@ -55,7 +55,7 @@ jobs:
           set -euo pipefail
           out=$(cargo test --locked -p airdress-mls --lib -- \
             canonical::tests::matches_shared_delegation_vectors \
-            credential::tests:: 2>&1) || { echo "$out"; exit 1; }
+            credential::tests:: delegation::tests:: 2>&1) || { echo "$out"; exit 1; }
           echo "$out"
           echo "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed' \
             || { echo "::error::the vector tests matched nothing"; exit 1; }
