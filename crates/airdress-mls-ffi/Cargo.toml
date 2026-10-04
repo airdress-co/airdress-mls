@@ -1,31 +1,23 @@
 [package]
 name = "airdress-mls-ffi"
-version = "0.1.116"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
-description = "Flutter Rust Bridge wrapper for mls-rs, exposing MLS operations to Dart"
+repository.workspace = true
+description = "C ABI over airdress-mls, for the phone's dart:ffi bindings"
 
 [lib]
-# `lib` (rlib) added so `airdress-operator` (federation feature) can
-# reuse `credential.rs` — the delegation-carrying identity types — for
-# the in-process agent's MLS credential. The cdylib/staticlib outputs
-# for the Dart FFI build are unchanged.
+# cdylib for Android and Linux, staticlib for iOS. The exported symbol set
+# is `symbols.txt` beside this file, and CI holds the built library to it.
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
+airdress-mls.workspace = true
 mls-rs.workspace = true
-mls-rs-core.workspace = true
-mls-rs-crypto-rustcrypto.workspace = true
-ed25519-dalek.workspace = true
-chacha20poly1305 = { workspace = true, features = ["rand_core"] }
-# NOTE: serde_json's `preserve_order` feature must never be enabled —
-# canonicalization (`canonical.rs`) relies on the default BTreeMap
-# representation sorting object keys at every nesting level.
-serde_json.workspace = true
-base64.workspace = true
-zeroize.workspace = true
 
 [dev-dependencies]
+ed25519-dalek.workspace = true
+airdress-mls = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

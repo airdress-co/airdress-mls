@@ -16,7 +16,7 @@ use std::os::raw::c_char;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::engine::{CommitOutcome, MlsEngine};
+use airdress_mls::engine::{CommitOutcome, MlsEngine};
 
 // ---------------------------------------------------------------------------
 // Handle table
@@ -186,7 +186,7 @@ pub type AirdressRootKeyLookupFn =
 
 struct CallbackRootKeyLookup(AirdressRootKeyLookupFn);
 
-impl crate::credential::RootKeyLookup for CallbackRootKeyLookup {
+impl airdress_mls::credential::RootKeyLookup for CallbackRootKeyLookup {
     fn root_public_key(&self, airdress: &str) -> Option<[u8; 32]> {
         let c_airdress = std::ffi::CString::new(airdress).ok()?;
         let mut out = [0u8; 32];
@@ -227,12 +227,12 @@ pub type AirdressRevocationLookupFn = extern "C" fn(device_id: *const c_char) ->
 
 struct CallbackRevocationLookup(AirdressRevocationLookupFn);
 
-impl crate::credential::RevocationLookup for CallbackRevocationLookup {
-    fn device_status(&self, device_id: &str) -> Option<crate::credential::DeviceStatus> {
+impl airdress_mls::credential::RevocationLookup for CallbackRevocationLookup {
+    fn device_status(&self, device_id: &str) -> Option<airdress_mls::credential::DeviceStatus> {
         let c_device_id = std::ffi::CString::new(device_id).ok()?;
         match (self.0)(c_device_id.as_ptr()) {
-            1 => Some(crate::credential::DeviceStatus::Active),
-            0 => Some(crate::credential::DeviceStatus::Revoked),
+            1 => Some(airdress_mls::credential::DeviceStatus::Active),
+            0 => Some(airdress_mls::credential::DeviceStatus::Revoked),
             // Unknown answers are "cannot answer", not "fine" — the
             // caller gets RevocationUnavailable, which is a reject.
             _ => None,
@@ -577,7 +577,7 @@ fn start_group_into_ffi(
 /// Dart-frees contract. Shared by every establishment export so the
 /// memory contract exists in exactly one place.
 fn marshal_start_group(
-    outcome: Result<crate::engine::StartGroupOutcome, String>,
+    outcome: Result<airdress_mls::engine::StartGroupOutcome, String>,
 ) -> FfiStartGroupResult {
     match outcome {
         Ok(outcome) => {
@@ -1157,7 +1157,7 @@ mod tests {
         let seed = [seed_byte; 32];
         let root = SigningKey::from_bytes(&[seed_byte.wrapping_add(0x40); 32]);
         let session_pub = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
-        let delegation = crate::credential::test_support::signed_delegation_json_v2(
+        let delegation = airdress_mls::credential::test_support::signed_delegation_json_v2(
             &root,
             airdress,
             &session_pub,

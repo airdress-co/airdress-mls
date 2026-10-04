@@ -1095,10 +1095,11 @@ impl mls_rs::IdentityProvider for AirdressIdentityProvider {
     }
 }
 
-/// Shared helpers for tests across the crate: a valid root-signed
+/// Shared helpers for tests, in this crate and (behind the
+/// `test-support` feature) in its consumers: a valid root-signed
 /// delegation for a given session key.
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use ed25519_dalek::{Signer as _, SigningKey};
@@ -1165,11 +1166,7 @@ mod tests {
 
     fn fixture_identity() -> AirdressIdentity {
         // Vector "minimal-realistic" from the shared fixture.
-        let parsed: Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../airdress-common/tests/fixtures/delegation_vectors.json"
-        )))
-        .unwrap();
+        let parsed: Value = serde_json::from_str(crate::vectors::DELEGATION).unwrap();
         let vector = &parsed["vectors"][0];
         assert_eq!(vector["name"], json!("minimal-realistic"));
         AirdressIdentity {
@@ -1191,11 +1188,7 @@ mod tests {
     /// that carries `device_id` and `expires_at`. Both crates
     /// canonicalize it and both must produce the same bytes.
     fn fixture_identity_v2() -> AirdressIdentity {
-        let parsed: Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../airdress-common/tests/fixtures/delegation_vectors.json"
-        )))
-        .unwrap();
+        let parsed: Value = serde_json::from_str(crate::vectors::DELEGATION).unwrap();
         let vector = parsed["vectors"]
             .as_array()
             .unwrap()

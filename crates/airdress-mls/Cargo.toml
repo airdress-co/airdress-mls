@@ -1,0 +1,27 @@
+[package]
+name = "airdress-mls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MLS (RFC 9420) client engine for airdress devices: delegation-carrying credentials, sealed storage, AAD binding and the group rules"
+
+[features]
+# Builders for root-signed delegations, for other crates' tests. Never
+# enabled by a production build.
+test-support = []
+
+[dependencies]
+mls-rs.workspace = true
+mls-rs-core.workspace = true
+mls-rs-crypto-rustcrypto.workspace = true
+ed25519-dalek.workspace = true
+chacha20poly1305 = { workspace = true, features = ["rand_core"] }
+serde_json.workspace = true
+base64.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

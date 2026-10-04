@@ -1,0 +1,77 @@
+# The `airdress_mls_*` C exports — the whole of this crate's ABI.
+#
+# `scripts/check-symbols.sh` builds the shared library and compares its
+# dynamic symbol table to this list in both directions: an export the
+# list does not carry fails, and so does a listed name the library does
+# not export. Every name here is an ABI promise to a phone already in the
+# field, so removing one is a breaking change and renaming one is two.
+#
+# airdress-chat keeps a mirror (`scripts/mls-ffi-symbols.txt`) that its
+# own linker lists and `nm` checks read; its parity test holds the mirror
+# to this crate's `src/ffi.rs`. A symbol missing from ONE artifact is not
+# a load error — it is an app that pairs, connects, and refuses every
+# send.
+#
+# Blank lines and `#` comments are ignored. One symbol per line.
+
+# SPEC-054 — the original fourteen.
+airdress_mls_create_engine_from_seed
+airdress_mls_set_root_key_lookup
+airdress_mls_destroy_engine
+airdress_mls_generate_key_package
+airdress_mls_generate_key_packages
+airdress_mls_stored_key_packages
+airdress_mls_key_package_pool_count
+airdress_mls_start_group
+airdress_mls_process_welcome
+airdress_mls_encrypt
+airdress_mls_decrypt
+airdress_mls_free_bytes
+airdress_mls_free_bytes_list
+airdress_mls_free_error
+
+# SPEC-061 phases 3 + 4 — the v2 credential controls, the bound
+# encrypt/decrypt pair, and the proposal/commit surface.
+airdress_mls_set_revocation_lookup
+airdress_mls_set_v2_cutover
+airdress_mls_is_v2_cutover
+airdress_mls_encrypt_bound
+airdress_mls_decrypt_bound
+airdress_mls_propose_add
+airdress_mls_propose_remove
+airdress_mls_propose_update
+airdress_mls_process_proposal
+airdress_mls_commit_pending
+airdress_mls_confirm_commit
+airdress_mls_abort_commit
+airdress_mls_process_commit
+airdress_mls_group_epoch
+airdress_mls_group_members
+airdress_mls_free_commit_result
+
+# SPEC-061 phase 7 — group establishment.
+#
+# `start_group_bound` is the one operation that had no bound form: the
+# group's FIRST application message rides inside `start_group`, so past
+# the cutover a client could join a group and send into one and could not
+# create one — and nothing else creates the first group of a
+# conversation.
+#
+# `start_group_solo` is task 7.2's. Retiring the `self.local` companion
+# credential makes the self thread a conversation whose members are the
+# owner's own devices, and an owner with one device then has a
+# conversation with ONE member — which no export taking a peer
+# `KeyPackage` can express, because the only package a lone device holds
+# is its own and that is a duplicate leaf.
+airdress_mls_start_group_bound
+airdress_mls_start_group_solo
+
+# SPEC-061 design D-10 — the group id off a message's framing.
+#
+# The FR-17a binding is now `group_id ‖ from_airdress`, and its security
+# property is "the receiver files by the group it decrypted under, which
+# MLS authenticates in FramedContentTBS". That is only true if the client
+# actually files by group rather than by the `conversation_id` the
+# operator asserts on the SSE event. RFC 9420 puts `group_id` in the
+# clear, so this is a parse with no key material and no engine handle.
+airdress_mls_message_group_id
