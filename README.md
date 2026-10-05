@@ -13,7 +13,8 @@ other.
 | ---- | ---- |
 | `crates/airdress-mls` | The engine: delegation-carrying credentials, sealed storage, AAD binding, group rules, two-phase commits |
 | `crates/airdress-mls-ffi` | The C ABI over it (`cdylib` + `staticlib`) and `symbols.txt`, the exported set |
-| `vectors/` | Test vectors every consumer reads, through `airdress_mls::vectors` |
+| `crates/airdress-mls-client` | The client half around the engine, with no network: envelope wire types, the envelope pump's decisions (join, decrypt, apply a commit, ask to rejoin, whether to acknowledge), the conversation-to-group directory and the peer-root pin store, sealed on disk. For a device that is not the phone |
+| `vectors/` | Test vectors every consumer reads, through `airdress_mls::vectors` and `airdress_mls_client::vectors` |
 
 Ciphersuite: CS3, `MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519`.
 

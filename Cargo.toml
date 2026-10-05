@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/airdress-mls", "crates/airdress-mls-ffi"]
+members = ["crates/airdress-mls", "crates/airdress-mls-ffi", "crates/airdress-mls-client"]
 
 [workspace.package]
 version = "0.2.0"
@@ -27,3 +27,5 @@ serde_json = "1"
 base64 = "0.22"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 tempfile = "3"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"

@@ -1,0 +1,72 @@
+{
+  "description": "Lane payloads: the plaintext of an application message. Devices send a bare block array; the operator's agent sends an object with origin and blocks. Each `decodes_to` is what a client must read; `decodes_to: null` means the plaintext must be refused as not a chat payload.",
+  "vectors": [
+    {
+      "name": "bare-array",
+      "plaintext": "[{\"type\":\"text\",\"text\":\"hi\"}]",
+      "decodes_to": {
+        "origin": null,
+        "blocks": [
+          {
+            "type": "text",
+            "text": "hi"
+          }
+        ]
+      }
+    },
+    {
+      "name": "agent-reply",
+      "plaintext": "{\"origin\":\"agent\",\"blocks\":[{\"type\":\"text\",\"text\":\"hello\"}]}",
+      "decodes_to": {
+        "origin": "agent",
+        "blocks": [
+          {
+            "type": "text",
+            "text": "hello"
+          }
+        ]
+      }
+    },
+    {
+      "name": "sibling-copy",
+      "plaintext": "{\"origin\":\"sibling\",\"blocks\":[]}",
+      "decodes_to": {
+        "origin": "sibling",
+        "blocks": []
+      }
+    },
+    {
+      "name": "object-without-origin",
+      "plaintext": "{\"blocks\":[{\"type\":\"text\",\"text\":\"x\"}]}",
+      "decodes_to": {
+        "origin": null,
+        "blocks": [
+          {
+            "type": "text",
+            "text": "x"
+          }
+        ]
+      }
+    },
+    {
+      "name": "object-without-blocks",
+      "plaintext": "{\"origin\":\"agent\"}",
+      "decodes_to": null
+    },
+    {
+      "name": "blocks-not-an-array",
+      "plaintext": "{\"blocks\":\"text\"}",
+      "decodes_to": null
+    },
+    {
+      "name": "a-bare-string",
+      "plaintext": "\"hi\"",
+      "decodes_to": null
+    },
+    {
+      "name": "not-json",
+      "plaintext": "hi there",
+      "decodes_to": null
+    }
+  ]
+}
