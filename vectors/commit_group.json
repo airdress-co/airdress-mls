@@ -1,0 +1,25 @@
+{
+  "description": "commit_group: lowercase hex of the first 16 bytes of SHA-256 over the MLS group id. The operator serializes commits per (conversation, commit_group, epoch); every client must compute the same tag.",
+  "vectors": [
+    {
+      "name": "empty",
+      "group_id_b64": "",
+      "commit_group": "e3b0c44298fc1c149afbf4c8996fb924"
+    },
+    {
+      "name": "sixteen-bytes",
+      "group_id_b64": "AAECAwQFBgcICQoLDA0ODw==",
+      "commit_group": "be45cb2605bf36bebde684841a28f0fd"
+    },
+    {
+      "name": "thirty-two-bytes",
+      "group_id_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "commit_group": "630dcd2966c4336691125448bbb25b4f"
+    },
+    {
+      "name": "ascii",
+      "group_id_b64": "YWlyZHJlc3MgZ3JvdXA=",
+      "commit_group": "e41c9f7ae1ddcf15ac7888b88fb92c01"
+    }
+  ]
+}
