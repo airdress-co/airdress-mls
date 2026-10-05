@@ -366,3 +366,119 @@ fn the_shared_vectors_hold() {
         }
     }
 }
+
+/// The risk the n-device lanes carry (n ≥ 4 leaves), with an agent among
+/// them: three of the owner's devices, a peer, and an agent device the
+/// owner assigned. Every member's message is read by every other member,
+/// in every direction; the agent's Remove leaves the other four talking.
+#[test]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "members are named by index throughout"
+)]
+fn five_leaves_with_an_assigned_agent_hear_every_direction() {
+    let owner = "owner.example";
+    let peer = "peer.example";
+    let devices = [
+        Device::new(owner, 21), // the phone that founds and commits
+        Device::new(owner, 22),
+        Device::new(owner, 23),
+        Device::new(peer, 24),
+        Device::new(owner, 25), // the agent device
+    ];
+    let mut clients: Vec<Client> = devices.iter().map(Device::open).collect();
+    // What each member's operator row for the conversation is called.
+    let conv = |i: usize| if i == 3 { "conv-peer" } else { "conv-owner" };
+    let from = |i: usize| if i == 3 { peer } else { owner };
+
+    let peer_kp = clients[3].key_packages(1).unwrap().remove(0);
+    let out = clients[0]
+        .establish(conv(0), peer, &peer_kp, &text("founding"), owner)
+        .unwrap();
+    for o in &out {
+        assert!(clients[3].process(&deliver(o, owner, conv(3))).ack);
+    }
+
+    // Add the other two phones and then the agent, one commit each, the way
+    // the sibling pass and then the assignment pass do.
+    for joining in [1usize, 2, 4] {
+        let kp = clients[joining].key_packages(1).unwrap().remove(0);
+        let prepared = clients[0].prepare_add(conv(0), &[kp]).unwrap();
+        clients[0].confirm_commit(conv(0)).unwrap();
+        for member in 1..clients.len() {
+            if member == joining {
+                continue;
+            }
+            if clients[member]
+                .directory()
+                .group_for(conv(member))
+                .is_some()
+            {
+                let r = clients[member].process(&deliver(&prepared.commit, owner, conv(member)));
+                assert!(r.ack, "member {member} applied the add of {joining}");
+            }
+        }
+        let welcome = prepared.welcome.expect("welcome");
+        let joined = clients[joining].process(&deliver(&welcome, owner, conv(joining)));
+        assert!(
+            matches!(joined.event, Event::Joined { .. }),
+            "{joining} joined"
+        );
+    }
+    let group = clients[0].directory().group_for(conv(0)).unwrap();
+    assert_eq!(clients[0].engine().group_members(&group).unwrap().len(), 5);
+
+    let every_direction = |clients: &mut Vec<Client>, members: &[usize], round: &str| {
+        for &sender in members {
+            let words = format!("{round} from {sender}");
+            let out = clients[sender]
+                .encrypt(conv(sender), &text(&words), from(sender))
+                .unwrap();
+            for &reader in members {
+                if reader == sender {
+                    continue;
+                }
+                let got = clients[reader].process(&deliver(&out, from(sender), conv(reader)));
+                assert!(got.ack, "{reader} acked {sender}'s message");
+                assert_eq!(
+                    message(&got.event),
+                    (conv(reader).to_owned(), words.clone()),
+                    "{reader} read {sender}"
+                );
+            }
+        }
+    };
+    every_direction(&mut clients, &[0, 1, 2, 3, 4], "five leaves");
+
+    // Unassigned: the founding phone removes the agent's leaf.
+    let agent_identity = clients[0]
+        .engine()
+        .group_members(&group)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.identity)
+        .find(|id| id.ends_with(b"device-25"))
+        .expect("the agent's leaf");
+    let removal = clients[0]
+        .prepare_remove(conv(0), &[agent_identity])
+        .unwrap();
+    clients[0].confirm_commit(conv(0)).unwrap();
+    for member in 1..5 {
+        let r = clients[member].process(&deliver(&removal.commit, owner, conv(member)));
+        assert!(r.ack);
+        if member == 4 {
+            assert!(
+                matches!(r.event, Event::Removed { .. }),
+                "the agent learns it was removed"
+            );
+        }
+    }
+    every_direction(&mut clients, &[0, 1, 2, 3], "after the remove");
+
+    // And the removed agent reads nothing new.
+    let after = clients[1]
+        .encrypt(conv(1), &text("not for the agent"), owner)
+        .unwrap();
+    let r = clients[4].process(&deliver(&after, owner, conv(4)));
+    assert!(!matches!(r.event, Event::Message(_)), "{:?}", r.event);
+}
