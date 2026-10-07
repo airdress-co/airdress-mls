@@ -105,7 +105,9 @@ impl IdentityVersion {
 pub struct AirdressIdentity {
     /// Which delegation form this is. Serialized as `v`.
     pub version: IdentityVersion,
+    /// The airdress the delegation names.
     pub airdress: String,
+    /// The airdress root's Ed25519 public key, which signed the delegation.
     pub root_public_key: [u8; 32],
     /// The full delegation object, `signature` field included.
     pub delegation: Map<String, Value>,
@@ -251,6 +253,10 @@ pub enum ParsedIdentity {
 ///
 /// A structured identity with missing or malformed fields, an
 /// unknown version, or bytes that are neither JSON nor UTF-8.
+#[expect(
+    clippy::map_err_ignore,
+    reason = "the discarded errors are a Vec handed back by try_into or a base64/UTF-8 position; the closed error kinds returned say all a caller can act on"
+)]
 pub fn parse_identity(bytes: &[u8]) -> Result<ParsedIdentity, String> {
     if let Ok(Value::Object(obj)) = serde_json::from_slice::<Value>(bytes)
         && let Some(v) = obj.get("v").and_then(Value::as_i64)
@@ -369,6 +375,7 @@ impl mls_rs_core::error::IntoAnyError for CredentialVerifyError {
 /// Returning `None` (nothing cached, fetch failed) rejects the leaf —
 /// check 2 is never optional or warn-only.
 pub trait RootKeyLookup: Send + Sync {
+    /// The root public key cached for `airdress`, or `None`, which rejects.
     fn root_public_key(&self, airdress: &str) -> Option<[u8; 32]>;
 }
 
@@ -409,6 +416,8 @@ pub enum DeviceStatus {
 /// wired the socket is in the pre-cutover state rather than in a
 /// state where nothing validates.
 pub trait RevocationLookup: Send + Sync {
+    /// Whether `device_id` is active or revoked, or `None` when the
+    /// answer is unknown, which rejects.
     fn device_status(&self, device_id: &str) -> Option<DeviceStatus>;
 }
 
@@ -540,6 +549,10 @@ pub fn verify_identity_at(
 /// compat mode of [`AirdressIdentityProvider`] — strict verification
 /// always supplies a lookup, and check 2 is then a hard reject in
 /// every outcome.
+#[expect(
+    clippy::map_err_ignore,
+    reason = "the discarded errors are a Vec handed back by try_into, a base64 position or an opaque ed25519 error; the closed error kinds returned say all a caller can act on"
+)]
 fn verify_chain(
     identity: &AirdressIdentity,
     leaf_signing_key: &[u8],
@@ -848,6 +861,7 @@ impl core::fmt::Debug for AirdressIdentityProvider {
 }
 
 impl AirdressIdentityProvider {
+    /// A provider in compatibility mode, before any lookup is set.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -899,6 +913,7 @@ impl AirdressIdentityProvider {
         self.lookup.read().expect("lookup lock poisoned").is_some()
     }
 
+    /// Whether the v2 credential cutover has been entered.
     #[must_use]
     pub fn is_v2_cutover(&self) -> bool {
         self.v2_cutover.load(std::sync::atomic::Ordering::SeqCst)
@@ -1290,19 +1305,13 @@ mod tests {
     #[test]
     fn version_is_inferred_from_the_delegations_own_fields() {
         let v1 = fixture_identity();
-        let inferred_v1 = AirdressIdentity::from_delegation(
-            v1.airdress.clone(),
-            v1.root_public_key,
-            v1.delegation.clone(),
-        );
+        let inferred_v1 =
+            AirdressIdentity::from_delegation(v1.airdress, v1.root_public_key, v1.delegation);
         assert_eq!(inferred_v1.version, IdentityVersion::V1);
 
         let v2 = fixture_identity_v2();
-        let inferred_v2 = AirdressIdentity::from_delegation(
-            v2.airdress.clone(),
-            v2.root_public_key,
-            v2.delegation.clone(),
-        );
+        let inferred_v2 =
+            AirdressIdentity::from_delegation(v2.airdress, v2.root_public_key, v2.delegation);
         assert_eq!(inferred_v2.version, IdentityVersion::V2);
     }
 

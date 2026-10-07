@@ -7,7 +7,7 @@ why it is there.
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --locked
 scripts/check-symbols.sh     # the C ABI against its list
 prek run --all-files         # the hooks, over everything

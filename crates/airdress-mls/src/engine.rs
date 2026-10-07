@@ -43,7 +43,9 @@ pub enum EngineError {
     ///
     /// Carries no key material, per SPEC-061 NFR-6.
     EpochUnavailable {
+        /// The epoch the message was sent in.
         requested: u64,
+        /// The oldest epoch this device still holds, if it holds any.
         oldest_retained: Option<u64>,
     },
     /// Anything else, rendered exactly as it always was.
@@ -99,9 +101,14 @@ type MlsConfig = WithIdentityProvider<
     >,
 >;
 
+/// What establishing a group produced, to be put on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartGroupOutcome {
+    /// The new group's id.
     pub group_id: Vec<u8>,
+    /// The Welcome for the added member; empty for a solo group.
     pub welcome: Vec<u8>,
+    /// The first application message, bound to the group and sender.
     pub first_application: Vec<u8>,
 }
 
@@ -169,6 +176,8 @@ fn uuid_like() -> String {
     )
 }
 
+/// One device's MLS client: its signing identity, its sealed state and
+/// the credential rules it enforces.
 pub struct MlsEngine {
     client: Client<MlsConfig>,
     public_key: Vec<u8>,
@@ -207,6 +216,15 @@ enum StagedProposal {
     Add(Vec<u8>),
     /// Leaf index of the member to remove.
     Remove(u32),
+}
+
+impl core::fmt::Debug for MlsEngine {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // The client holds the signing key, so only the public half shows.
+        f.debug_struct("MlsEngine")
+            .field("public_key", &self.public_key)
+            .finish_non_exhaustive()
+    }
 }
 
 impl MlsEngine {
@@ -273,7 +291,6 @@ impl MlsEngine {
     /// supplies [`DEFAULT_MAX_EPOCH_RETENTION`] — the same default the
     /// operator's in-process agent engine uses, so forward secrecy at
     /// the storage layer is not a function of which binary ran.
-    #[allow(clippy::too_many_arguments)]
     pub fn from_seed_with_retention(
         airdress: &str,
         seed: &[u8; 32],
@@ -345,6 +362,7 @@ impl MlsEngine {
         Ok(engine)
     }
 
+    /// The device's session public key, which signs its leaf.
     pub fn public_key(&self) -> &[u8] {
         &self.public_key
     }
@@ -383,6 +401,8 @@ impl MlsEngine {
         self.identity_provider.is_v2_cutover()
     }
 
+    /// One fresh KeyPackage, persisted to the pool like
+    /// [`Self::generate_key_packages`].
     pub fn generate_key_package(&self) -> Result<Vec<u8>, String> {
         let mut generated = self.generate_key_packages(1)?;
         generated
@@ -573,6 +593,8 @@ impl MlsEngine {
         })
     }
 
+    /// Join the group a Welcome invites this device into. Returns the
+    /// group id.
     pub fn process_welcome(&mut self, welcome_bytes: &[u8]) -> Result<Vec<u8>, String> {
         let msg = MlsMessage::from_bytes(welcome_bytes).map_err(|e| format!("bad welcome: {e}"))?;
         let (mut group, _) = self
@@ -793,10 +815,7 @@ impl MlsEngine {
     /// `airdress ‖ 0x1F ‖ device_id` under v2. Resolved through this
     /// engine's own identity provider, so the value matches what the
     /// tree used and does not drift with the cutover flag.
-    fn member_identity_bytes(
-        &self,
-        signing_identity: &mls_rs::identity::SigningIdentity,
-    ) -> Result<Vec<u8>, String> {
+    fn member_identity_bytes(&self, signing_identity: &SigningIdentity) -> Result<Vec<u8>, String> {
         use mls_rs::IdentityProvider as _;
         self.identity_provider
             .identity(signing_identity, &ExtensionList::default())

@@ -24,3 +24,68 @@ base64.workspace = true
 ed25519-dalek.workspace = true
 airdress-mls = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
+
+# The workspace lints, copied, with `unsafe_code` lowered from "forbid"
+# to "deny" so `lib.rs` can allow it on the one FFI module (R-UNS-1).
+# Cargo cannot inherit `[workspace.lints]` and override one entry, so
+# this is the whole block; `scripts/check-lints-copy.sh` keeps the two
+# in step.
+[lints.rust]
+unsafe_code = "deny"                         # lowered from the workspace "forbid": lib.rs allows it on the ffi module (R-UNS-1)
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+unnameable_types = "warn"
+elided_lifetimes_in_paths = "warn"
+unused_qualifications = "warn"
+unused_must_use = "deny"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+redundant_clone = "warn"
+debug_assert_with_mut_call = "warn"
+unused_peekable = "warn"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "warn"
+print_stdout = "deny"
+print_stderr = "deny"
+exit = "deny"
+mem_forget = "deny"
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+let_underscore_must_use = "deny"
+let_underscore_future = "deny"
+map_err_ignore = "warn"
+undocumented_unsafe_blocks = "deny"
+allow_attributes_without_reason = "warn"
+iter_over_hash_type = "warn"
+tests_outside_test_module = "warn"
+rc_buffer = "warn"
+rc_mutex = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+get_unwrap = "warn"
+manual_let_else = "warn"
+or_fun_call = "warn"
+use_self = "warn"
+str_to_string = "warn"
+disallowed_methods = "deny"
+disallowed_types = "deny"
+disallowed_macros = "deny"
+# --- pedantic allows, each with its reason ---
+missing_errors_doc = "allow"                 # the error type documents itself; `# Errors` where it adds a fact
+missing_panics_doc = "allow"                 # R-ERR-3 demands the reason at the `expect` instead
+module_name_repetitions = "allow"            # `engine::EngineError` is the clearer name
+must_use_candidate = "allow"                 # too noisy; `#[must_use]` is added where misuse has a cost
+too_many_lines = "allow"                     # a long match over a closed enum is not a defect
+doc_markdown = "allow"                       # acronyms (MLS, AAD, FFI) are not items to backtick
+cast_possible_truncation = "allow"           # we require `try_from` at wire edges by review
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"

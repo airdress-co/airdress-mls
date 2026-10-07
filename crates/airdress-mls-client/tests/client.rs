@@ -1,6 +1,10 @@
 //! Two and three clients over temporary directories, past the v2
 //! cutover: establish, join, talk both ways, add a third member, remove
 //! one, and come back from sealed state.
+#![allow(
+    clippy::tests_outside_test_module,
+    reason = "an integration test file has no cfg(test) module by construction"
+)]
 
 use airdress_mls::MlsEngine;
 use airdress_mls::credential::test_support::signed_delegation_json_v2;
@@ -284,7 +288,7 @@ fn a_third_member_is_added_hears_the_group_and_is_then_removed() {
         bob.process(&deliver(&removal.commit, "alice.example", "conv-b")).event,
         Event::Membership { ref removed, .. } if removed.len() == 1
     ));
-    let _ = b64_group_id(&group);
+    assert!(!b64_group_id(&group).is_empty());
 }
 
 #[test]

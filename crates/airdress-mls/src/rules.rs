@@ -60,7 +60,12 @@ pub enum MlsRulesError {
     /// Carries both airdresses because the operator-side telemetry
     /// needs to say which pair it saw; neither is secret (both are
     /// public names) and neither is key material.
-    CrossAirdressRemoval { by: String, target: String },
+    CrossAirdressRemoval {
+        /// The airdress whose member proposed the removal.
+        by: String,
+        /// The airdress of the leaf it tried to remove.
+        target: String,
+    },
     /// A roster leaf carried a credential that could not be read.
     /// Distinct from the above so a malformed leaf is not reported as
     /// an attempted removal.
@@ -102,12 +107,12 @@ fn airdress_at(roster: &Roster<'_>, index: u32) -> Result<String, MlsRulesError>
 /// Read from the roster, never from the proposal body — a sender that
 /// could name its own airdress could name someone else's.
 fn proposer_airdress(
-    sender: &Sender,
+    sender: Sender,
     source: &CommitSource,
     roster: &Roster<'_>,
 ) -> Result<Option<String>, MlsRulesError> {
     match sender {
-        Sender::Member(index) => airdress_at(roster, *index).map(Some),
+        Sender::Member(index) => airdress_at(roster, index).map(Some),
         // A NewMember cannot propose Remove under RFC 9420's own
         // rules; mls-rs rejects it downstream. Nothing to decide here.
         Sender::NewMemberProposal | Sender::NewMemberCommit => match source {
@@ -138,6 +143,7 @@ pub struct AirdressMlsRules {
 }
 
 impl AirdressMlsRules {
+    /// The rules, wrapping mls-rs's defaults.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -151,12 +157,12 @@ impl mls_rs::MlsRules for AirdressMlsRules {
         &self,
         direction: CommitDirection,
         source: CommitSource,
-        current_roster: &Roster,
+        current_roster: &Roster<'_>,
         current_context: &GroupContext,
         mut proposals: ProposalBundle,
     ) -> Result<ProposalBundle, Self::Error> {
         proposals.retain_by_type::<RemoveProposal, _, Self::Error>(|info| {
-            let Some(by) = proposer_airdress(info.sender(), &source, current_roster)? else {
+            let Some(by) = proposer_airdress(*info.sender(), &source, current_roster)? else {
                 // No standing to remove anything.
                 return match direction {
                     CommitDirection::Send => Ok(false),
@@ -192,7 +198,7 @@ impl mls_rs::MlsRules for AirdressMlsRules {
 
     fn commit_options(
         &self,
-        new_roster: &Roster,
+        new_roster: &Roster<'_>,
         new_context: &GroupContext,
         proposals: &ProposalBundle,
     ) -> Result<CommitOptions, Self::Error> {
@@ -203,7 +209,7 @@ impl mls_rs::MlsRules for AirdressMlsRules {
 
     fn encryption_options(
         &self,
-        current_roster: &Roster,
+        current_roster: &Roster<'_>,
         current_context: &GroupContext,
     ) -> Result<EncryptionOptions, Self::Error> {
         self.inner

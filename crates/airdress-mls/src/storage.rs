@@ -60,7 +60,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{AeadCore, ChaCha20Poly1305};
 use mls_rs_core::key_package::KeyPackageData;
 use mls_rs_core::mls_rs_codec::{MlsDecode, MlsEncode};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const NONCE_LEN: usize = 12;
 const GROUP_AAD_LABEL: &[u8] = b"airdress-mls-group-state-v1";
@@ -91,7 +91,8 @@ impl mls_rs_core::error::IntoAnyError for StorageError {
 fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        let _ = write!(out, "{b:02x}");
+        // Writing into a String cannot fail.
+        write!(out, "{b:02x}").expect("formatting into a String is infallible");
     }
     out
 }
@@ -99,7 +100,7 @@ fn hex(bytes: &[u8]) -> String {
 /// The shared sealed-file primitive both stores are built on.
 #[derive(Clone)]
 pub struct SealedStore {
-    root: Arc<PathBuf>,
+    root: Arc<Path>,
     cipher: Arc<ChaCha20Poly1305>,
 }
 
@@ -121,7 +122,7 @@ impl SealedStore {
                 .map_err(|e| StorageError(format!("create {sub} dir: {e}")))?;
         }
         Ok(Self {
-            root: Arc::new(root),
+            root: Arc::from(root),
             cipher: Arc::new(ChaCha20Poly1305::new(state_key.into())),
         })
     }
@@ -138,6 +139,10 @@ impl SealedStore {
     }
 
     /// Seal `plaintext` and atomically write it to `<sub>/<hex id>`.
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "an AEAD failure is opaque by design, and a short read's error is the slice; the closed message says what happened"
+    )]
     fn seal_write(
         &self,
         sub: &str,
@@ -171,8 +176,11 @@ impl SealedStore {
         std::fs::rename(&tmp_path, &final_path)
             .map_err(|e| StorageError(format!("rename into place: {e}")))?;
         // Best-effort directory fsync so the rename itself is durable.
-        if let Ok(dir) = std::fs::File::open(final_path.parent().unwrap_or(Path::new("."))) {
-            let _ = dir.sync_all();
+        if let Ok(dir) = std::fs::File::open(final_path.parent().unwrap_or_else(|| Path::new(".")))
+        {
+            // Best effort: the rename above already happened, and a
+            // filesystem without directory fsync is not an error here.
+            dir.sync_all().ok();
         }
         Ok(())
     }
@@ -180,6 +188,10 @@ impl SealedStore {
     /// Read and unseal `<sub>/<hex id>`. `Ok(None)` when absent; an
     /// AEAD failure (tampering, wrong key, copied file) is an error
     /// that refuses the item — never a silent re-key.
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "an AEAD failure is opaque by design, and a short read's error is the slice; the closed message says what happened"
+    )]
     fn open_read(
         &self,
         sub: &str,
@@ -263,9 +275,22 @@ fn parse_hex(name: &str) -> Option<Vec<u8>> {
 /// (u64 LE epoch_id || u32 LE len || data)*`
 const GROUP_RECORD_VERSION: u8 = 1;
 
+///
+/// Both halves are group secrets — the state holds the current epoch's
+/// key schedule and each epoch record a past one's — so the decoded
+/// record wipes itself when dropped (rust guide R-TYP-8), and so does
+/// each epoch entry trimmed out of it.
+#[derive(Zeroize, ZeroizeOnDrop)]
 struct GroupRecord {
     state: Vec<u8>,
-    epochs: Vec<(u64, Vec<u8>)>,
+    epochs: Vec<EpochEntry>,
+}
+
+/// One past epoch's record: its id and its secret bytes.
+#[derive(Debug, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+struct EpochEntry {
+    id: u64,
+    data: Vec<u8>,
 }
 
 impl GroupRecord {
@@ -275,7 +300,7 @@ impl GroupRecord {
         out.extend_from_slice(&u32::try_from(self.state.len()).unwrap_or(0).to_le_bytes());
         out.extend_from_slice(&self.state);
         out.extend_from_slice(&u32::try_from(self.epochs.len()).unwrap_or(0).to_le_bytes());
-        for (id, data) in &self.epochs {
+        for EpochEntry { id, data } in &self.epochs {
             out.extend_from_slice(&id.to_le_bytes());
             out.extend_from_slice(&u32::try_from(data.len()).unwrap_or(0).to_le_bytes());
             out.extend_from_slice(data);
@@ -283,6 +308,10 @@ impl GroupRecord {
         out
     }
 
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "try_into on a length-checked slice cannot fail, and its error is the slice; the closed message says what happened"
+    )]
     fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
         let err = || StorageError("group record truncated".to_owned());
         let mut cursor = bytes;
@@ -307,7 +336,10 @@ impl GroupRecord {
         for _ in 0..count {
             let id = u64::from_le_bytes(take(&mut cursor, 8)?.try_into().map_err(|_| err())?);
             let len = u32::from_le_bytes(take(&mut cursor, 4)?.try_into().map_err(|_| err())?);
-            epochs.push((id, take(&mut cursor, len as usize)?));
+            epochs.push(EpochEntry {
+                id,
+                data: take(&mut cursor, len as usize)?,
+            });
         }
         Ok(Self { state, epochs })
     }
@@ -371,7 +403,7 @@ impl SealedGroupStore {
         let Some(record) = self.load(group_id)? else {
             return Ok(Vec::new());
         };
-        let mut ids: Vec<u64> = record.epochs.iter().map(|(id, _)| *id).collect();
+        let mut ids: Vec<u64> = record.epochs.iter().map(|e| e.id).collect();
         ids.sort_unstable();
         Ok(ids)
     }
@@ -380,7 +412,7 @@ impl SealedGroupStore {
     pub fn oldest_retained_epoch(&self, group_id: &[u8]) -> Result<Option<u64>, StorageError> {
         Ok(self
             .load(group_id)?
-            .and_then(|r| r.epochs.iter().map(|(id, _)| *id).min()))
+            .and_then(|r| r.epochs.iter().map(|e| e.id).min()))
     }
 
     fn load(&self, group_id: &[u8]) -> Result<Option<GroupRecord>, StorageError> {
@@ -395,7 +427,9 @@ impl mls_rs_core::group::GroupStateStorage for SealedGroupStore {
     type Error = StorageError;
 
     fn state(&self, group_id: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>, Self::Error> {
-        Ok(self.load(group_id)?.map(|r| Zeroizing::new(r.state)))
+        Ok(self
+            .load(group_id)?
+            .map(|mut r| Zeroizing::new(std::mem::take(&mut r.state))))
     }
 
     fn epoch(
@@ -403,11 +437,11 @@ impl mls_rs_core::group::GroupStateStorage for SealedGroupStore {
         group_id: &[u8],
         epoch_id: u64,
     ) -> Result<Option<Zeroizing<Vec<u8>>>, Self::Error> {
-        Ok(self.load(group_id)?.and_then(|r| {
+        Ok(self.load(group_id)?.and_then(|mut r| {
             r.epochs
-                .into_iter()
-                .find(|(id, _)| *id == epoch_id)
-                .map(|(_, data)| Zeroizing::new(data))
+                .iter_mut()
+                .find(|e| e.id == epoch_id)
+                .map(|e| Zeroizing::new(std::mem::take(&mut e.data)))
         }))
     }
 
@@ -421,13 +455,18 @@ impl mls_rs_core::group::GroupStateStorage for SealedGroupStore {
             state: Vec::new(),
             epochs: Vec::new(),
         });
+        record.state.zeroize();
         record.state = state.data.to_vec();
         for insert in epoch_inserts {
-            record.epochs.push((insert.id, insert.data.to_vec()));
+            record.epochs.push(EpochEntry {
+                id: insert.id,
+                data: insert.data.to_vec(),
+            });
         }
         for update in epoch_updates {
-            if let Some(slot) = record.epochs.iter_mut().find(|(id, _)| *id == update.id) {
-                slot.1 = update.data.to_vec();
+            if let Some(slot) = record.epochs.iter_mut().find(|e| e.id == update.id) {
+                slot.data.zeroize();
+                slot.data = update.data.to_vec();
             }
         }
         // SPEC-061 FR-21 / NFR-4. Trim in the same re-seal that wrote
@@ -436,7 +475,7 @@ impl mls_rs_core::group::GroupStateStorage for SealedGroupStore {
         // is unchanged: this removes entries, it does not change how
         // they are written.
         if record.epochs.len() > self.max_epoch_retention {
-            record.epochs.sort_unstable_by_key(|(id, _)| *id);
+            record.epochs.sort_unstable_by_key(|e| e.id);
             let excess = record.epochs.len() - self.max_epoch_retention;
             record.epochs.drain(..excess);
         }
@@ -448,7 +487,7 @@ impl mls_rs_core::group::GroupStateStorage for SealedGroupStore {
     fn max_epoch_id(&self, group_id: &[u8]) -> Result<Option<u64>, Self::Error> {
         Ok(self
             .load(group_id)?
-            .and_then(|r| r.epochs.iter().map(|(id, _)| *id).max()))
+            .and_then(|r| r.epochs.iter().map(|e| e.id).max()))
     }
 }
 
@@ -606,7 +645,16 @@ mod tests {
     fn group_record_round_trip() {
         let record = GroupRecord {
             state: vec![1, 2, 3],
-            epochs: vec![(7, vec![9, 9]), (8, vec![])],
+            epochs: vec![
+                EpochEntry {
+                    id: 7,
+                    data: vec![9, 9],
+                },
+                EpochEntry {
+                    id: 8,
+                    data: vec![],
+                },
+            ],
         };
         let back = GroupRecord::decode(&record.encode()).unwrap();
         assert_eq!(back.state, record.state);

@@ -116,9 +116,8 @@ mod tests {
         drop(bob);
         let mut bob = engine_at("bob.test", 4, bob_dir.path());
         let msg = alice.encrypt(&outcome.group_id, b"again", "").unwrap();
-        let err = match bob.decrypt(&outcome.group_id, &msg, "") {
-            Err(e) => e,
-            Ok(_) => panic!("corrupt state must refuse, not panic"),
+        let Err(err) = bob.decrypt(&outcome.group_id, &msg, "") else {
+            panic!("corrupt state must refuse, not panic")
         };
         let err = err.to_string();
         assert!(err.contains("load group"), "unexpected error: {err}");
@@ -221,7 +220,7 @@ mod tests {
             dir.path().to_str().unwrap(),
             &[3u8; 32],
         );
-        let err = err.err().expect("non-object delegation must be rejected");
+        let err = err.expect_err("non-object delegation must be rejected");
         assert!(err.contains("JSON object"), "unexpected error: {err}");
     }
 
@@ -331,7 +330,7 @@ mod tests {
                 );
                 assert!(oldest_retained.unwrap() > requested);
             }
-            other => panic!("expected EpochUnavailable, got {other:?}"),
+            other @ EngineError::Other(_) => panic!("expected EpochUnavailable, got {other:?}"),
         }
     }
 

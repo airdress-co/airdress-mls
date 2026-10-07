@@ -148,7 +148,7 @@ pub fn commit_group_tag(group_id: &[u8]) -> String {
         .iter()
         .fold(String::with_capacity(32), |mut s, b| {
             use std::fmt::Write as _;
-            let _ = write!(s, "{b:02x}");
+            write!(s, "{b:02x}").expect("formatting into a String is infallible");
             s
         })
 }
@@ -217,7 +217,11 @@ pub(crate) fn random_uuid() -> String {
     OsRng.fill_bytes(&mut b);
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
-    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    let h = b.iter().fold(String::with_capacity(32), |mut s, x| {
+        use std::fmt::Write as _;
+        write!(s, "{x:02x}").expect("formatting into a String is infallible");
+        s
+    });
     format!(
         "{}-{}-{}-{}-{}",
         &h[0..8],

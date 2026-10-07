@@ -77,6 +77,13 @@ fn dec(s: &str) -> Option<[u8; 32]> {
     URL_SAFE_NO_PAD.decode(s).ok()?.try_into().ok()
 }
 
+impl core::fmt::Debug for PinStore {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Sealed content and the key it is sealed under stay out of logs.
+        f.debug_struct("PinStore").finish_non_exhaustive()
+    }
+}
+
 impl PinStore {
     /// Open (or start) the store in `dir`.
     ///
@@ -131,7 +138,7 @@ impl PinStore {
             Some(pin) => {
                 let pinned = dec(&pin.root).ok_or("a stored pin is malformed")?;
                 if pinned == *root {
-                    pin.last_seen = now.to_owned();
+                    now.clone_into(&mut pin.last_seen);
                     PinObservation::Matched
                 } else {
                     let already = self.doc.changes.iter().any(|c| {

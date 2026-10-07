@@ -172,7 +172,7 @@ unsafe fn required_str<'a>(ptr: *const c_char, name: &str) -> Result<&'a str, St
     // a NUL-terminated string valid and unwritten for `'a`.
     unsafe { CStr::from_ptr(ptr) }
         .to_str()
-        .map_err(|_| format!("{name} is not valid UTF-8"))
+        .map_err(|e| format!("{name} is not valid UTF-8: {e}"))
 }
 
 /// Copy a required 32-byte argument, rejecting null and wrong lengths.
@@ -192,7 +192,9 @@ unsafe fn required_key32(ptr: *const u8, len: usize, name: &str) -> Result<[u8; 
     }
     // SAFETY: forwarded from this function's own contract.
     let slice = unsafe { borrowed(ptr, len, name) }?;
-    slice.try_into().map_err(|_| format!("{name} length error"))
+    slice
+        .try_into()
+        .map_err(|e| format!("{name} length error: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +241,10 @@ impl FfiBytes {
         }
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "takes the String every caller owns, so guarded(FfiBytes::err, ..) names it directly"
+    )]
     fn err(msg: String) -> Self {
         Self {
             ptr: std::ptr::null_mut(),
@@ -317,7 +323,6 @@ fn ffi_handle_err(msg: &str) -> FfiHandleResult {
 /// `airdress`, `delegation_json` and `state_dir` are string inputs
 /// (contract 2). The result is freed per contract 3.
 #[unsafe(no_mangle)]
-#[allow(clippy::too_many_arguments)] // a flat C ABI: one argument per field
 pub unsafe extern "C" fn airdress_mls_create_engine_from_seed(
     airdress: *const c_char,
     session_seed: *const u8,
@@ -561,6 +566,10 @@ impl FfiBytesList {
         }
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "takes the String every caller owns, so guarded(FfiBytesList::err, ..) names it directly"
+    )]
     fn err(msg: String) -> Self {
         Self {
             items: std::ptr::null_mut(),
@@ -1664,7 +1673,6 @@ pub unsafe extern "C" fn airdress_mls_free_commit_result(result: FfiCommitResult
 /// `device_id`, `harness` and `device_label` are string inputs
 /// (contract 2). The result is freed per contract 3.
 #[unsafe(no_mangle)]
-#[allow(clippy::too_many_arguments)] // a flat C ABI: one argument per field
 pub unsafe extern "C" fn airdress_mls_mint_agent_delegation(
     root_seed: *const u8,
     root_seed_len: usize,
@@ -1797,9 +1805,10 @@ mod tests {
 
     /// The hook `with_engine` calls with the table locked.
     pub(super) fn maybe_inject_panic() {
-        if INJECT_PANIC.with(|flag| flag.replace(false)) {
-            panic!("injected by a test");
-        }
+        assert!(
+            !INJECT_PANIC.with(|flag| flag.replace(false)),
+            "injected by a test"
+        );
     }
 
     const ALICE: &str = "alice.test.airdress.co";
@@ -1808,7 +1817,7 @@ mod tests {
     /// A live engine handle plus the state dir it must outlive.
     struct Handle {
         id: u64,
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
     }
 
     impl Drop for Handle {
@@ -1863,7 +1872,7 @@ mod tests {
         }
         Handle {
             id: result.handle_id,
-            _dir: dir,
+            dir,
         }
     }
 
@@ -1890,6 +1899,10 @@ mod tests {
     }
 
     /// Consume an `FfiBytes`, freeing whichever half it carries.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "taking the result by value is the point: it is freed here"
+    )]
     fn take_bytes(result: FfiBytes) -> Result<Vec<u8>, String> {
         if result.error.is_null() {
             Ok(take_buffer(result.ptr, result.len))
@@ -1906,6 +1919,10 @@ mod tests {
         first_application: Vec<u8>,
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "taking the result by value is the point: it is freed here"
+    )]
     fn take_start(result: FfiStartGroupResult) -> Result<Started, String> {
         if !result.error.is_null() {
             return Err(take_error(result.error));
@@ -2135,8 +2152,8 @@ mod tests {
         // Nothing was created. Alice's state dir holds no group, so
         // the refusal cost the caller nothing to retry from.
         assert!(
-            !alice._dir.path().join("groups").exists()
-                || std::fs::read_dir(alice._dir.path().join("groups"))
+            !alice.dir.path().join("groups").exists()
+                || std::fs::read_dir(alice.dir.path().join("groups"))
                     .expect("groups dir")
                     .next()
                     .is_none(),
