@@ -543,6 +543,12 @@ impl airdress_mls::credential::RevocationLookup for CallbackRevocationLookup {
 /// Returns 0 on success, -1 for an invalid handle or a null callback,
 /// -3 on an internal error.
 ///
+/// **Required past the v2 cutover.** An engine that has entered
+/// `airdress_mls_set_v2_cutover` refuses every leaf
+/// (`device revocation state unavailable`) until this is registered:
+/// the two switches are coupled, in either order (fail closed, since
+/// 0.3.0; before, check 5 was silently skipped).
+///
 /// # Safety
 ///
 /// `lookup` is null (refused) or a callback under contract 4.
@@ -573,6 +579,11 @@ pub unsafe extern "C" fn airdress_mls_set_revocation_lookup(
 /// identities stop being accepted and the per-device member identity
 /// becomes the only form in the tree. One-way within the process, per
 /// NFR-15 — there is no symmetric "unset" export, deliberately.
+///
+/// **Couples to `airdress_mls_set_revocation_lookup`.** Past the cutover
+/// no leaf verifies until a revocation lookup is registered on this
+/// engine — before or after this call — so a host that enters the
+/// cutover must register one (fail closed, since 0.3.0).
 ///
 /// Returns 0 on success, -1 for an invalid handle, -3 on an internal
 /// error.
@@ -1910,6 +1921,12 @@ mod tests {
         }
     }
 
+    /// The revocation lookup the test engines register: every device
+    /// is active.
+    extern "C" fn every_device_active(_device_id: *const std::os::raw::c_char) -> i32 {
+        1
+    }
+
     /// Build an engine through the export a host actually calls, and
     /// put it past the v2 cutover when asked.
     fn engine(airdress: &str, seed_byte: u8, device_id: &str, cutover: bool) -> Handle {
@@ -1953,6 +1970,19 @@ mod tests {
         unsafe { super::airdress_mls_free_bytes(result.public_key_ptr, result.public_key_len) };
         if cutover {
             assert_eq!(airdress_mls_set_v2_cutover(result.handle_id), 0);
+            // Past the cutover nothing verifies until a revocation lookup
+            // is registered (fail closed); every device here is active.
+            assert_eq!(
+                // SAFETY: a plain function, callable for the life of the
+                // process, that never calls back into the library.
+                unsafe {
+                    super::airdress_mls_set_revocation_lookup(
+                        result.handle_id,
+                        Some(every_device_active),
+                    )
+                },
+                0
+            );
         }
         Handle {
             id: result.handle_id,

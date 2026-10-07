@@ -340,6 +340,11 @@ pub enum CredentialVerifyError {
     /// A pre-cutover bare-string identity while strict verification
     /// is on, or a `v: 1` identity after the v2 cutover.
     LegacyIdentityRejected,
+    /// Check 4 could not run: the clock reads before 1970, so "now"
+    /// is unknown. A reject — reading it as 0 would make every expiry
+    /// lie in the future, which is a wound-back clock accepting expired
+    /// delegations.
+    ClockUnavailable,
 }
 
 impl core::fmt::Display for CredentialVerifyError {
@@ -355,6 +360,7 @@ impl core::fmt::Display for CredentialVerifyError {
             Self::RevocationUnavailable => write!(f, "device revocation state unavailable"),
             Self::MissingDeviceId => write!(f, "delegation missing device id"),
             Self::LegacyIdentityRejected => write!(f, "legacy identity rejected"),
+            Self::ClockUnavailable => write!(f, "system clock unavailable"),
         }
     }
 }
@@ -442,6 +448,14 @@ where
 pub trait Clock: Send + Sync {
     /// Seconds since the Unix epoch.
     fn now_unix_seconds(&self) -> u64;
+
+    /// Seconds since the Unix epoch, or `None` when the clock cannot
+    /// say — what verification reads, so that an unknown "now" refuses
+    /// a delegation with an expiry instead of passing it. The default
+    /// trusts [`Self::now_unix_seconds`].
+    fn now_unix_seconds_checked(&self) -> Option<u64> {
+        Some(self.now_unix_seconds())
+    }
 }
 
 /// Production [`Clock`]: the host's wall clock.
@@ -449,10 +463,18 @@ pub trait Clock: Send + Sync {
 pub struct SystemClock;
 
 impl Clock for SystemClock {
+    /// 0 for a clock before 1970. Verification never reads this form:
+    /// it reads [`Clock::now_unix_seconds_checked`], which refuses.
     fn now_unix_seconds(&self) -> u64 {
+        self.now_unix_seconds_checked().unwrap_or(0)
+    }
+
+    /// `None` for a clock before 1970.
+    fn now_unix_seconds_checked(&self) -> Option<u64> {
         std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs())
+            .ok()
+            .map(|d| d.as_secs())
     }
 }
 
@@ -497,17 +519,19 @@ pub fn airdress_of(
 }
 
 /// Run the chain verification on a parsed identity with the system
-/// clock and no revocation lookup.
+/// clock and **no revocation check** (check 5 is skipped).
 ///
-/// Retained as the crate's simple entry point (the operator's agent
-/// credential tests and any host that has not wired the SPEC-061
-/// sockets call it). Checks 4 and 5 still run whenever the delegation
-/// itself carries the fields they read.
+/// The name says what it leaves out (it was `verify_identity`, which
+/// read as the whole check): a revoked device's identity passes here.
+/// Use [`verify_identity_at`] with a revocation lookup, or a
+/// cutover [`AirdressIdentityProvider`] with one registered, for a
+/// leaf that is going into a group. Check 4 runs whenever the
+/// delegation carries an expiry, and a clock before 1970 refuses it.
 ///
 /// # Errors
 ///
 /// Any [`CredentialVerifyError`].
-pub fn verify_identity(
+pub fn verify_identity_without_revocation(
     identity: &AirdressIdentity,
     leaf_signing_key: &[u8],
     lookup: &dyn RootKeyLookup,
@@ -517,11 +541,11 @@ pub fn verify_identity(
         leaf_signing_key,
         Some(lookup),
         None,
-        SystemClock.now_unix_seconds(),
+        SystemClock.now_unix_seconds_checked(),
     )
 }
 
-/// [`verify_identity`] with the SPEC-061 sockets supplied explicitly:
+/// [`verify_identity_without_revocation`] with the SPEC-061 sockets supplied explicitly:
 /// a revocation lookup (check 5) and an already-resolved wall-clock
 /// instant (check 4).
 ///
@@ -540,7 +564,7 @@ pub fn verify_identity_at(
         leaf_signing_key,
         Some(lookup),
         revocation,
-        now_unix_seconds,
+        Some(now_unix_seconds),
     )
 }
 
@@ -558,7 +582,7 @@ fn verify_chain(
     leaf_signing_key: &[u8],
     lookup: Option<&dyn RootKeyLookup>,
     revocation: Option<&dyn RevocationLookup>,
-    now_unix_seconds: u64,
+    now_unix_seconds: Option<u64>,
 ) -> Result<(), CredentialVerifyError> {
     // Check 1 — delegation signature over the canonical bytes.
     let sig_b64 = identity
@@ -622,7 +646,8 @@ fn verify_chain(
             let expiry = parse_rfc3339_seconds(expires_at).ok_or_else(|| {
                 CredentialVerifyError::Malformed("delegation expires_at is not RFC 3339".into())
             })?;
-            if expiry <= now_unix_seconds {
+            let now = now_unix_seconds.ok_or(CredentialVerifyError::ClockUnavailable)?;
+            if expiry <= now {
                 return Err(CredentialVerifyError::DelegationExpired);
             }
         }
@@ -922,16 +947,43 @@ impl AirdressIdentityProvider {
     /// # Panics
     ///
     /// If the clock lock is poisoned — unrecoverable.
-    fn now(&self, timestamp: Option<mls_rs::time::MlsTime>) -> u64 {
+    fn now(&self, timestamp: Option<mls_rs::time::MlsTime>) -> Option<u64> {
         timestamp.map_or_else(
             || {
                 self.clock
                     .read()
                     .expect("clock lock poisoned")
-                    .now_unix_seconds()
+                    .now_unix_seconds_checked()
             },
-            |t| t.seconds_since_epoch(),
+            |t| Some(t.seconds_since_epoch()),
         )
+    }
+
+    /// The registered revocation lookup, or a refusal when the v2
+    /// cutover is on and none is registered.
+    ///
+    /// Past the cutover every leaf carries a `device_id` and check 5 is
+    /// what makes removing a device mean anything. Before this, a host
+    /// that entered the cutover and never registered a lookup skipped
+    /// check 5 for every leaf, silently: a revoked device kept its seat.
+    /// Now that host refuses every leaf until it registers one, which
+    /// is loud (owner decision: fail closed).
+    ///
+    /// # Panics
+    ///
+    /// If the revocation lock is poisoned — unrecoverable.
+    fn revocation_for_check(
+        &self,
+    ) -> Result<Option<std::sync::Arc<dyn RevocationLookup>>, CredentialVerifyError> {
+        let revocation = self
+            .revocation
+            .read()
+            .expect("revocation lock poisoned")
+            .clone();
+        if revocation.is_none() && self.is_v2_cutover() {
+            return Err(CredentialVerifyError::RevocationUnavailable);
+        }
+        Ok(revocation)
     }
 
     /// Run checks 1 and 3-5 against an explicitly supplied root-key
@@ -959,11 +1011,7 @@ impl AirdressIdentityProvider {
         lookup: &dyn RootKeyLookup,
         timestamp: Option<mls_rs::time::MlsTime>,
     ) -> Result<(), CredentialVerifyError> {
-        let revocation = self
-            .revocation
-            .read()
-            .expect("revocation lock poisoned")
-            .clone();
+        let revocation = self.revocation_for_check()?;
         verify_chain(
             identity,
             leaf_signing_key,
@@ -1012,11 +1060,6 @@ impl AirdressIdentityProvider {
         let parsed = parse_identity(&basic.identifier).map_err(CredentialVerifyError::Malformed)?;
         self.reject_cutover_retired_form(&parsed)?;
         let lookup = self.lookup.read().expect("lookup lock poisoned").clone();
-        let revocation = self
-            .revocation
-            .read()
-            .expect("revocation lock poisoned")
-            .clone();
         match parsed {
             // Strict mode retires the bare-string form on its own,
             // ahead of and independent of the v2 cutover.
@@ -1027,13 +1070,16 @@ impl AirdressIdentityProvider {
                     Ok(())
                 }
             }
-            ParsedIdentity::Structured(identity) => verify_chain(
-                &identity,
-                signing_identity.signature_key.as_bytes(),
-                lookup.as_deref(),
-                revocation.as_deref(),
-                self.now(timestamp),
-            ),
+            ParsedIdentity::Structured(identity) => {
+                let revocation = self.revocation_for_check()?;
+                verify_chain(
+                    &identity,
+                    signing_identity.signature_key.as_bytes(),
+                    lookup.as_deref(),
+                    revocation.as_deref(),
+                    self.now(timestamp),
+                )
+            }
         }
     }
 
@@ -1448,7 +1494,7 @@ mod tests {
     use super::test_support::{signed_delegation_json, signed_delegation_json_v2};
     use super::{
         AirdressIdentityProvider, CredentialVerifyError, DeviceStatus, FixedClock,
-        IDENTITY_SEPARATOR, verify_identity, verify_identity_at,
+        IDENTITY_SEPARATOR, verify_identity_at, verify_identity_without_revocation,
     };
 
     const FAR_FUTURE: &str = "2099-01-01T00:00:00Z";
@@ -1509,7 +1555,7 @@ mod tests {
     fn valid_chain_is_accepted() {
         let (identity, root_pub, session_pub) = chain_fixture();
         let lookup = move |_: &str| Some(root_pub);
-        verify_identity(&identity, &session_pub, &lookup).unwrap();
+        verify_identity_without_revocation(&identity, &session_pub, &lookup).unwrap();
     }
 
     #[test]
@@ -1520,7 +1566,7 @@ mod tests {
             .to_bytes();
         let lookup = move |_: &str| Some(other_root);
         assert_eq!(
-            verify_identity(&identity, &session_pub, &lookup),
+            verify_identity_without_revocation(&identity, &session_pub, &lookup),
             Err(CredentialVerifyError::RootKeyMismatch)
         );
     }
@@ -1530,7 +1576,7 @@ mod tests {
         let (identity, _, session_pub) = chain_fixture();
         let lookup = |_: &str| None;
         assert_eq!(
-            verify_identity(&identity, &session_pub, &lookup),
+            verify_identity_without_revocation(&identity, &session_pub, &lookup),
             Err(CredentialVerifyError::RootKeyUnavailable)
         );
     }
@@ -1543,7 +1589,7 @@ mod tests {
             .verifying_key()
             .to_bytes();
         assert_eq!(
-            verify_identity(&identity, &other_session, &lookup),
+            verify_identity_without_revocation(&identity, &other_session, &lookup),
             Err(CredentialVerifyError::SessionKeyMismatch)
         );
     }
@@ -1556,7 +1602,7 @@ mod tests {
             .insert("device_label".to_owned(), json!("tampered"));
         let lookup = move |_: &str| Some(root_pub);
         assert_eq!(
-            verify_identity(&identity, &session_pub, &lookup),
+            verify_identity_without_revocation(&identity, &session_pub, &lookup),
             Err(CredentialVerifyError::DelegationSignatureInvalid)
         );
     }
@@ -2048,8 +2094,36 @@ mod tests {
             provider.identity(&v1_leaf, &mls_rs::ExtensionList::default()),
             Err(CredentialVerifyError::LegacyIdentityRejected)
         );
+        // Fail closed: past the cutover, no revocation lookup means no
+        // leaf verifies — not every leaf skipping check 5.
+        assert_eq!(
+            provider.validate_external_sender(&v2_leaf, None, None),
+            Err(CredentialVerifyError::RevocationUnavailable)
+        );
+        provider.set_revocation_lookup(std::sync::Arc::new(|_: &str| Some(DeviceStatus::Active)));
         provider
             .validate_external_sender(&v2_leaf, None, None)
             .expect("v2 is the live form after the cutover");
+
+        // And a clock that cannot say what time it is refuses a v2 leaf
+        // rather than reading "now" as 1970, before every expiry.
+        provider.set_clock(std::sync::Arc::new(BeforeEpoch));
+        assert_eq!(
+            provider.validate_external_sender(&v2_leaf, None, None),
+            Err(CredentialVerifyError::ClockUnavailable)
+        );
+    }
+
+    /// A clock before 1970, as `SystemClock` reads one.
+    struct BeforeEpoch;
+
+    impl super::Clock for BeforeEpoch {
+        fn now_unix_seconds(&self) -> u64 {
+            0
+        }
+
+        fn now_unix_seconds_checked(&self) -> Option<u64> {
+            None
+        }
     }
 }

@@ -57,6 +57,11 @@ impl Device {
         )
         .unwrap();
         engine.set_v2_cutover();
+        // Past the cutover nothing verifies without a revocation lookup
+        // (fail closed); every device here is active.
+        engine.set_revocation_lookup(std::sync::Arc::new(|_: &str| {
+            Some(airdress_mls::credential::DeviceStatus::Active)
+        }));
         Client::open(engine, &self.dir.path().join("client"), &self.key).unwrap()
     }
 }

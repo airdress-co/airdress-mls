@@ -18,11 +18,38 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 - Consumers pin a tag, never a branch (rust guide R-API-6).
   `cargo-semver-checks` runs in CI against the base revision.
 
-## v0.3.0 — unreleased
+## v0.3.0 — 2026-10-07
 
 Everything since `5cf9036` (0.2.0, the revision the operator pins).
 
 ### Breaking
+
+Fail closed (owner decision, 2026-10-07):
+
+- **Past the v2 cutover, verification refuses until a revocation lookup
+  is registered.** An `AirdressIdentityProvider` (and so an `MlsEngine`)
+  that has entered `set_v2_cutover` answers every leaf with
+  `CredentialVerifyError::RevocationUnavailable` until
+  `set_revocation_lookup` has been called, in either order. Before, check
+  5 was skipped for every leaf, silently, and a revoked device kept its
+  seat. The two C switches are coupled the same way:
+  `airdress_mls_set_v2_cutover` needs `airdress_mls_set_revocation_lookup`.
+  **A host that enters the cutover must now register a lookup**, or no
+  group work verifies.
+- **`credential::verify_identity` is renamed
+  `verify_identity_without_revocation`**, so the name says it skips
+  check 5. Same signature and behaviour otherwise.
+- **A clock before 1970 refuses.** `SystemClock` used to read such a
+  clock as 0, which put every expiry in the future. Verification now
+  reads the new `Clock::now_unix_seconds_checked` (default: `Some` of
+  `now_unix_seconds`, so existing `Clock` implementations are unchanged),
+  and `None` refuses any delegation with an expiry, every `v: 2` one
+  included, with the new variant `CredentialVerifyError::ClockUnavailable`.
+  An exhaustive `match` on `CredentialVerifyError` needs the arm.
+- **`airdress-mls-ffi` no longer re-exports `airdress_mls::*`.** Its
+  contract is the C ABI; a Rust consumer depends on `airdress-mls`.
+
+Earlier in this release:
 
 - **The FFI's pointer-taking exports are `unsafe extern "C"`.** The C
   symbols and their signatures are unchanged, so the Dart bindings need

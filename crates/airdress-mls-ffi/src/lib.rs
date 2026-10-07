@@ -35,4 +35,6 @@ compile_error!(
 )]
 mod ffi;
 
-pub use airdress_mls::*;
+// This crate re-exported all of `airdress_mls` until 0.3.0. It no longer
+// does: its contract is the C ABI in `symbols.txt`, and a Rust consumer
+// links `airdress-mls` itself, so there is one path to each item.

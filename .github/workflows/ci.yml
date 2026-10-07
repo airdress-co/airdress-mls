@@ -116,7 +116,7 @@ jobs:
     # CLI at a tag: an API break without a version bump fails here
     # (rust guide R-API-6). The FFI crate's Rust API is not its contract;
     # scripts/check-symbols.sh holds the C one.
-    name: Semver against the base
+    name: Semver against the last release
     timeout-minutes: 20
     runs-on: ubuntu-24.04
     steps:
@@ -135,10 +135,24 @@ jobs:
             "https://github.com/obi1kenobi/cargo-semver-checks/releases/download/${SEMVER_CHECKS_VERSION}/${tarball}"
           echo "${SEMVER_CHECKS_SHA256}  ${tarball}" | sha256sum -c -
           tar xzf "$tarball" cargo-semver-checks
-      - name: Engine and client against the base revision
-        env:
-          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: ./cargo-semver-checks semver-checks -p airdress-mls -p airdress-mls-client --baseline-rev "$BASE"
+      - name: Engine and client against the last release
+        # Against the last tag, which is what consumers pin, not the base
+        # revision: between releases main carries an unreleased version,
+        # and two breaking changes inside one unreleased version are one
+        # bump. Before the first tag, 0.2.0 at 5cf9036, which the
+        # operator pins.
+        run: |
+          set -euo pipefail
+          base=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo 5cf9036)
+          echo "baseline: $base"
+          for pkg in airdress-mls airdress-mls-client; do
+            # A crate the baseline does not have has no API to break.
+            if git cat-file -e "$base:crates/$pkg/Cargo.toml" 2>/dev/null; then
+              ./cargo-semver-checks semver-checks -p "$pkg" --baseline-rev "$base"
+            else
+              echo "$pkg is new since $base; nothing to compare"
+            fi
+          done
 
   msrv:
     # rust-version is the one place the MSRV lives (rust guide R-API-7);
