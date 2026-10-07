@@ -83,4 +83,37 @@ mod tests {
                 .unwrap_or_else(|e| panic!("signature invalid for {name}: {e}"));
         }
     }
+
+    /// The guard on serde_json's `preserve_order` feature (rust guide
+    /// R-WS-6). A `Map` built in non-sorted order, nested two deep and
+    /// inside an array, must serialise sorted at every level — which is
+    /// true only while the default BTreeMap representation is in use.
+    ///
+    /// Features unify across a build, so if anything that links this
+    /// crate (the phone's cdylib, the operator, the CLI) turns
+    /// `preserve_order` on, this fails in that build rather than every
+    /// delegation signature changing silently. `sort_keys` in
+    /// `canonical_delegation_bytes` would only sort the top level.
+    #[test]
+    fn maps_serialise_sorted_whatever_the_insertion_order() {
+        use serde_json::{Map, json};
+
+        let mut inner = Map::new();
+        inner.insert("zz".to_owned(), json!(1));
+        inner.insert("aa".to_owned(), json!({"y": true, "b": false}));
+        let mut outer = Map::new();
+        outer.insert("zeta".to_owned(), Value::Object(inner));
+        outer.insert("alpha".to_owned(), json!([{"q": 1, "c": 2}]));
+        outer.insert("mid".to_owned(), json!("x"));
+
+        assert_eq!(
+            serde_json::to_string(&Value::Object(outer.clone())).expect("serialise"),
+            r#"{"alpha":[{"c":2,"q":1}],"mid":"x","zeta":{"aa":{"b":false,"y":true},"zz":1}}"#,
+            "serde_json's preserve_order is enabled somewhere in this build"
+        );
+        assert_eq!(
+            canonical_delegation_bytes(&outer).expect("canonicalize"),
+            br#"{"alpha":[{"c":2,"q":1}],"mid":"x","zeta":{"aa":{"b":false,"y":true},"zz":1}}"#
+        );
+    }
 }
