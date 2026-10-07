@@ -236,6 +236,28 @@
         "airdress": "nina.humans.airdress.co",
         "signature": "Udew3Sqxj3FSl94I2iUMOeXNPzmxQq9r8lo6AXLzts8gU4QKFRg6uMROKP4WC4MR3vdbLIpk_EQdELg-AmLtDA"
       }
+    },
+    {
+      "name": "person-v3-delegation",
+      "root_seed_b64url": "Dw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8",
+      "root_public_key_b64url": "2b8hSHSKhcidparY7gsPwtEF_TnUGkx5ZTY1TwrikAw",
+      "canonical_b64url": "eyJhaXJkcmVzcyI6ImFsaWNlLmh1bWFucy5haXJkcmVzcy5jbyIsImRldmljZV9pZCI6IjAxOWYzYzJhLTlkMDItN2MxNS1iNmU0LTBhN2QzZjhlMWMyOSIsImRldmljZV9sYWJlbCI6IlNhbSdzIHBob25lIiwiZGV2aWNlX3Nlc3Npb25fcHVibGljX2tleSI6IlhKeHQ4bUhKeTRRRWRYZHFydnpaUkxRRk1vLXJLUG16cVY3MEJKRFQzb1EiLCJleHBpcmVzX2F0IjoiMjAyNy0wNC0wN1QxMjowMDowMFoiLCJpc3N1ZWRfYXQiOiIyMDI2LTEwLTA3VDEyOjAwOjAwWiIsInBlcnNvbl9pZCI6IjAxOWYzYzJhLTVlNzEtN2IwNC1hOGQzLTRlMWY5YzZiMmE4NSIsInJvbGUiOiJodW1hbl9oZWxkIn0",
+      "delegation": {
+        "airdress": "alice.humans.airdress.co",
+        "device_id": "019f3c2a-9d02-7c15-b6e4-0a7d3f8e1c29",
+        "device_label": "Sam's phone",
+        "device_session_public_key": "XJxt8mHJy4QEdXdqrvzZRLQFMo-rKPmzqV70BJDT3oQ",
+        "expires_at": "2027-04-07T12:00:00Z",
+        "issued_at": "2026-10-07T12:00:00Z",
+        "person_id": "019f3c2a-5e71-7b04-a8d3-4e1f9c6b2a85",
+        "role": "human_held",
+        "signature": "LOrZl_pfsLvT-tZb3QWMHTucGt50Sq2mgNNTs5HDLl3z9b6oR8eHbiyJkLQEbZ-XhwBwLZwwKNZO-_1nZuBhCQ"
+      },
+      "identity": {
+        "v": 3,
+        "pin_subject": "alice.humans.airdress.co\u001f019f3c2a-5e71-7b04-a8d3-4e1f9c6b2a85",
+        "member_identity": "alice.humans.airdress.co\u001f019f3c2a-5e71-7b04-a8d3-4e1f9c6b2a85\u001f019f3c2a-9d02-7c15-b6e4-0a7d3f8e1c29"
+      }
     }
   ]
 }
