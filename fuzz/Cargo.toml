@@ -1,0 +1,50 @@
+# Fuzz targets for the parsers that read bytes a peer or a disk chose
+# (rust guide R-TST-3). Built and run by `cargo fuzz` on nightly, in CI
+# for a bounded time; a workspace of its own so the main build never
+# sees libfuzzer.
+[package]
+name = "airdress-mls-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# The libFuzzer driver cargo-fuzz links against.
+libfuzzer-sys = "0.4"
+# The parsers under test.
+airdress-mls = { path = "../crates/airdress-mls" }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "parse_identity"
+path = "fuzz_targets/parse_identity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_rfc3339_seconds"
+path = "fuzz_targets/parse_rfc3339_seconds.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "group_record_decode"
+path = "fuzz_targets/group_record_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_group_id"
+path = "fuzz_targets/message_group_id.rs"
+test = false
+doc = false
+bench = false

@@ -15,7 +15,6 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 airdress-mls.workspace = true
-mls-rs.workspace = true
 serde_json.workspace = true
 zeroize.workspace = true
 

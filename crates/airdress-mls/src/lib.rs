@@ -33,6 +33,24 @@ pub mod rules;
 pub mod storage;
 pub mod vectors;
 
+/// Entry points for the fuzz targets in `fuzz/`, which reach private
+/// parsers through here. Compiled only under `cargo fuzz` (`--cfg
+/// fuzzing`); never part of the API.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing {
+    /// `credential::parse_rfc3339_seconds`.
+    pub fn parse_rfc3339_seconds(s: &str) -> Option<u64> {
+        crate::credential::parse_rfc3339_seconds(s)
+    }
+
+    /// `storage::GroupRecord::decode`, re-encoding what decodes: a
+    /// record that decodes must encode back to the same bytes.
+    pub fn group_record_round_trip(bytes: &[u8]) {
+        crate::storage::fuzz_group_record(bytes);
+    }
+}
+
 pub use binding::MessageBinding;
 pub use engine::{CommitOutcome, EngineError, ErrorCode, GroupMember, MlsEngine};
 

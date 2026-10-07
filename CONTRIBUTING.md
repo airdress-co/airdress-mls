@@ -30,6 +30,12 @@ CI runs the same things, plus `cargo deny check`.
 - **No telemetry.** No analytics, no crash reporting, no tracing
   exporter, in this repository or any dependency. `deny.toml` lists the
   bans and CI enforces them.
+- **A change a consumer can see goes in `CHANGELOG.md`**, under the
+  unreleased version; one they must act on goes under its Breaking
+  section. A release is a tag (`vX.Y.Z`) on the commit that sets the
+  version in `Cargo.toml` and dates the changelog.
+- **A new parser of bytes a peer or a disk chose gets a fuzz target** in
+  `fuzz/`, and its pure tests are named in CI's Miri job.
 - **A new test file must be named in CI** in the same change, or it is
   a file that never runs.
 - **Document numbers belong in comments**, never in an identifier, a
