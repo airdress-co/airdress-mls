@@ -9,12 +9,56 @@
 //! - `handle_id` values are opaque integers. Dart must not fabricate
 //!   them; only use values returned by
 //!   `airdress_mls_create_engine_from_seed`.
+//!
+//! ## Safety contract
+//!
+//! Every `unsafe extern "C"` function below relies on its caller — the
+//! Dart bindings in airdress-chat (`lib/ffi/mls_bindings.dart`) and the
+//! tests in this file — for the same five things. Each function's own
+//! `# Safety` section names which of its arguments they apply to.
+//!
+//! 1. **Byte inputs.** A `(ptr, len)` input is null with `len == 0` (an
+//!    empty input), or points to `len` initialised bytes that stay valid
+//!    and are not written for the duration of the call. The library only
+//!    borrows inputs: the Dart side `calloc`s them, and frees them after
+//!    the call returns. A null pointer with a non-zero length, and a
+//!    length above `isize::MAX`, are refused with an error rather than
+//!    trusted.
+//! 2. **String inputs.** A `*const c_char` input is null (refused with an
+//!    error) or points to a NUL-terminated string that stays valid and
+//!    unwritten for the call (Dart's `toNativeUtf8`). Invalid UTF-8 is
+//!    refused.
+//! 3. **Results.** Every pointer in a returned struct (`FfiBytes`,
+//!    `FfiBytesList`, `FfiStartGroupResult`, `FfiCommitResult`,
+//!    `FfiHandleResult`) was allocated by Rust and goes back to the
+//!    matching `airdress_mls_free_*` export exactly once, with its length
+//!    unchanged — never to the C allocator's `free`.
+//! 4. **Callbacks.** A lookup callback is a function pointer that stays
+//!    callable until the engine it was registered on is destroyed or the
+//!    callback is replaced. It is invoked synchronously, on the thread
+//!    that made the engine call, while that call is in progress: the Dart
+//!    side's `NativeCallable.isolateLocal` requires exactly this, so the
+//!    caller must only call into an engine from the isolate that
+//!    registered its callbacks. A callback must not call back into this
+//!    library, and must not unwind.
+//! 5. **Threads.** Engines live in one table behind one lock, so any
+//!    export may be called from any thread; a call blocks while another
+//!    is running.
+//!
+//! Every export runs its body under `catch_unwind`: a Rust panic —
+//! a bug here, or one inside `mls-rs` on hostile input — becomes an
+//! error result instead of unwinding into Dart, which would abort the
+//! app. A panic that happens while the engine table is locked poisons
+//! the lock; [`engines`] recovers it rather than failing every later
+//! call.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::os::raw::c_char;
-use std::sync::Mutex;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use airdress_mls::engine::{CommitOutcome, MlsEngine};
 
@@ -25,6 +69,131 @@ use airdress_mls::engine::{CommitOutcome, MlsEngine};
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static ENGINES: std::sync::LazyLock<Mutex<HashMap<u64, MlsEngine>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The engine table, recovering it if a caught panic poisoned it.
+///
+/// A panic inside an engine operation unwinds through the guard and
+/// poisons the mutex. Before, every later call then failed `expect`
+/// inside an `extern "C"` function, which aborts the process — and
+/// would again on every relaunch that reached the same state. The table
+/// itself is a `HashMap` that no engine operation mutates (inserts and
+/// removes happen in the create and destroy exports, which do not call
+/// into an engine while doing so), so it is never left half-written; the
+/// engine that panicked keeps the state its own operation left it in,
+/// which is the state an error return leaves it in too.
+fn engines() -> MutexGuard<'static, HashMap<u64, MlsEngine>> {
+    ENGINES.lock().unwrap_or_else(|poisoned| {
+        ENGINES.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+/// Run `f` on the engine named by `handle_id`, or `missing()` when no
+/// such engine exists.
+fn with_engine<T>(
+    handle_id: u64,
+    missing: impl FnOnce() -> T,
+    f: impl FnOnce(&mut MlsEngine) -> T,
+) -> T {
+    let mut table = engines();
+    #[cfg(test)]
+    tests::maybe_inject_panic();
+    match table.get_mut(&handle_id) {
+        Some(engine) => f(engine),
+        None => missing(),
+    }
+}
+
+/// The text of a caught panic, for the error the caller sees.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    let detail = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".to_owned());
+    format!("internal error in airdress-mls (a panic was caught): {detail}")
+}
+
+/// Run an export's body, turning a panic into `on_panic(message)`.
+///
+/// `AssertUnwindSafe` is sound here because nothing the closure borrows
+/// is observed after a panic except through [`engines`], whose
+/// recovery is argued there.
+fn guarded<T>(on_panic: impl FnOnce(String) -> T, body: impl FnOnce() -> T) -> T {
+    catch_unwind(AssertUnwindSafe(body))
+        .unwrap_or_else(|payload| on_panic(panic_message(&*payload)))
+}
+
+// ---------------------------------------------------------------------------
+// Argument checks
+// ---------------------------------------------------------------------------
+
+/// Borrow a `(ptr, len)` byte input.
+///
+/// Null with `len == 0` is the empty input (Dart may hand over a null
+/// pointer for an empty `calloc`); null with any other length is an
+/// error, and so is a length no allocation can have.
+///
+/// # Safety
+///
+/// `ptr` is null, or points to `len` initialised bytes that stay valid
+/// and are not written for `'a` (contract 1).
+unsafe fn borrowed<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], String> {
+    if ptr.is_null() {
+        return if len == 0 {
+            Ok(&[])
+        } else {
+            Err(format!("{name} is null with a length of {len}"))
+        };
+    }
+    // No allocation is larger than `isize::MAX` bytes, so such a length is
+    // the caller's mistake; `from_raw_parts` would be undefined behaviour
+    // (and a process abort in a debug build) rather than an error.
+    if isize::try_from(len).is_err() {
+        return Err(format!("{name} has an impossible length {len}"));
+    }
+    // SAFETY: `ptr` is non-null; the caller guarantees it points to `len`
+    // initialised bytes that live and stay unwritten for `'a`; `u8` needs
+    // no alignment; and `len <= isize::MAX` was checked above.
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
+/// Borrow a required C string argument, rejecting null and invalid UTF-8.
+///
+/// # Safety
+///
+/// `ptr` is null, or points to a NUL-terminated string that stays valid
+/// and unwritten for `'a` (contract 2).
+unsafe fn required_str<'a>(ptr: *const c_char, name: &str) -> Result<&'a str, String> {
+    if ptr.is_null() {
+        return Err(format!("{name} is null"));
+    }
+    // SAFETY: `ptr` is non-null and, per the caller's contract, points to
+    // a NUL-terminated string valid and unwritten for `'a`.
+    unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .map_err(|_| format!("{name} is not valid UTF-8"))
+}
+
+/// Copy a required 32-byte argument, rejecting null and wrong lengths.
+///
+/// The copy is the caller's to zeroize when it holds a secret.
+///
+/// # Safety
+///
+/// As [`borrowed`]: `ptr` is null, or points to `len` initialised bytes
+/// valid and unwritten for the call (contract 1).
+unsafe fn required_key32(ptr: *const u8, len: usize, name: &str) -> Result<[u8; 32], String> {
+    if ptr.is_null() {
+        return Err(format!("{name} is null"));
+    }
+    if len != 32 {
+        return Err(format!("{name} must be 32 bytes, got {len}"));
+    }
+    // SAFETY: forwarded from this function's own contract.
+    let slice = unsafe { borrowed(ptr, len, name) }?;
+    slice.try_into().map_err(|_| format!("{name} length error"))
+}
 
 // ---------------------------------------------------------------------------
 // FFI byte buffer
@@ -42,12 +211,27 @@ pub struct FfiBytes {
     pub error: *mut c_char,
 }
 
+/// Hand an owned buffer to the caller: a pointer `airdress_mls_free_bytes`
+/// turns back into this `Box<[u8]>`, and its length.
+///
+/// An empty buffer gives a dangling, non-null pointer and length 0, which
+/// the free export skips.
+fn into_raw_bytes(data: Vec<u8>) -> (*mut u8, usize) {
+    let boxed = data.into_boxed_slice();
+    let len = boxed.len();
+    (Box::into_raw(boxed).cast::<u8>(), len)
+}
+
+/// An owned C string for an `error` field, freed by
+/// `airdress_mls_free_error`. A message with an interior NUL becomes the
+/// empty string, which is still a non-null error.
+fn into_raw_error(msg: &str) -> *mut c_char {
+    std::ffi::CString::new(msg).unwrap_or_default().into_raw()
+}
+
 impl FfiBytes {
     fn ok(data: Vec<u8>) -> Self {
-        let mut boxed = data.into_boxed_slice();
-        let ptr = boxed.as_mut_ptr();
-        let len = boxed.len();
-        std::mem::forget(boxed);
+        let (ptr, len) = into_raw_bytes(data);
         Self {
             ptr,
             len,
@@ -56,11 +240,17 @@ impl FfiBytes {
     }
 
     fn err(msg: String) -> Self {
-        let c_str = std::ffi::CString::new(msg).unwrap_or_default();
         Self {
             ptr: std::ptr::null_mut(),
             len: 0,
-            error: c_str.into_raw(),
+            error: into_raw_error(&msg),
+        }
+    }
+
+    fn from_result(result: Result<Vec<u8>, String>) -> Self {
+        match result {
+            Ok(data) => Self::ok(data),
+            Err(msg) => Self::err(msg),
         }
     }
 }
@@ -86,40 +276,28 @@ pub struct FfiStartGroupResult {
     pub error: *mut c_char,
 }
 
+/// What an `i32`-returning export answers when its body panicked. Every
+/// such export documents `0` as success, so the Dart side's `!= 0` and
+/// `< 0` checks treat it as a failure.
+const PANIC_I32: i32 = -3;
+
+/// What an `i64`-returning export answers when its body panicked: `-2`,
+/// the generic failure those exports already document, because the Dart
+/// side checks for `-1` and `-2` by value and would read any other
+/// negative number as a count or an epoch.
+const PANIC_I64: i64 = -2;
+
 // ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
 
 fn ffi_handle_err(msg: &str) -> FfiHandleResult {
-    let c_str = std::ffi::CString::new(msg).unwrap_or_default();
     FfiHandleResult {
         handle_id: 0,
         public_key_ptr: std::ptr::null_mut(),
         public_key_len: 0,
-        error: c_str.into_raw(),
+        error: into_raw_error(msg),
     }
-}
-
-/// Borrow a required C string argument, rejecting null and invalid UTF-8.
-fn required_str<'a>(ptr: *const c_char, name: &str) -> Result<&'a str, String> {
-    if ptr.is_null() {
-        return Err(format!("{name} is null"));
-    }
-    unsafe { CStr::from_ptr(ptr) }
-        .to_str()
-        .map_err(|_| format!("{name} is not valid UTF-8"))
-}
-
-/// Borrow a required 32-byte argument, rejecting null and wrong lengths.
-fn required_key32(ptr: *const u8, len: usize, name: &str) -> Result<[u8; 32], String> {
-    if ptr.is_null() {
-        return Err(format!("{name} is null"));
-    }
-    if len != 32 {
-        return Err(format!("{name} must be 32 bytes, got {len}"));
-    }
-    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-    slice.try_into().map_err(|_| format!("{name} length error"))
 }
 
 /// Create an MLS engine from host-supplied identity material.
@@ -131,8 +309,16 @@ fn required_key32(ptr: *const u8, len: usize, name: &str) -> Result<[u8; 32], St
 /// and `state_key` (32 bytes) locate and seal the on-disk MLS state.
 ///
 /// Returns a handle ID + the session public key.
+///
+/// # Safety
+///
+/// `(session_seed, session_seed_len)`, `(root_pubkey, root_pubkey_len)`
+/// and `(state_key, state_key_len)` are byte inputs (contract 1);
+/// `airdress`, `delegation_json` and `state_dir` are string inputs
+/// (contract 2). The result is freed per contract 3.
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_create_engine_from_seed(
+#[allow(clippy::too_many_arguments)] // a flat C ABI: one argument per field
+pub unsafe extern "C" fn airdress_mls_create_engine_from_seed(
     airdress: *const c_char,
     session_seed: *const u8,
     session_seed_len: usize,
@@ -143,34 +329,50 @@ pub extern "C" fn airdress_mls_create_engine_from_seed(
     state_key: *const u8,
     state_key_len: usize,
 ) -> FfiHandleResult {
-    let parsed = (|| -> Result<MlsEngine, String> {
-        let airdress = required_str(airdress, "airdress")?;
-        let seed = required_key32(session_seed, session_seed_len, "session_seed")?;
-        let root = required_key32(root_pubkey, root_pubkey_len, "root_pubkey")?;
-        let delegation = required_str(delegation_json, "delegation_json")?;
-        let state_dir = required_str(state_dir, "state_dir")?;
-        let key = required_key32(state_key, state_key_len, "state_key")?;
-        MlsEngine::from_seed(airdress, &seed, &root, delegation, state_dir, &key)
-    })();
+    guarded(
+        |msg| ffi_handle_err(&msg),
+        || {
+            let parsed = (|| -> Result<MlsEngine, String> {
+                // SAFETY: each pointer is an input of the kind this
+                // function's `# Safety` names.
+                let (airdress, root, delegation, state_dir) = unsafe {
+                    (
+                        required_str(airdress, "airdress")?,
+                        required_key32(root_pubkey, root_pubkey_len, "root_pubkey")?,
+                        required_str(delegation_json, "delegation_json")?,
+                        required_str(state_dir, "state_dir")?,
+                    )
+                };
+                // The two secrets are copied onto the stack by the checks,
+                // so both copies are zeroized however the build ends.
+                // SAFETY: a byte input (contract 1).
+                let seed = zeroize::Zeroizing::new(unsafe {
+                    required_key32(session_seed, session_seed_len, "session_seed")
+                }?);
+                // SAFETY: a byte input (contract 1).
+                let key = zeroize::Zeroizing::new(unsafe {
+                    required_key32(state_key, state_key_len, "state_key")
+                }?);
+                MlsEngine::from_seed(airdress, &seed, &root, delegation, state_dir, &key)
+            })();
 
-    match parsed {
-        Ok(engine) => {
-            let pk = engine.public_key().to_vec();
-            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            ENGINES.lock().expect("poisoned").insert(id, engine);
-            let mut pk_box = pk.into_boxed_slice();
-            let pk_ptr = pk_box.as_mut_ptr();
-            let pk_len = pk_box.len();
-            std::mem::forget(pk_box);
-            FfiHandleResult {
-                handle_id: id,
-                public_key_ptr: pk_ptr,
-                public_key_len: pk_len,
-                error: std::ptr::null_mut(),
+            match parsed {
+                Ok(engine) => {
+                    let (public_key_ptr, public_key_len) =
+                        into_raw_bytes(engine.public_key().to_vec());
+                    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                    engines().insert(id, engine);
+                    FfiHandleResult {
+                        handle_id: id,
+                        public_key_ptr,
+                        public_key_len,
+                        error: std::ptr::null_mut(),
+                    }
+                }
+                Err(msg) => ffi_handle_err(&msg),
             }
-        }
-        Err(msg) => ffi_handle_err(&msg),
-    }
+        },
+    )
 }
 
 /// Host-supplied root-key cache callback.
@@ -200,20 +402,30 @@ impl airdress_mls::credential::RootKeyLookup for CallbackRootKeyLookup {
 
 /// Register the host's root-key cache and switch the engine to strict
 /// credential verification (one-way cutover). Returns 0 on success,
-/// -1 for an invalid handle.
+/// -1 for an invalid handle or a null callback, -3 on an internal error.
+///
+/// # Safety
+///
+/// `lookup` is null (refused) or a callback under contract 4.
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_set_root_key_lookup(
+pub unsafe extern "C" fn airdress_mls_set_root_key_lookup(
     handle_id: u64,
-    lookup: AirdressRootKeyLookupFn,
+    lookup: Option<AirdressRootKeyLookupFn>,
 ) -> i32 {
-    let guard = ENGINES.lock().expect("poisoned");
-    match guard.get(&handle_id) {
-        Some(engine) => {
-            engine.set_root_key_lookup(std::sync::Arc::new(CallbackRootKeyLookup(lookup)));
-            0
-        }
-        None => -1,
-    }
+    guarded(
+        |_| PANIC_I32,
+        || {
+            let Some(lookup) = lookup else { return -1 };
+            with_engine(
+                handle_id,
+                || -1,
+                |engine| {
+                    engine.set_root_key_lookup(std::sync::Arc::new(CallbackRootKeyLookup(lookup)));
+                    0
+                },
+            )
+        },
+    )
 }
 
 /// Host callback answering "is this device revoked?" (SPEC-061
@@ -241,20 +453,33 @@ impl airdress_mls::credential::RevocationLookup for CallbackRevocationLookup {
 }
 
 /// Register the host's device-revocation state (SPEC-061 FR-19).
-/// Returns 0 on success, -1 for an invalid handle.
+/// Returns 0 on success, -1 for an invalid handle or a null callback,
+/// -3 on an internal error.
+///
+/// # Safety
+///
+/// `lookup` is null (refused) or a callback under contract 4.
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_set_revocation_lookup(
+pub unsafe extern "C" fn airdress_mls_set_revocation_lookup(
     handle_id: u64,
-    lookup: AirdressRevocationLookupFn,
+    lookup: Option<AirdressRevocationLookupFn>,
 ) -> i32 {
-    let guard = ENGINES.lock().expect("poisoned");
-    match guard.get(&handle_id) {
-        Some(engine) => {
-            engine.set_revocation_lookup(std::sync::Arc::new(CallbackRevocationLookup(lookup)));
-            0
-        }
-        None => -1,
-    }
+    guarded(
+        |_| PANIC_I32,
+        || {
+            let Some(lookup) = lookup else { return -1 };
+            with_engine(
+                handle_id,
+                || -1,
+                |engine| {
+                    engine.set_revocation_lookup(std::sync::Arc::new(CallbackRevocationLookup(
+                        lookup,
+                    )));
+                    0
+                },
+            )
+        },
+    )
 }
 
 /// Enter the SPEC-061 v2 credential cutover (FR-20): `v: 1`
@@ -262,47 +487,54 @@ pub extern "C" fn airdress_mls_set_revocation_lookup(
 /// becomes the only form in the tree. One-way within the process, per
 /// NFR-15 — there is no symmetric "unset" export, deliberately.
 ///
-/// Returns 0 on success, -1 for an invalid handle.
+/// Returns 0 on success, -1 for an invalid handle, -3 on an internal
+/// error.
 #[unsafe(no_mangle)]
 pub extern "C" fn airdress_mls_set_v2_cutover(handle_id: u64) -> i32 {
-    let guard = ENGINES.lock().expect("poisoned");
-    match guard.get(&handle_id) {
-        Some(engine) => {
-            engine.set_v2_cutover();
-            0
-        }
-        None => -1,
-    }
+    guarded(
+        |_| PANIC_I32,
+        || {
+            with_engine(
+                handle_id,
+                || -1,
+                |engine| {
+                    engine.set_v2_cutover();
+                    0
+                },
+            )
+        },
+    )
 }
 
 /// Whether the v2 cutover has been entered on this engine. Returns 1
-/// for yes, 0 for no, -1 for an invalid handle.
+/// for yes, 0 for no, -1 for an invalid handle, -3 on an internal error.
 #[unsafe(no_mangle)]
 pub extern "C" fn airdress_mls_is_v2_cutover(handle_id: u64) -> i32 {
-    let guard = ENGINES.lock().expect("poisoned");
-    match guard.get(&handle_id) {
-        Some(engine) => i32::from(engine.is_v2_cutover()),
-        None => -1,
-    }
+    guarded(
+        |_| PANIC_I32,
+        || with_engine(handle_id, || -1, |engine| i32::from(engine.is_v2_cutover())),
+    )
 }
 
 /// Destroy an MLS engine and free its resources.
 #[unsafe(no_mangle)]
 pub extern "C" fn airdress_mls_destroy_engine(handle_id: u64) {
-    ENGINES.lock().expect("poisoned").remove(&handle_id);
+    // Taken out under the lock and dropped after it, so a panic in an
+    // engine's `Drop` (there is none today) cannot poison the table.
+    let removed = guarded(|_| None, || engines().remove(&handle_id));
+    guarded(|_| (), move || drop(removed));
 }
 
 /// Generate a serialized KeyPackage.
 #[unsafe(no_mangle)]
 pub extern "C" fn airdress_mls_generate_key_package(handle_id: u64) -> FfiBytes {
-    let guard = ENGINES.lock().expect("poisoned");
-    match guard.get(&handle_id) {
-        Some(engine) => match engine.generate_key_package() {
-            Ok(bytes) => FfiBytes::ok(bytes),
-            Err(e) => FfiBytes::err(e),
-        },
-        None => FfiBytes::err("invalid handle".into()),
-    }
+    guarded(FfiBytes::err, || {
+        with_engine(
+            handle_id,
+            || FfiBytes::err("invalid handle".into()),
+            |engine| FfiBytes::from_result(engine.generate_key_package()),
+        )
+    })
 }
 
 /// List of byte buffers returned across the FFI boundary.
@@ -320,23 +552,27 @@ pub struct FfiBytesList {
 
 impl FfiBytesList {
     fn ok(buffers: Vec<Vec<u8>>) -> Self {
-        let mut items: Box<[FfiBytes]> = buffers.into_iter().map(FfiBytes::ok).collect();
-        let ptr = items.as_mut_ptr();
+        let items: Box<[FfiBytes]> = buffers.into_iter().map(FfiBytes::ok).collect();
         let len = items.len();
-        std::mem::forget(items);
         Self {
-            items: ptr,
+            items: Box::into_raw(items).cast::<FfiBytes>(),
             len,
             error: std::ptr::null_mut(),
         }
     }
 
     fn err(msg: String) -> Self {
-        let c_str = std::ffi::CString::new(msg).unwrap_or_default();
         Self {
             items: std::ptr::null_mut(),
             len: 0,
-            error: c_str.into_raw(),
+            error: into_raw_error(&msg),
+        }
+    }
+
+    fn from_result(result: Result<Vec<Vec<u8>>, String>) -> Self {
+        match result {
+            Ok(buffers) => Self::ok(buffers),
+            Err(msg) => Self::err(msg),
         }
     }
 
@@ -359,42 +595,46 @@ impl FfiBytesList {
 /// single-use; consumption deletes them from the pool.
 #[unsafe(no_mangle)]
 pub extern "C" fn airdress_mls_generate_key_packages(handle_id: u64, count: usize) -> FfiBytesList {
-    let guard = ENGINES.lock().expect("poisoned");
-    match guard.get(&handle_id) {
-        Some(engine) => match engine.generate_key_packages(count) {
-            Ok(buffers) => FfiBytesList::ok(buffers),
-            Err(e) => FfiBytesList::err(e),
-        },
-        None => FfiBytesList::err("invalid handle".into()),
-    }
+    guarded(FfiBytesList::err, || {
+        with_engine(
+            handle_id,
+            || FfiBytesList::err("invalid handle".into()),
+            |engine| FfiBytesList::from_result(engine.generate_key_packages(count)),
+        )
+    })
 }
 
 /// The publishable public messages of every unconsumed KeyPackage in
 /// the pool — for first publish and for re-publish after a restart.
 #[unsafe(no_mangle)]
 pub extern "C" fn airdress_mls_stored_key_packages(handle_id: u64) -> FfiBytesList {
-    let guard = ENGINES.lock().expect("poisoned");
-    match guard.get(&handle_id) {
-        Some(engine) => match engine.stored_key_packages() {
-            Ok(buffers) => FfiBytesList::ok(buffers),
-            Err(e) => FfiBytesList::err(e),
-        },
-        None => FfiBytesList::err("invalid handle".into()),
-    }
+    guarded(FfiBytesList::err, || {
+        with_engine(
+            handle_id,
+            || FfiBytesList::err("invalid handle".into()),
+            |engine| FfiBytesList::from_result(engine.stored_key_packages()),
+        )
+    })
 }
 
 /// Number of unconsumed KeyPackage private halves in the pool.
-/// Returns -1 for an invalid handle, -2 on a storage error.
+/// Returns -1 for an invalid handle, -2 on a storage error or an
+/// internal error.
 #[unsafe(no_mangle)]
 pub extern "C" fn airdress_mls_key_package_pool_count(handle_id: u64) -> i64 {
-    let guard = ENGINES.lock().expect("poisoned");
-    match guard.get(&handle_id) {
-        Some(engine) => match engine.key_package_pool_count() {
-            Ok(count) => i64::try_from(count).unwrap_or(i64::MAX),
-            Err(_) => -2,
+    guarded(
+        |_| PANIC_I64,
+        || {
+            with_engine(
+                handle_id,
+                || -1,
+                |engine| match engine.key_package_pool_count() {
+                    Ok(count) => i64::try_from(count).unwrap_or(i64::MAX),
+                    Err(_) => -2,
+                },
+            )
         },
-        None => -1,
-    }
+    )
 }
 
 /// Free a byte-buffer list previously returned by
@@ -405,20 +645,34 @@ pub extern "C" fn airdress_mls_key_package_pool_count(handle_id: u64) -> i64 {
 /// # Safety
 ///
 /// `list` must have been returned by a Rust FFI function in this
-/// crate and must not have been freed before.
+/// crate, unchanged, and must not have been freed before (contract 3).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn airdress_mls_free_bytes_list(list: FfiBytesList) {
-    if !list.items.is_null() && list.len > 0 {
-        let items =
-            unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(list.items, list.len)) };
-        for item in items {
-            unsafe {
-                airdress_mls_free_bytes(item.ptr, item.len);
-                airdress_mls_free_error(item.error);
+    guarded(
+        |_| (),
+        || {
+            if !list.items.is_null() && list.len > 0 {
+                // SAFETY: a non-empty list's `items` is the pointer
+                // `FfiBytesList::ok` made from a `Box<[FfiBytes]>` of exactly
+                // `len` items; rebuilding that fat pointer returns it to the
+                // allocator that made it, once (the caller's contract).
+                let items = unsafe {
+                    Box::from_raw(std::ptr::slice_from_raw_parts_mut(list.items, list.len))
+                };
+                for item in items {
+                    // SAFETY: each item was built by `FfiBytes::ok`, so its
+                    // buffer and its (null) error are this crate's, and they
+                    // are freed once, with the list.
+                    unsafe {
+                        airdress_mls_free_bytes(item.ptr, item.len);
+                        airdress_mls_free_error(item.error);
+                    }
+                }
             }
-        }
-    }
-    unsafe { airdress_mls_free_error(list.error) };
+            // SAFETY: the list's error is null or this crate's, freed once.
+            unsafe { airdress_mls_free_error(list.error) };
+        },
+    );
 }
 
 /// Start a group with a peer's KeyPackage, **unbound**.
@@ -430,37 +684,35 @@ pub unsafe extern "C" fn airdress_mls_free_bytes_list(list: FfiBytesList) {
 /// silent fallback to an empty one would be indistinguishable on the
 /// wire from an unbound message. Post-cutover callers use
 /// [`airdress_mls_start_group_bound`].
+///
+/// # Safety
+///
+/// `(peer_kp_ptr, peer_kp_len)` and `(first_msg_ptr, first_msg_len)` are
+/// byte inputs (contract 1). The result is freed per contract 3.
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_start_group(
+pub unsafe extern "C" fn airdress_mls_start_group(
     handle_id: u64,
     peer_kp_ptr: *const u8,
     peer_kp_len: usize,
     first_msg_ptr: *const u8,
     first_msg_len: usize,
 ) -> FfiStartGroupResult {
-    let peer_kp = unsafe { std::slice::from_raw_parts(peer_kp_ptr, peer_kp_len) };
-    let first_msg = unsafe { std::slice::from_raw_parts(first_msg_ptr, first_msg_len) };
-    start_group_into_ffi(handle_id, peer_kp, first_msg, None)
-}
-
-/// The unbound exports' post-cutover refusal (SPEC-061 FR-17a).
-///
-/// `aad_for` used to raise this, because a caller past the cutover
-/// could supply no binding. Under design D-10 the binding is derived
-/// from the group and a sender the caller always has, so the engine
-/// has nothing left to refuse — which means the refusal has to live
-/// where the missing sender actually is: at the unbound entry points.
-///
-/// It is not a fallback to an unbound message. An unbound send past
-/// the cutover would be indistinguishable on the wire from one an
-/// attacker stripped, which is the property FR-17a exists to hold.
-fn refuse_unbound_past_cutover(handle_id: u64) -> Option<String> {
-    let guard = ENGINES.lock().expect("poisoned");
-    let engine = guard.get(&handle_id)?;
-    engine.is_v2_cutover().then(|| {
-        "application messages must carry their sender binding after the v2 credential cutover"
-            .to_owned()
-    })
+    guarded(
+        |msg| ffi_start_group_err(&msg),
+        || {
+            // SAFETY: two byte inputs (contract 1), per `# Safety`.
+            let inputs = unsafe {
+                borrowed(peer_kp_ptr, peer_kp_len, "peer_kp")
+                    .and_then(|kp| Ok((kp, borrowed(first_msg_ptr, first_msg_len, "first_msg")?)))
+            };
+            match inputs {
+                Ok((peer_kp, first_msg)) => {
+                    start_group_into_ffi(handle_id, peer_kp, first_msg, None)
+                }
+                Err(e) => ffi_start_group_err(&e),
+            }
+        },
+    )
 }
 
 /// Start a group with a peer's KeyPackage, carrying the SPEC-061
@@ -483,8 +735,14 @@ fn refuse_unbound_past_cutover(handle_id: u64) -> Option<String> {
 /// component of the binding is the group this call creates, so the
 /// caller does not supply it (design D-10 — it used to be a 16-byte
 /// conversation UUID, which two owners could not agree on).
+///
+/// # Safety
+///
+/// `(peer_kp_ptr, peer_kp_len)` and `(first_msg_ptr, first_msg_len)` are
+/// byte inputs (contract 1); `from_airdress` is a string input
+/// (contract 2). The result is freed per contract 3.
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_start_group_bound(
+pub unsafe extern "C" fn airdress_mls_start_group_bound(
     handle_id: u64,
     peer_kp_ptr: *const u8,
     peer_kp_len: usize,
@@ -492,13 +750,28 @@ pub extern "C" fn airdress_mls_start_group_bound(
     first_msg_len: usize,
     from_airdress: *const c_char,
 ) -> FfiStartGroupResult {
-    let peer_kp = unsafe { std::slice::from_raw_parts(peer_kp_ptr, peer_kp_len) };
-    let first_msg = unsafe { std::slice::from_raw_parts(first_msg_ptr, first_msg_len) };
-    let airdress = match required_str(from_airdress, "from_airdress") {
-        Ok(a) => a,
-        Err(e) => return ffi_start_group_err(&e),
-    };
-    start_group_into_ffi(handle_id, peer_kp, first_msg, Some(airdress))
+    guarded(
+        |msg| ffi_start_group_err(&msg),
+        || {
+            // SAFETY: two byte inputs (contract 1) and a string input
+            // (contract 2), per `# Safety`.
+            let inputs = unsafe {
+                (|| -> Result<_, String> {
+                    Ok((
+                        borrowed(peer_kp_ptr, peer_kp_len, "peer_kp")?,
+                        borrowed(first_msg_ptr, first_msg_len, "first_msg")?,
+                        required_str(from_airdress, "from_airdress")?,
+                    ))
+                })()
+            };
+            match inputs {
+                Ok((peer_kp, first_msg, airdress)) => {
+                    start_group_into_ffi(handle_id, peer_kp, first_msg, Some(airdress))
+                }
+                Err(e) => ffi_start_group_err(&e),
+            }
+        },
+    )
 }
 
 /// Start a group with **no other member** — the owner's self thread on
@@ -523,24 +796,39 @@ pub extern "C" fn airdress_mls_start_group_bound(
 ///
 /// The binding argument mirrors `airdress_mls_start_group_bound`
 /// exactly: the sending airdress as a NUL-terminated UTF-8 string.
+///
+/// # Safety
+///
+/// `(first_msg_ptr, first_msg_len)` is a byte input (contract 1);
+/// `from_airdress` is a string input (contract 2). The result is freed
+/// per contract 3.
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_start_group_solo(
+pub unsafe extern "C" fn airdress_mls_start_group_solo(
     handle_id: u64,
     first_msg_ptr: *const u8,
     first_msg_len: usize,
     from_airdress: *const c_char,
 ) -> FfiStartGroupResult {
-    let first_msg = unsafe { std::slice::from_raw_parts(first_msg_ptr, first_msg_len) };
-    let airdress = match required_str(from_airdress, "from_airdress") {
-        Ok(a) => a,
-        Err(e) => return ffi_start_group_err(&e),
-    };
-    let mut guard = ENGINES.lock().expect("poisoned");
-    let engine = match guard.get_mut(&handle_id) {
-        Some(e) => e,
-        None => return ffi_start_group_err("invalid handle"),
-    };
-    marshal_start_group(engine.start_group_solo(first_msg, airdress))
+    guarded(
+        |msg| ffi_start_group_err(&msg),
+        || {
+            // SAFETY: a byte input (contract 1) and a string input
+            // (contract 2), per `# Safety`.
+            let inputs = unsafe {
+                borrowed(first_msg_ptr, first_msg_len, "first_msg")
+                    .and_then(|msg| Ok((msg, required_str(from_airdress, "from_airdress")?)))
+            };
+            let (first_msg, airdress) = match inputs {
+                Ok(inputs) => inputs,
+                Err(e) => return ffi_start_group_err(&e),
+            };
+            with_engine(
+                handle_id,
+                || ffi_start_group_err("invalid handle"),
+                |engine| marshal_start_group(engine.start_group_solo(first_msg, airdress)),
+            )
+        },
+    )
 }
 
 /// The body both establishment exports share: resolve the handle, run
@@ -552,26 +840,39 @@ fn start_group_into_ffi(
     first_msg: &[u8],
     from_airdress: Option<&str>,
 ) -> FfiStartGroupResult {
-    let mut guard = ENGINES.lock().expect("poisoned");
-    let engine = match guard.get_mut(&handle_id) {
-        Some(e) => e,
-        None => return ffi_start_group_err("invalid handle"),
-    };
-    let from_airdress = match from_airdress {
-        Some(a) => a,
-        None if engine.is_v2_cutover() => {
-            return ffi_start_group_err(
-                "application messages must carry their sender binding after the \
-                 v2 credential cutover",
-            );
-        }
-        // Pre-cutover the AAD is empty regardless, so the value is
-        // never read. Naming it here keeps the unbound export working
-        // unchanged rather than giving it a second code path.
-        None => "",
-    };
-    marshal_start_group(engine.start_group(peer_kp, first_msg, from_airdress))
+    with_engine(
+        handle_id,
+        || ffi_start_group_err("invalid handle"),
+        |engine| {
+            let from_airdress = match from_airdress {
+                Some(a) => a,
+                None if engine.is_v2_cutover() => {
+                    return ffi_start_group_err(UNBOUND_PAST_CUTOVER);
+                }
+                // Pre-cutover the AAD is empty regardless, so the value is
+                // never read. Naming it here keeps the unbound export
+                // working unchanged rather than giving it a second code
+                // path.
+                None => "",
+            };
+            marshal_start_group(engine.start_group(peer_kp, first_msg, from_airdress))
+        },
+    )
 }
+
+/// The unbound exports' post-cutover refusal (SPEC-061 FR-17a).
+///
+/// `aad_for` used to raise this, because a caller past the cutover
+/// could supply no binding. Under design D-10 the binding is derived
+/// from the group and a sender the caller always has, so the engine
+/// has nothing left to refuse — which means the refusal has to live
+/// where the missing sender actually is: at the unbound entry points.
+///
+/// It is not a fallback to an unbound message. An unbound send past
+/// the cutover would be indistinguishable on the wire from one an
+/// attacker stripped, which is the property FR-17a exists to hold.
+const UNBOUND_PAST_CUTOVER: &str =
+    "application messages must carry their sender binding after the v2 credential cutover";
 
 /// Hand three owned buffers to the caller under the Rust-allocates /
 /// Dart-frees contract. Shared by every establishment export so the
@@ -581,95 +882,160 @@ fn marshal_start_group(
 ) -> FfiStartGroupResult {
     match outcome {
         Ok(outcome) => {
-            let mut gid = outcome.group_id.into_boxed_slice();
-            let mut welcome = outcome.welcome.into_boxed_slice();
-            let mut app = outcome.first_application.into_boxed_slice();
-            let result = FfiStartGroupResult {
-                group_id_ptr: gid.as_mut_ptr(),
-                group_id_len: gid.len(),
-                welcome_ptr: welcome.as_mut_ptr(),
-                welcome_len: welcome.len(),
-                first_app_ptr: app.as_mut_ptr(),
-                first_app_len: app.len(),
+            let (group_id_ptr, group_id_len) = into_raw_bytes(outcome.group_id);
+            let (welcome_ptr, welcome_len) = into_raw_bytes(outcome.welcome);
+            let (first_app_ptr, first_app_len) = into_raw_bytes(outcome.first_application);
+            FfiStartGroupResult {
+                group_id_ptr,
+                group_id_len,
+                welcome_ptr,
+                welcome_len,
+                first_app_ptr,
+                first_app_len,
                 error: std::ptr::null_mut(),
-            };
-            std::mem::forget(gid);
-            std::mem::forget(welcome);
-            std::mem::forget(app);
-            result
+            }
         }
         Err(e) => ffi_start_group_err(&e),
     }
 }
 
 /// Process an inbound Welcome. Returns the group ID.
+///
+/// # Safety
+///
+/// `(welcome_ptr, welcome_len)` is a byte input (contract 1). The result
+/// is freed per contract 3.
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_process_welcome(
+pub unsafe extern "C" fn airdress_mls_process_welcome(
     handle_id: u64,
     welcome_ptr: *const u8,
     welcome_len: usize,
 ) -> FfiBytes {
-    let welcome = unsafe { std::slice::from_raw_parts(welcome_ptr, welcome_len) };
-    let mut guard = ENGINES.lock().expect("poisoned");
-    match guard.get_mut(&handle_id) {
-        Some(engine) => match engine.process_welcome(welcome) {
-            Ok(gid) => FfiBytes::ok(gid),
-            Err(e) => FfiBytes::err(e),
-        },
-        None => FfiBytes::err("invalid handle".into()),
+    guarded(FfiBytes::err, || {
+        // SAFETY: a byte input (contract 1), per `# Safety`.
+        let welcome = match unsafe { borrowed(welcome_ptr, welcome_len, "welcome") } {
+            Ok(w) => w,
+            Err(e) => return FfiBytes::err(e),
+        };
+        with_engine(
+            handle_id,
+            || FfiBytes::err("invalid handle".into()),
+            |engine| FfiBytes::from_result(engine.process_welcome(welcome)),
+        )
+    })
+}
+
+/// Borrow a `(group id, payload)` pair of byte inputs, the shape most
+/// group operations take.
+///
+/// # Safety
+///
+/// Both pairs are byte inputs (contract 1), valid for `'a`.
+unsafe fn group_and_payload<'a>(
+    group_id_ptr: *const u8,
+    group_id_len: usize,
+    payload_ptr: *const u8,
+    payload_len: usize,
+    payload_name: &str,
+) -> Result<(&'a [u8], &'a [u8]), String> {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        Ok((
+            borrowed(group_id_ptr, group_id_len, "group_id")?,
+            borrowed(payload_ptr, payload_len, payload_name)?,
+        ))
     }
 }
 
 /// Encrypt plaintext under an existing group.
+///
+/// # Safety
+///
+/// `(group_id_ptr, group_id_len)` and `(plaintext_ptr, plaintext_len)`
+/// are byte inputs (contract 1). The result is freed per contract 3.
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_encrypt(
+pub unsafe extern "C" fn airdress_mls_encrypt(
     handle_id: u64,
     group_id_ptr: *const u8,
     group_id_len: usize,
     plaintext_ptr: *const u8,
     plaintext_len: usize,
 ) -> FfiBytes {
-    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
-    let plaintext = unsafe { std::slice::from_raw_parts(plaintext_ptr, plaintext_len) };
-    if let Some(refusal) = refuse_unbound_past_cutover(handle_id) {
-        return FfiBytes::err(refusal);
-    }
-    let mut guard = ENGINES.lock().expect("poisoned");
-    match guard.get_mut(&handle_id) {
-        Some(engine) => match engine.encrypt(group_id, plaintext, "") {
-            Ok(bytes) => FfiBytes::ok(bytes),
-            Err(e) => FfiBytes::err(e),
-        },
-        None => FfiBytes::err("invalid handle".into()),
-    }
+    guarded(FfiBytes::err, || {
+        // SAFETY: two byte inputs (contract 1), per `# Safety`.
+        let inputs = unsafe {
+            group_and_payload(
+                group_id_ptr,
+                group_id_len,
+                plaintext_ptr,
+                plaintext_len,
+                "plaintext",
+            )
+        };
+        let (group_id, plaintext) = match inputs {
+            Ok(inputs) => inputs,
+            Err(e) => return FfiBytes::err(e),
+        };
+        with_engine(
+            handle_id,
+            || FfiBytes::err("invalid handle".into()),
+            |engine| {
+                if engine.is_v2_cutover() {
+                    return FfiBytes::err(UNBOUND_PAST_CUTOVER.to_owned());
+                }
+                FfiBytes::from_result(engine.encrypt(group_id, plaintext, ""))
+            },
+        )
+    })
 }
 
 /// Decrypt an inbound application message.
+///
+/// # Safety
+///
+/// `(group_id_ptr, group_id_len)` and `(message_ptr, message_len)` are
+/// byte inputs (contract 1). The result is freed per contract 3.
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_decrypt(
+pub unsafe extern "C" fn airdress_mls_decrypt(
     handle_id: u64,
     group_id_ptr: *const u8,
     group_id_len: usize,
     message_ptr: *const u8,
     message_len: usize,
 ) -> FfiBytes {
-    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
-    let message = unsafe { std::slice::from_raw_parts(message_ptr, message_len) };
-    if let Some(refusal) = refuse_unbound_past_cutover(handle_id) {
-        return FfiBytes::err(refusal);
-    }
-    let mut guard = ENGINES.lock().expect("poisoned");
-    match guard.get_mut(&handle_id) {
-        Some(engine) => match engine.decrypt(group_id, message, "") {
-            Ok(bytes) => FfiBytes::ok(bytes),
-            // SPEC-061 FR-22: the variant is distinguishable in Rust;
-            // across the C boundary it is still one sentence, per the
-            // `credential.rs` discipline. Phase 6 gives the client a
-            // structured form when it has somewhere to route it.
-            Err(e) => FfiBytes::err(e.to_string()),
-        },
-        None => FfiBytes::err("invalid handle".into()),
-    }
+    guarded(FfiBytes::err, || {
+        // SAFETY: two byte inputs (contract 1), per `# Safety`.
+        let inputs = unsafe {
+            group_and_payload(
+                group_id_ptr,
+                group_id_len,
+                message_ptr,
+                message_len,
+                "message",
+            )
+        };
+        let (group_id, message) = match inputs {
+            Ok(inputs) => inputs,
+            Err(e) => return FfiBytes::err(e),
+        };
+        with_engine(
+            handle_id,
+            || FfiBytes::err("invalid handle".into()),
+            |engine| {
+                if engine.is_v2_cutover() {
+                    return FfiBytes::err(UNBOUND_PAST_CUTOVER.to_owned());
+                }
+                // SPEC-061 FR-22: the variant is distinguishable in Rust;
+                // across the C boundary it is still one sentence, per the
+                // `credential.rs` discipline.
+                FfiBytes::from_result(
+                    engine
+                        .decrypt(group_id, message, "")
+                        .map_err(|e| e.to_string()),
+                )
+            },
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -705,7 +1071,6 @@ pub struct FfiCommitResult {
 }
 
 fn ffi_commit_err(msg: &str) -> FfiCommitResult {
-    let c_str = std::ffi::CString::new(msg).unwrap_or_default();
     FfiCommitResult {
         commit_ptr: std::ptr::null_mut(),
         commit_len: 0,
@@ -716,26 +1081,15 @@ fn ffi_commit_err(msg: &str) -> FfiCommitResult {
         added: FfiBytesList::empty(),
         removed: FfiBytesList::empty(),
         members: FfiBytesList::empty(),
-        error: c_str.into_raw(),
+        error: into_raw_error(msg),
     }
 }
 
 fn ffi_commit_ok(outcome: CommitOutcome) -> FfiCommitResult {
-    let mut commit = outcome.commit.into_boxed_slice();
-    let commit_ptr = commit.as_mut_ptr();
-    let commit_len = commit.len();
-    std::mem::forget(commit);
-
-    let (welcome_ptr, welcome_len) = outcome.welcome.map_or_else(
-        || (std::ptr::null_mut(), 0),
-        |w| {
-            let mut boxed = w.into_boxed_slice();
-            let ptr = boxed.as_mut_ptr();
-            let len = boxed.len();
-            std::mem::forget(boxed);
-            (ptr, len)
-        },
-    );
+    let (commit_ptr, commit_len) = into_raw_bytes(outcome.commit);
+    let (welcome_ptr, welcome_len) = outcome
+        .welcome
+        .map_or((std::ptr::null_mut(), 0), into_raw_bytes);
 
     FfiCommitResult {
         commit_ptr,
@@ -757,8 +1111,14 @@ fn ffi_commit_ok(outcome: CommitOutcome) -> FfiCommitResult {
 /// client keeps working unchanged; this is the symbol the client moves
 /// to at cutover. Pass the sending airdress; the group component of
 /// the binding is the `group_id` this call already names.
+///
+/// # Safety
+///
+/// `(group_id_ptr, group_id_len)` and `(plaintext_ptr, plaintext_len)`
+/// are byte inputs (contract 1); `from_airdress` is a string input
+/// (contract 2). The result is freed per contract 3.
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_encrypt_bound(
+pub unsafe extern "C" fn airdress_mls_encrypt_bound(
     handle_id: u64,
     group_id_ptr: *const u8,
     group_id_len: usize,
@@ -766,28 +1126,43 @@ pub extern "C" fn airdress_mls_encrypt_bound(
     plaintext_len: usize,
     from_airdress: *const c_char,
 ) -> FfiBytes {
-    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
-    let plaintext = unsafe { std::slice::from_raw_parts(plaintext_ptr, plaintext_len) };
-    let airdress = match required_str(from_airdress, "from_airdress") {
-        Ok(a) => a,
-        Err(e) => return FfiBytes::err(e),
-    };
-    let mut guard = ENGINES.lock().expect("poisoned");
-    match guard.get_mut(&handle_id) {
-        Some(engine) => match engine.encrypt(group_id, plaintext, airdress) {
-            Ok(bytes) => FfiBytes::ok(bytes),
-            Err(e) => FfiBytes::err(e),
-        },
-        None => FfiBytes::err("invalid handle".into()),
-    }
+    guarded(FfiBytes::err, || {
+        // SAFETY: two byte inputs (contract 1) and a string input
+        // (contract 2), per `# Safety`.
+        let inputs = unsafe {
+            group_and_payload(
+                group_id_ptr,
+                group_id_len,
+                plaintext_ptr,
+                plaintext_len,
+                "plaintext",
+            )
+            .and_then(|(g, p)| Ok((g, p, required_str(from_airdress, "from_airdress")?)))
+        };
+        let (group_id, plaintext, airdress) = match inputs {
+            Ok(inputs) => inputs,
+            Err(e) => return FfiBytes::err(e),
+        };
+        with_engine(
+            handle_id,
+            || FfiBytes::err("invalid handle".into()),
+            |engine| FfiBytes::from_result(engine.encrypt(group_id, plaintext, airdress)),
+        )
+    })
 }
 
 /// Decrypt with the SPEC-061 FR-17a binding. The counterpart to
 /// `airdress_mls_encrypt_bound`: the sender comes from the envelope's
 /// cleartext `from` column and the group from the framing, so the AAD
 /// is computable before the decrypt.
+///
+/// # Safety
+///
+/// `(group_id_ptr, group_id_len)` and `(message_ptr, message_len)` are
+/// byte inputs (contract 1); `from_airdress` is a string input
+/// (contract 2). The result is freed per contract 3.
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_decrypt_bound(
+pub unsafe extern "C" fn airdress_mls_decrypt_bound(
     handle_id: u64,
     group_id_ptr: *const u8,
     group_id_len: usize,
@@ -795,20 +1170,35 @@ pub extern "C" fn airdress_mls_decrypt_bound(
     message_len: usize,
     from_airdress: *const c_char,
 ) -> FfiBytes {
-    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
-    let message = unsafe { std::slice::from_raw_parts(message_ptr, message_len) };
-    let airdress = match required_str(from_airdress, "from_airdress") {
-        Ok(a) => a,
-        Err(e) => return FfiBytes::err(e),
-    };
-    let mut guard = ENGINES.lock().expect("poisoned");
-    match guard.get_mut(&handle_id) {
-        Some(engine) => match engine.decrypt(group_id, message, airdress) {
-            Ok(bytes) => FfiBytes::ok(bytes),
-            Err(e) => FfiBytes::err(e.to_string()),
-        },
-        None => FfiBytes::err("invalid handle".into()),
-    }
+    guarded(FfiBytes::err, || {
+        // SAFETY: two byte inputs (contract 1) and a string input
+        // (contract 2), per `# Safety`.
+        let inputs = unsafe {
+            group_and_payload(
+                group_id_ptr,
+                group_id_len,
+                message_ptr,
+                message_len,
+                "message",
+            )
+            .and_then(|(g, m)| Ok((g, m, required_str(from_airdress, "from_airdress")?)))
+        };
+        let (group_id, message, airdress) = match inputs {
+            Ok(inputs) => inputs,
+            Err(e) => return FfiBytes::err(e),
+        };
+        with_engine(
+            handle_id,
+            || FfiBytes::err("invalid handle".into()),
+            |engine| {
+                FfiBytes::from_result(
+                    engine
+                        .decrypt(group_id, message, airdress)
+                        .map_err(|e| e.to_string()),
+                )
+            },
+        )
+    })
 }
 
 /// The MLS group id carried in a message's framing, in the clear.
@@ -829,107 +1219,179 @@ pub extern "C" fn airdress_mls_decrypt_bound(
 /// inside the encrypted `GroupInfo`), so this returns an error for
 /// one — a Welcome is filed by the conversation it was sent for, which
 /// is establishment-time trust and unchanged by D-10.
+///
+/// # Safety
+///
+/// `(message_ptr, message_len)` is a byte input (contract 1). The result
+/// is freed per contract 3.
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_message_group_id(
+pub unsafe extern "C" fn airdress_mls_message_group_id(
     message_ptr: *const u8,
     message_len: usize,
 ) -> FfiBytes {
-    let message = unsafe { std::slice::from_raw_parts(message_ptr, message_len) };
-    match mls_rs::MlsMessage::from_bytes(message) {
-        Ok(msg) => match msg.group_id() {
-            Some(gid) => FfiBytes::ok(gid.to_vec()),
-            None => FfiBytes::err("this message carries no group id in its framing".into()),
-        },
-        Err(e) => FfiBytes::err(format!("bad message: {e}")),
-    }
+    guarded(FfiBytes::err, || {
+        // SAFETY: a byte input (contract 1), per `# Safety`.
+        let message = match unsafe { borrowed(message_ptr, message_len, "message") } {
+            Ok(m) => m,
+            Err(e) => return FfiBytes::err(e),
+        };
+        match mls_rs::MlsMessage::from_bytes(message) {
+            Ok(msg) => match msg.group_id() {
+                Some(gid) => FfiBytes::ok(gid.to_vec()),
+                None => FfiBytes::err("this message carries no group id in its framing".into()),
+            },
+            Err(e) => FfiBytes::err(format!("bad message: {e}")),
+        }
+    })
 }
 
 /// Stage an `Add` for the group's next commit (FR-3). Staged by value
 /// — the commit built by `airdress_mls_commit_pending` carries it, so
 /// no separate proposal message goes on the wire. Returns an empty
 /// buffer on success.
+///
+/// # Safety
+///
+/// `(group_id_ptr, group_id_len)` and `(key_package_ptr,
+/// key_package_len)` are byte inputs (contract 1). The result is freed
+/// per contract 3.
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_propose_add(
+pub unsafe extern "C" fn airdress_mls_propose_add(
     handle_id: u64,
     group_id_ptr: *const u8,
     group_id_len: usize,
     key_package_ptr: *const u8,
     key_package_len: usize,
 ) -> FfiBytes {
-    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
-    let kp = unsafe { std::slice::from_raw_parts(key_package_ptr, key_package_len) };
-    let mut guard = ENGINES.lock().expect("poisoned");
-    match guard.get_mut(&handle_id) {
-        Some(engine) => match engine.propose_add(group_id, kp) {
-            Ok(()) => FfiBytes::ok(Vec::new()),
-            Err(e) => FfiBytes::err(e),
-        },
-        None => FfiBytes::err("invalid handle".into()),
-    }
+    guarded(FfiBytes::err, || {
+        // SAFETY: two byte inputs (contract 1), per `# Safety`.
+        let inputs = unsafe {
+            group_and_payload(
+                group_id_ptr,
+                group_id_len,
+                key_package_ptr,
+                key_package_len,
+                "key_package",
+            )
+        };
+        let (group_id, kp) = match inputs {
+            Ok(inputs) => inputs,
+            Err(e) => return FfiBytes::err(e),
+        };
+        with_engine(
+            handle_id,
+            || FfiBytes::err("invalid handle".into()),
+            |engine| FfiBytes::from_result(engine.propose_add(group_id, kp).map(|()| Vec::new())),
+        )
+    })
 }
 
 /// Stage a `Remove` of `leaf_index` for the group's next commit
 /// (FR-2), by value. Refused when the leaf belongs to another airdress
 /// (FR-25). Returns an empty buffer on success.
+///
+/// # Safety
+///
+/// `(group_id_ptr, group_id_len)` is a byte input (contract 1). The
+/// result is freed per contract 3.
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_propose_remove(
+pub unsafe extern "C" fn airdress_mls_propose_remove(
     handle_id: u64,
     group_id_ptr: *const u8,
     group_id_len: usize,
     leaf_index: u32,
 ) -> FfiBytes {
-    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
-    let mut guard = ENGINES.lock().expect("poisoned");
-    match guard.get_mut(&handle_id) {
-        Some(engine) => match engine.propose_remove(group_id, leaf_index) {
-            Ok(()) => FfiBytes::ok(Vec::new()),
-            Err(e) => FfiBytes::err(e),
-        },
-        None => FfiBytes::err("invalid handle".into()),
-    }
+    guarded(FfiBytes::err, || {
+        // SAFETY: a byte input (contract 1), per `# Safety`.
+        let group_id = match unsafe { borrowed(group_id_ptr, group_id_len, "group_id") } {
+            Ok(g) => g,
+            Err(e) => return FfiBytes::err(e),
+        };
+        with_engine(
+            handle_id,
+            || FfiBytes::err("invalid handle".into()),
+            |engine| {
+                FfiBytes::from_result(
+                    engine
+                        .propose_remove(group_id, leaf_index)
+                        .map(|()| Vec::new()),
+                )
+            },
+        )
+    })
 }
 
 /// Propose replacing this device's own leaf key (FR-1). Returns the
 /// bare proposal for publication — the one operation that must travel
 /// by reference, because RFC 9420 forbids a committer from including
 /// its own `Update`.
+///
+/// # Safety
+///
+/// `(group_id_ptr, group_id_len)` is a byte input (contract 1). The
+/// result is freed per contract 3.
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_propose_update(
+pub unsafe extern "C" fn airdress_mls_propose_update(
     handle_id: u64,
     group_id_ptr: *const u8,
     group_id_len: usize,
 ) -> FfiBytes {
-    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
-    let mut guard = ENGINES.lock().expect("poisoned");
-    match guard.get_mut(&handle_id) {
-        Some(engine) => match engine.propose_update(group_id) {
-            Ok(bytes) => FfiBytes::ok(bytes),
-            Err(e) => FfiBytes::err(e),
-        },
-        None => FfiBytes::err("invalid handle".into()),
-    }
+    guarded(FfiBytes::err, || {
+        // SAFETY: a byte input (contract 1), per `# Safety`.
+        let group_id = match unsafe { borrowed(group_id_ptr, group_id_len, "group_id") } {
+            Ok(g) => g,
+            Err(e) => return FfiBytes::err(e),
+        };
+        with_engine(
+            handle_id,
+            || FfiBytes::err("invalid handle".into()),
+            |engine| FfiBytes::from_result(engine.propose_update(group_id)),
+        )
+    })
 }
 
 /// Hold an inbound bare proposal for the next commit (FR-5). Returns
 /// an empty buffer on success.
+///
+/// # Safety
+///
+/// `(group_id_ptr, group_id_len)` and `(message_ptr, message_len)` are
+/// byte inputs (contract 1). The result is freed per contract 3.
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_process_proposal(
+pub unsafe extern "C" fn airdress_mls_process_proposal(
     handle_id: u64,
     group_id_ptr: *const u8,
     group_id_len: usize,
     message_ptr: *const u8,
     message_len: usize,
 ) -> FfiBytes {
-    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
-    let message = unsafe { std::slice::from_raw_parts(message_ptr, message_len) };
-    let mut guard = ENGINES.lock().expect("poisoned");
-    match guard.get_mut(&handle_id) {
-        Some(engine) => match engine.process_proposal(group_id, message) {
-            Ok(()) => FfiBytes::ok(Vec::new()),
-            Err(e) => FfiBytes::err(e),
-        },
-        None => FfiBytes::err("invalid handle".into()),
-    }
+    guarded(FfiBytes::err, || {
+        // SAFETY: two byte inputs (contract 1), per `# Safety`.
+        let inputs = unsafe {
+            group_and_payload(
+                group_id_ptr,
+                group_id_len,
+                message_ptr,
+                message_len,
+                "message",
+            )
+        };
+        let (group_id, message) = match inputs {
+            Ok(inputs) => inputs,
+            Err(e) => return FfiBytes::err(e),
+        };
+        with_engine(
+            handle_id,
+            || FfiBytes::err("invalid handle".into()),
+            |engine| {
+                FfiBytes::from_result(
+                    engine
+                        .process_proposal(group_id, message)
+                        .map(|()| Vec::new()),
+                )
+            },
+        )
+    })
 }
 
 /// Commit held proposals WITHOUT persisting (FR-7, phase one of two).
@@ -938,120 +1400,215 @@ pub extern "C" fn airdress_mls_process_proposal(
 /// `airdress_mls_confirm_commit`. On a `409` or a network failure it
 /// calls `airdress_mls_abort_commit`. Persisting before the operator
 /// has accepted the commit forks the group.
+///
+/// # Safety
+///
+/// `(group_id_ptr, group_id_len)` is a byte input (contract 1). The
+/// result is freed per contract 3.
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_commit_pending(
+pub unsafe extern "C" fn airdress_mls_commit_pending(
     handle_id: u64,
     group_id_ptr: *const u8,
     group_id_len: usize,
 ) -> FfiCommitResult {
-    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
-    let mut guard = ENGINES.lock().expect("poisoned");
-    match guard.get_mut(&handle_id) {
-        Some(engine) => match engine.commit_pending(group_id) {
-            Ok(outcome) => ffi_commit_ok(outcome),
-            Err(e) => ffi_commit_err(&e),
+    guarded(
+        |msg| ffi_commit_err(&msg),
+        || {
+            // SAFETY: a byte input (contract 1), per `# Safety`.
+            let group_id = match unsafe { borrowed(group_id_ptr, group_id_len, "group_id") } {
+                Ok(g) => g,
+                Err(e) => return ffi_commit_err(&e),
+            };
+            with_engine(
+                handle_id,
+                || ffi_commit_err("invalid handle"),
+                |engine| match engine.commit_pending(group_id) {
+                    Ok(outcome) => ffi_commit_ok(outcome),
+                    Err(e) => ffi_commit_err(&e),
+                },
+            )
         },
-        None => ffi_commit_err("invalid handle"),
-    }
+    )
 }
 
 /// Persist a commit built by `airdress_mls_commit_pending` (phase two).
 /// Returns the resulting epoch, `-1` for an invalid handle, `-2` when
-/// no commit was awaiting confirmation or the write failed.
+/// no commit was awaiting confirmation, the write failed, the group id
+/// was refused, or an internal error happened.
+///
+/// # Safety
+///
+/// `(group_id_ptr, group_id_len)` is a byte input (contract 1).
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_confirm_commit(
+pub unsafe extern "C" fn airdress_mls_confirm_commit(
     handle_id: u64,
     group_id_ptr: *const u8,
     group_id_len: usize,
 ) -> i64 {
-    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
-    let mut guard = ENGINES.lock().expect("poisoned");
-    match guard.get_mut(&handle_id) {
-        Some(engine) => engine
-            .confirm_commit(group_id)
-            .map_or(-2, |e| i64::try_from(e).unwrap_or(i64::MAX)),
-        None => -1,
-    }
+    guarded(
+        |_| PANIC_I64,
+        || {
+            // SAFETY: a byte input (contract 1), per `# Safety`.
+            let Ok(group_id) = (unsafe { borrowed(group_id_ptr, group_id_len, "group_id") }) else {
+                return -2;
+            };
+            with_engine(
+                handle_id,
+                || -1,
+                |engine| {
+                    engine
+                        .confirm_commit(group_id)
+                        .map_or(-2, |e| i64::try_from(e).unwrap_or(i64::MAX))
+                },
+            )
+        },
+    )
 }
 
 /// Discard a commit built by `airdress_mls_commit_pending`, reloading
 /// the group from sealed storage. Returns the epoch the group is back
-/// at, `-1` for an invalid handle, `-2` when nothing was pending.
+/// at, `-1` for an invalid handle, `-2` when nothing was pending, the
+/// group id was refused, or an internal error happened.
+///
+/// # Safety
+///
+/// `(group_id_ptr, group_id_len)` is a byte input (contract 1).
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_abort_commit(
+pub unsafe extern "C" fn airdress_mls_abort_commit(
     handle_id: u64,
     group_id_ptr: *const u8,
     group_id_len: usize,
 ) -> i64 {
-    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
-    let mut guard = ENGINES.lock().expect("poisoned");
-    match guard.get_mut(&handle_id) {
-        Some(engine) => engine
-            .abort_commit(group_id)
-            .map_or(-2, |e| i64::try_from(e).unwrap_or(i64::MAX)),
-        None => -1,
-    }
+    guarded(
+        |_| PANIC_I64,
+        || {
+            // SAFETY: a byte input (contract 1), per `# Safety`.
+            let Ok(group_id) = (unsafe { borrowed(group_id_ptr, group_id_len, "group_id") }) else {
+                return -2;
+            };
+            with_engine(
+                handle_id,
+                || -1,
+                |engine| {
+                    engine
+                        .abort_commit(group_id)
+                        .map_or(-2, |e| i64::try_from(e).unwrap_or(i64::MAX))
+                },
+            )
+        },
+    )
 }
 
 /// Apply another member's commit (FR-4): advance the epoch, persist,
 /// and report the membership delta. `self_removed` is `1` when this
 /// device was the leaf removed.
+///
+/// # Safety
+///
+/// `(group_id_ptr, group_id_len)` and `(message_ptr, message_len)` are
+/// byte inputs (contract 1). The result is freed per contract 3.
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_process_commit(
+pub unsafe extern "C" fn airdress_mls_process_commit(
     handle_id: u64,
     group_id_ptr: *const u8,
     group_id_len: usize,
     message_ptr: *const u8,
     message_len: usize,
 ) -> FfiCommitResult {
-    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
-    let message = unsafe { std::slice::from_raw_parts(message_ptr, message_len) };
-    let mut guard = ENGINES.lock().expect("poisoned");
-    match guard.get_mut(&handle_id) {
-        Some(engine) => match engine.process_commit(group_id, message) {
-            Ok(outcome) => ffi_commit_ok(outcome),
-            Err(e) => ffi_commit_err(&e.to_string()),
+    guarded(
+        |msg| ffi_commit_err(&msg),
+        || {
+            // SAFETY: two byte inputs (contract 1), per `# Safety`.
+            let inputs = unsafe {
+                group_and_payload(
+                    group_id_ptr,
+                    group_id_len,
+                    message_ptr,
+                    message_len,
+                    "message",
+                )
+            };
+            let (group_id, message) = match inputs {
+                Ok(inputs) => inputs,
+                Err(e) => return ffi_commit_err(&e),
+            };
+            with_engine(
+                handle_id,
+                || ffi_commit_err("invalid handle"),
+                |engine| match engine.process_commit(group_id, message) {
+                    Ok(outcome) => ffi_commit_ok(outcome),
+                    Err(e) => ffi_commit_err(&e.to_string()),
+                },
+            )
         },
-        None => ffi_commit_err("invalid handle"),
-    }
+    )
 }
 
 /// The group's current epoch — the value the client declares as
 /// `commit_from_epoch`. Returns `-1` for an invalid handle, `-2` when
-/// the group is not on disk.
+/// the group is not on disk, the group id was refused, or an internal
+/// error happened.
+///
+/// # Safety
+///
+/// `(group_id_ptr, group_id_len)` is a byte input (contract 1).
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_group_epoch(
+pub unsafe extern "C" fn airdress_mls_group_epoch(
     handle_id: u64,
     group_id_ptr: *const u8,
     group_id_len: usize,
 ) -> i64 {
-    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
-    let guard = ENGINES.lock().expect("poisoned");
-    match guard.get(&handle_id) {
-        Some(engine) => engine
-            .group_epoch(group_id)
-            .map_or(-2, |e| i64::try_from(e).unwrap_or(i64::MAX)),
-        None => -1,
-    }
+    guarded(
+        |_| PANIC_I64,
+        || {
+            // SAFETY: a byte input (contract 1), per `# Safety`.
+            let Ok(group_id) = (unsafe { borrowed(group_id_ptr, group_id_len, "group_id") }) else {
+                return -2;
+            };
+            with_engine(
+                handle_id,
+                || -1,
+                |engine| {
+                    engine
+                        .group_epoch(group_id)
+                        .map_or(-2, |e| i64::try_from(e).unwrap_or(i64::MAX))
+                },
+            )
+        },
+    )
 }
 
 /// Every member identity in the group, in leaf-index order — for the
 /// membership UI and for AC-4.
+///
+/// # Safety
+///
+/// `(group_id_ptr, group_id_len)` is a byte input (contract 1). The
+/// result is freed per contract 3.
 #[unsafe(no_mangle)]
-pub extern "C" fn airdress_mls_group_members(
+pub unsafe extern "C" fn airdress_mls_group_members(
     handle_id: u64,
     group_id_ptr: *const u8,
     group_id_len: usize,
 ) -> FfiBytesList {
-    let group_id = unsafe { std::slice::from_raw_parts(group_id_ptr, group_id_len) };
-    let guard = ENGINES.lock().expect("poisoned");
-    match guard.get(&handle_id) {
-        Some(engine) => match engine.group_members(group_id) {
-            Ok(members) => FfiBytesList::ok(members.into_iter().map(|m| m.identity).collect()),
-            Err(e) => FfiBytesList::err(e),
-        },
-        None => FfiBytesList::err("invalid handle".into()),
-    }
+    guarded(FfiBytesList::err, || {
+        // SAFETY: a byte input (contract 1), per `# Safety`.
+        let group_id = match unsafe { borrowed(group_id_ptr, group_id_len, "group_id") } {
+            Ok(g) => g,
+            Err(e) => return FfiBytesList::err(e),
+        };
+        with_engine(
+            handle_id,
+            || FfiBytesList::err("invalid handle".into()),
+            |engine| {
+                FfiBytesList::from_result(
+                    engine
+                        .group_members(group_id)
+                        .map(|members| members.into_iter().map(|m| m.identity).collect()),
+                )
+            },
+        )
+    })
 }
 
 /// Free an `FfiCommitResult` returned by `airdress_mls_commit_pending`
@@ -1059,18 +1616,27 @@ pub extern "C" fn airdress_mls_group_members(
 ///
 /// # Safety
 ///
-/// `result` must have been returned by one of those two functions and
-/// must not have been freed before.
+/// `result` must have been returned by one of those two functions,
+/// unchanged, and must not have been freed before (contract 3).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn airdress_mls_free_commit_result(result: FfiCommitResult) {
-    unsafe {
-        airdress_mls_free_bytes(result.commit_ptr, result.commit_len);
-        airdress_mls_free_bytes(result.welcome_ptr, result.welcome_len);
-        airdress_mls_free_bytes_list(result.added);
-        airdress_mls_free_bytes_list(result.removed);
-        airdress_mls_free_bytes_list(result.members);
-        airdress_mls_free_error(result.error);
-    }
+    guarded(
+        |_| (),
+        || {
+            // SAFETY: every field was made by `ffi_commit_ok` or
+            // `ffi_commit_err` and is freed here once, per the caller's
+            // contract; the free exports accept the null and empty values
+            // the error form holds.
+            unsafe {
+                airdress_mls_free_bytes(result.commit_ptr, result.commit_len);
+                airdress_mls_free_bytes(result.welcome_ptr, result.welcome_len);
+                airdress_mls_free_bytes_list(result.added);
+                airdress_mls_free_bytes_list(result.removed);
+                airdress_mls_free_bytes_list(result.members);
+                airdress_mls_free_error(result.error);
+            }
+        },
+    );
 }
 
 /// Mint a root-signed delegation for an agent device.
@@ -1090,9 +1656,16 @@ pub unsafe extern "C" fn airdress_mls_free_commit_result(result: FfiCommitResult
 /// Returns the delegation as UTF-8 JSON (keys sorted, `signature`
 /// included), freed with `airdress_mls_free_bytes`, or an error naming the
 /// field that failed its shape check.
+///
+/// # Safety
+///
+/// `(root_seed, root_seed_len)` and `(device_public_key,
+/// device_public_key_len)` are byte inputs (contract 1); `airdress`,
+/// `device_id`, `harness` and `device_label` are string inputs
+/// (contract 2). The result is freed per contract 3.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)] // a flat C ABI: one argument per field
-pub extern "C" fn airdress_mls_mint_agent_delegation(
+pub unsafe extern "C" fn airdress_mls_mint_agent_delegation(
     root_seed: *const u8,
     root_seed_len: usize,
     airdress: *const c_char,
@@ -1103,62 +1676,81 @@ pub extern "C" fn airdress_mls_mint_agent_delegation(
     device_label: *const c_char,
     issued_at_unix: u64,
 ) -> FfiBytes {
-    let minted = (|| -> Result<Vec<u8>, String> {
-        let mut seed = required_key32(root_seed, root_seed_len, "root_seed")?;
-        let req = (|| -> Result<_, String> {
-            Ok(airdress_mls::delegation::AgentDelegationRequest {
-                airdress: required_str(airdress, "airdress")?,
-                device_id: required_str(device_id, "device_id")?,
-                device_public_key: required_key32(
-                    device_public_key,
-                    device_public_key_len,
-                    "device_public_key",
-                )?,
-                harness: required_str(harness, "harness")?,
-                device_label: required_str(device_label, "device_label")?,
-                issued_at_unix,
-            })
+    guarded(FfiBytes::err, || {
+        let minted = (|| -> Result<Vec<u8>, String> {
+            // SAFETY: a byte input (contract 1), per `# Safety`. The copy is
+            // zeroized on drop, on every path out of this closure.
+            let seed = zeroize::Zeroizing::new(unsafe {
+                required_key32(root_seed, root_seed_len, "root_seed")
+            }?);
+            // SAFETY: string inputs (contract 2) and a byte input
+            // (contract 1), per `# Safety`.
+            let req = unsafe {
+                airdress_mls::delegation::AgentDelegationRequest {
+                    airdress: required_str(airdress, "airdress")?,
+                    device_id: required_str(device_id, "device_id")?,
+                    device_public_key: required_key32(
+                        device_public_key,
+                        device_public_key_len,
+                        "device_public_key",
+                    )?,
+                    harness: required_str(harness, "harness")?,
+                    device_label: required_str(device_label, "device_label")?,
+                    issued_at_unix,
+                }
+            };
+            let delegation = airdress_mls::delegation::mint_agent_delegation(&seed, &req)
+                .map_err(|e| e.to_string())?;
+            serde_json::to_vec(&serde_json::Value::Object(delegation)).map_err(|e| e.to_string())
         })();
-        let out = req.and_then(|req| {
-            airdress_mls::delegation::mint_agent_delegation(&seed, &req).map_err(|e| e.to_string())
-        });
-        zeroize::Zeroize::zeroize(&mut seed);
-        let delegation = out?;
-        serde_json::to_vec(&serde_json::Value::Object(delegation)).map_err(|e| e.to_string())
-    })();
-    match minted {
-        Ok(bytes) => FfiBytes::ok(bytes),
-        Err(msg) => FfiBytes::err(msg),
-    }
+        FfiBytes::from_result(minted)
+    })
 }
 
 /// Free a byte buffer previously returned by any `airdress_mls_*` function.
 ///
 /// # Safety
 ///
-/// `ptr` must have been returned by a Rust FFI function in this crate and
-/// must not have been freed before.
+/// `ptr` must have been returned by a Rust FFI function in this crate,
+/// with this `len`, and must not have been freed before (contract 3).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn airdress_mls_free_bytes(ptr: *mut u8, len: usize) {
-    if !ptr.is_null() && len > 0 {
-        drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)) });
-    }
+    guarded(
+        |_| (),
+        || {
+            if !ptr.is_null() && len > 0 {
+                // SAFETY: a non-empty buffer was made by `into_raw_bytes`
+                // from a `Box<[u8]>` of exactly `len` bytes; rebuilding that
+                // fat pointer and dropping the box returns it to the
+                // allocator that made it, once (the caller's contract).
+                drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)) });
+            }
+        },
+    );
 }
 
 /// Free an error string previously returned in an FFI result's `error` field.
 ///
 /// # Safety
 ///
-/// `ptr` must have been returned by a Rust FFI function in this crate.
+/// `ptr` is null, or was returned in an `error` field by a Rust FFI
+/// function in this crate and has not been freed before (contract 3).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn airdress_mls_free_error(ptr: *mut c_char) {
-    if !ptr.is_null() {
-        drop(unsafe { std::ffi::CString::from_raw(ptr) });
-    }
+    guarded(
+        |_| (),
+        || {
+            if !ptr.is_null() {
+                // SAFETY: a non-null error was made by `into_raw_error`
+                // (`CString::into_raw`) and is reclaimed once, per the
+                // caller's contract.
+                drop(unsafe { std::ffi::CString::from_raw(ptr) });
+            }
+        },
+    );
 }
 
 fn ffi_start_group_err(msg: &str) -> FfiStartGroupResult {
-    let c_str = std::ffi::CString::new(msg).unwrap_or_default();
     FfiStartGroupResult {
         group_id_ptr: std::ptr::null_mut(),
         group_id_len: 0,
@@ -1166,7 +1758,7 @@ fn ffi_start_group_err(msg: &str) -> FfiStartGroupResult {
         welcome_len: 0,
         first_app_ptr: std::ptr::null_mut(),
         first_app_len: 0,
-        error: c_str.into_raw(),
+        error: into_raw_error(msg),
     }
 }
 
@@ -1182,6 +1774,7 @@ mod tests {
     //! else creates the first group of a conversation, no conversation
     //! could be established at all.
 
+    use std::cell::Cell;
     use std::ffi::{CStr, CString};
 
     use ed25519_dalek::SigningKey;
@@ -1193,6 +1786,21 @@ mod tests {
         airdress_mls_process_welcome, airdress_mls_set_v2_cutover, airdress_mls_start_group,
         airdress_mls_start_group_bound, airdress_mls_start_group_solo,
     };
+
+    thread_local! {
+        /// Set by a test to make the next engine lookup ON THIS THREAD
+        /// panic while the engine table is locked — the worst place a
+        /// panic inside `mls-rs` could happen. Thread-local, so tests
+        /// running in parallel never see each other's.
+        static INJECT_PANIC: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The hook `with_engine` calls with the table locked.
+    pub(super) fn maybe_inject_panic() {
+        if INJECT_PANIC.with(|flag| flag.replace(false)) {
+            panic!("injected by a test");
+        }
+    }
 
     const ALICE: &str = "alice.test.airdress.co";
     const BOB: &str = "bob.test.airdress.co";
@@ -1228,22 +1836,27 @@ mod tests {
         let c_dir = CString::new(dir.path().to_str().unwrap()).unwrap();
         let root_pub = root.verifying_key().to_bytes();
         let state_key = [0x77u8; 32];
-        let result = airdress_mls_create_engine_from_seed(
-            c_airdress.as_ptr(),
-            seed.as_ptr(),
-            seed.len(),
-            root_pub.as_ptr(),
-            root_pub.len(),
-            c_delegation.as_ptr(),
-            c_dir.as_ptr(),
-            state_key.as_ptr(),
-            state_key.len(),
-        );
-        assert!(
-            result.error.is_null(),
-            "create_engine_from_seed: {}",
+        // SAFETY: every argument is a live local buffer with its own
+        // length, or a live `CString`, all outliving the call.
+        let result = unsafe {
+            airdress_mls_create_engine_from_seed(
+                c_airdress.as_ptr(),
+                seed.as_ptr(),
+                seed.len(),
+                root_pub.as_ptr(),
+                root_pub.len(),
+                c_delegation.as_ptr(),
+                c_dir.as_ptr(),
+                state_key.as_ptr(),
+                state_key.len(),
+            )
+        };
+        assert!(result.error.is_null(), "create_engine_from_seed: {}", {
+            // SAFETY: a non-null error is a NUL-terminated string this
+            // crate made, not yet freed.
             unsafe { CStr::from_ptr(result.error) }.to_string_lossy()
-        );
+        });
+        // SAFETY: the public key buffer the call returned, freed once.
         unsafe { super::airdress_mls_free_bytes(result.public_key_ptr, result.public_key_len) };
         if cutover {
             assert_eq!(airdress_mls_set_v2_cutover(result.handle_id), 0);
@@ -1254,18 +1867,34 @@ mod tests {
         }
     }
 
+    /// Read and free an error string the crate returned.
+    fn take_error(error: *mut std::os::raw::c_char) -> String {
+        // SAFETY: a non-null `error` field is a NUL-terminated string this
+        // crate made with `CString::into_raw`, not yet freed.
+        let msg = unsafe { CStr::from_ptr(error) }
+            .to_string_lossy()
+            .into_owned();
+        // SAFETY: that string, freed once.
+        unsafe { super::airdress_mls_free_error(error) };
+        msg
+    }
+
+    /// Copy out and free one buffer the crate returned.
+    fn take_buffer(ptr: *mut u8, len: usize) -> Vec<u8> {
+        // SAFETY: a buffer of `len` initialised bytes this crate made
+        // (dangling but non-null when empty), not yet freed.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+        // SAFETY: that buffer, with its own length, freed once.
+        unsafe { super::airdress_mls_free_bytes(ptr, len) };
+        bytes
+    }
+
     /// Consume an `FfiBytes`, freeing whichever half it carries.
     fn take_bytes(result: FfiBytes) -> Result<Vec<u8>, String> {
         if result.error.is_null() {
-            let bytes = unsafe { std::slice::from_raw_parts(result.ptr, result.len) }.to_vec();
-            unsafe { super::airdress_mls_free_bytes(result.ptr, result.len) };
-            Ok(bytes)
+            Ok(take_buffer(result.ptr, result.len))
         } else {
-            let msg = unsafe { CStr::from_ptr(result.error) }
-                .to_string_lossy()
-                .into_owned();
-            unsafe { super::airdress_mls_free_error(result.error) };
-            Err(msg)
+            Err(take_error(result.error))
         }
     }
 
@@ -1279,30 +1908,13 @@ mod tests {
 
     fn take_start(result: FfiStartGroupResult) -> Result<Started, String> {
         if !result.error.is_null() {
-            let msg = unsafe { CStr::from_ptr(result.error) }
-                .to_string_lossy()
-                .into_owned();
-            unsafe { super::airdress_mls_free_error(result.error) };
-            return Err(msg);
+            return Err(take_error(result.error));
         }
-        let started = Started {
-            group_id: unsafe {
-                std::slice::from_raw_parts(result.group_id_ptr, result.group_id_len)
-            }
-            .to_vec(),
-            welcome: unsafe { std::slice::from_raw_parts(result.welcome_ptr, result.welcome_len) }
-                .to_vec(),
-            first_application: unsafe {
-                std::slice::from_raw_parts(result.first_app_ptr, result.first_app_len)
-            }
-            .to_vec(),
-        };
-        unsafe {
-            super::airdress_mls_free_bytes(result.group_id_ptr, result.group_id_len);
-            super::airdress_mls_free_bytes(result.welcome_ptr, result.welcome_len);
-            super::airdress_mls_free_bytes(result.first_app_ptr, result.first_app_len);
-        }
-        Ok(started)
+        Ok(Started {
+            group_id: take_buffer(result.group_id_ptr, result.group_id_len),
+            welcome: take_buffer(result.welcome_ptr, result.welcome_len),
+            first_application: take_buffer(result.first_app_ptr, result.first_app_len),
+        })
     }
 
     fn key_package(handle: &Handle) -> Vec<u8> {
@@ -1331,31 +1943,39 @@ mod tests {
 
         let bob_kp = key_package(&bob);
         let c_alice = CString::new(ALICE).unwrap();
-        let started = take_start(airdress_mls_start_group_bound(
-            alice.id,
-            bob_kp.as_ptr(),
-            bob_kp.len(),
-            b"hello bob".as_ptr(),
-            b"hello bob".len(),
-            c_alice.as_ptr(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        let started = take_start(unsafe {
+            airdress_mls_start_group_bound(
+                alice.id,
+                bob_kp.as_ptr(),
+                bob_kp.len(),
+                b"hello bob".as_ptr(),
+                b"hello bob".len(),
+                c_alice.as_ptr(),
+            )
+        })
         .expect("a client past the cutover must be able to establish a conversation");
 
-        take_bytes(airdress_mls_process_welcome(
-            bob.id,
-            started.welcome.as_ptr(),
-            started.welcome.len(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        take_bytes(unsafe {
+            airdress_mls_process_welcome(bob.id, started.welcome.as_ptr(), started.welcome.len())
+        })
         .expect("bob joins");
 
-        let plaintext = take_bytes(airdress_mls_decrypt_bound(
-            bob.id,
-            started.group_id.as_ptr(),
-            started.group_id.len(),
-            started.first_application.as_ptr(),
-            started.first_application.len(),
-            c_alice.as_ptr(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        let plaintext = take_bytes(unsafe {
+            airdress_mls_decrypt_bound(
+                bob.id,
+                started.group_id.as_ptr(),
+                started.group_id.len(),
+                started.first_application.as_ptr(),
+                started.first_application.len(),
+                c_alice.as_ptr(),
+            )
+        })
         .expect("the establishment's first message decrypts under its binding");
         assert_eq!(plaintext, b"hello bob");
 
@@ -1363,24 +1983,32 @@ mod tests {
         // successful call: the conversation carries traffic in both
         // directions under the same binding.
         let c_bob = CString::new(BOB).unwrap();
-        let reply = take_bytes(airdress_mls_encrypt_bound(
-            bob.id,
-            started.group_id.as_ptr(),
-            started.group_id.len(),
-            b"hi alice".as_ptr(),
-            b"hi alice".len(),
-            c_bob.as_ptr(),
-        ))
-        .expect("bob replies into the established group");
-        assert_eq!(
-            take_bytes(airdress_mls_decrypt_bound(
-                alice.id,
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        let reply = take_bytes(unsafe {
+            airdress_mls_encrypt_bound(
+                bob.id,
                 started.group_id.as_ptr(),
                 started.group_id.len(),
-                reply.as_ptr(),
-                reply.len(),
+                b"hi alice".as_ptr(),
+                b"hi alice".len(),
                 c_bob.as_ptr(),
-            ))
+            )
+        })
+        .expect("bob replies into the established group");
+        assert_eq!(
+            // SAFETY: live local buffers and C strings, each with its own
+            // length, outliving the call; the result is freed by a take_* helper.
+            take_bytes(unsafe {
+                airdress_mls_decrypt_bound(
+                    alice.id,
+                    started.group_id.as_ptr(),
+                    started.group_id.len(),
+                    reply.as_ptr(),
+                    reply.len(),
+                    c_bob.as_ptr(),
+                )
+            })
             .expect("alice reads the reply"),
             b"hi alice"
         );
@@ -1411,12 +2039,16 @@ mod tests {
         let alice = engine(ALICE, 0x41, "alice-only", true);
         let c_alice = CString::new(ALICE).unwrap();
 
-        let started = take_start(airdress_mls_start_group_solo(
-            alice.id,
-            b"note to self".as_ptr(),
-            b"note to self".len(),
-            c_alice.as_ptr(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        let started = take_start(unsafe {
+            airdress_mls_start_group_solo(
+                alice.id,
+                b"note to self".as_ptr(),
+                b"note to self".len(),
+                c_alice.as_ptr(),
+            )
+        })
         .expect("a single-device owner must still have a self thread");
 
         assert!(
@@ -1427,14 +2059,18 @@ mod tests {
         assert!(!started.first_application.is_empty());
 
         // The group works: the owner keeps writing into it.
-        let more = take_bytes(airdress_mls_encrypt_bound(
-            alice.id,
-            started.group_id.as_ptr(),
-            started.group_id.len(),
-            b"and another".as_ptr(),
-            b"and another".len(),
-            c_alice.as_ptr(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        let more = take_bytes(unsafe {
+            airdress_mls_encrypt_bound(
+                alice.id,
+                started.group_id.as_ptr(),
+                started.group_id.len(),
+                b"and another".as_ptr(),
+                b"and another".len(),
+                c_alice.as_ptr(),
+            )
+        })
         .expect("the solo group carries traffic");
         assert!(!more.is_empty());
     }
@@ -1448,12 +2084,16 @@ mod tests {
     #[test]
     fn a_solo_establishment_without_a_sender_is_refused() {
         let alice = engine(ALICE, 0x42, "alice-only-2", true);
-        let err = take_start(airdress_mls_start_group_solo(
-            alice.id,
-            b"note to self".as_ptr(),
-            b"note to self".len(),
-            std::ptr::null(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        let err = take_start(unsafe {
+            airdress_mls_start_group_solo(
+                alice.id,
+                b"note to self".as_ptr(),
+                b"note to self".len(),
+                std::ptr::null(),
+            )
+        })
         .expect_err("a null sender is a caller bug, not an unbound call");
         assert!(err.contains("from_airdress"), "unexpected refusal: {err}");
     }
@@ -1475,13 +2115,17 @@ mod tests {
         let bob = engine(BOB, 0x34, "bob-b", true);
 
         let bob_kp = key_package(&bob);
-        let err = take_start(airdress_mls_start_group(
-            alice.id,
-            bob_kp.as_ptr(),
-            bob_kp.len(),
-            b"hello bob".as_ptr(),
-            b"hello bob".len(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        let err = take_start(unsafe {
+            airdress_mls_start_group(
+                alice.id,
+                bob_kp.as_ptr(),
+                bob_kp.len(),
+                b"hello bob".as_ptr(),
+                b"hello bob".len(),
+            )
+        })
         .expect_err("an unbound establishment past the cutover must be refused");
         assert!(
             err.contains("must carry their sender binding"),
@@ -1502,14 +2146,18 @@ mod tests {
         // The same call with a binding succeeds against the SAME
         // KeyPackage — proof the refusal did not consume it.
         let c_alice = CString::new(ALICE).unwrap();
-        take_start(airdress_mls_start_group_bound(
-            alice.id,
-            bob_kp.as_ptr(),
-            bob_kp.len(),
-            b"hello bob".as_ptr(),
-            b"hello bob".len(),
-            c_alice.as_ptr(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        take_start(unsafe {
+            airdress_mls_start_group_bound(
+                alice.id,
+                bob_kp.as_ptr(),
+                bob_kp.len(),
+                b"hello bob".as_ptr(),
+                b"hello bob".len(),
+                c_alice.as_ptr(),
+            )
+        })
         .expect("the bound form succeeds where the unbound one refused");
     }
 
@@ -1527,20 +2175,24 @@ mod tests {
 
         let c_alice = CString::new(ALICE).unwrap();
         let bob_kp = key_package(&bob);
-        let started = take_start(airdress_mls_start_group_bound(
-            alice.id,
-            bob_kp.as_ptr(),
-            bob_kp.len(),
-            b"hello bob".as_ptr(),
-            b"hello bob".len(),
-            c_alice.as_ptr(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        let started = take_start(unsafe {
+            airdress_mls_start_group_bound(
+                alice.id,
+                bob_kp.as_ptr(),
+                bob_kp.len(),
+                b"hello bob".as_ptr(),
+                b"hello bob".len(),
+                c_alice.as_ptr(),
+            )
+        })
         .expect("establish");
-        take_bytes(airdress_mls_process_welcome(
-            bob.id,
-            started.welcome.as_ptr(),
-            started.welcome.len(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        take_bytes(unsafe {
+            airdress_mls_process_welcome(bob.id, started.welcome.as_ptr(), started.welcome.len())
+        })
         .expect("bob joins");
 
         // A second conversation between the same two airdresses. Under
@@ -1548,43 +2200,55 @@ mod tests {
         // against another group", because that is what the receiver
         // files by.
         let other_kp = key_package(&bob);
-        let other = take_start(airdress_mls_start_group_bound(
-            alice.id,
-            other_kp.as_ptr(),
-            other_kp.len(),
-            b"second thread".as_ptr(),
-            b"second thread".len(),
-            c_alice.as_ptr(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        let other = take_start(unsafe {
+            airdress_mls_start_group_bound(
+                alice.id,
+                other_kp.as_ptr(),
+                other_kp.len(),
+                b"second thread".as_ptr(),
+                b"second thread".len(),
+                c_alice.as_ptr(),
+            )
+        })
         .expect("a second group");
-        take_bytes(airdress_mls_process_welcome(
-            bob.id,
-            other.welcome.as_ptr(),
-            other.welcome.len(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        take_bytes(unsafe {
+            airdress_mls_process_welcome(bob.id, other.welcome.as_ptr(), other.welcome.len())
+        })
         .expect("bob joins the second group");
         assert_ne!(started.group_id, other.group_id);
 
-        take_bytes(airdress_mls_decrypt_bound(
-            bob.id,
-            other.group_id.as_ptr(),
-            other.group_id.len(),
-            started.first_application.as_ptr(),
-            started.first_application.len(),
-            c_alice.as_ptr(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        take_bytes(unsafe {
+            airdress_mls_decrypt_bound(
+                bob.id,
+                other.group_id.as_ptr(),
+                other.group_id.len(),
+                started.first_application.as_ptr(),
+                started.first_application.len(),
+                c_alice.as_ptr(),
+            )
+        })
         .expect_err("a ciphertext presented against another group must not decrypt");
 
         // Re-attributed to another sender.
         let c_bob = CString::new(BOB).unwrap();
-        let err = take_bytes(airdress_mls_decrypt_bound(
-            bob.id,
-            started.group_id.as_ptr(),
-            started.group_id.len(),
-            started.first_application.as_ptr(),
-            started.first_application.len(),
-            c_bob.as_ptr(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        let err = take_bytes(unsafe {
+            airdress_mls_decrypt_bound(
+                bob.id,
+                started.group_id.as_ptr(),
+                started.group_id.len(),
+                started.first_application.as_ptr(),
+                started.first_application.len(),
+                c_bob.as_ptr(),
+            )
+        })
         .expect_err("a re-attributed establishment message must not decrypt");
         assert!(
             err.contains("does not belong to this group or sender"),
@@ -1593,26 +2257,34 @@ mod tests {
 
         // And an UNBOUND decrypt of it is refused too, so a receiver
         // cannot sidestep the comparison by dropping the binding.
-        take_bytes(airdress_mls_decrypt(
-            bob.id,
-            started.group_id.as_ptr(),
-            started.group_id.len(),
-            started.first_application.as_ptr(),
-            started.first_application.len(),
-        ))
-        .expect_err("an unbound decrypt past the cutover must be refused");
-
-        // The honest binding still works after all three rejections —
-        // no rejection ratcheted the group forward behind the caller.
-        assert_eq!(
-            take_bytes(airdress_mls_decrypt_bound(
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        take_bytes(unsafe {
+            airdress_mls_decrypt(
                 bob.id,
                 started.group_id.as_ptr(),
                 started.group_id.len(),
                 started.first_application.as_ptr(),
                 started.first_application.len(),
-                c_alice.as_ptr(),
-            ))
+            )
+        })
+        .expect_err("an unbound decrypt past the cutover must be refused");
+
+        // The honest binding still works after all three rejections —
+        // no rejection ratcheted the group forward behind the caller.
+        assert_eq!(
+            // SAFETY: live local buffers and C strings, each with its own
+            // length, outliving the call; the result is freed by a take_* helper.
+            take_bytes(unsafe {
+                airdress_mls_decrypt_bound(
+                    bob.id,
+                    started.group_id.as_ptr(),
+                    started.group_id.len(),
+                    started.first_application.as_ptr(),
+                    started.first_application.len(),
+                    c_alice.as_ptr(),
+                )
+            })
             .expect("the correctly bound decrypt still works"),
             b"hello bob"
         );
@@ -1626,28 +2298,36 @@ mod tests {
         let bob = engine(BOB, 0x38, "bob-d", false);
 
         let bob_kp = key_package(&bob);
-        let started = take_start(airdress_mls_start_group(
-            alice.id,
-            bob_kp.as_ptr(),
-            bob_kp.len(),
-            b"hello bob".as_ptr(),
-            b"hello bob".len(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        let started = take_start(unsafe {
+            airdress_mls_start_group(
+                alice.id,
+                bob_kp.as_ptr(),
+                bob_kp.len(),
+                b"hello bob".as_ptr(),
+                b"hello bob".len(),
+            )
+        })
         .expect("pre-cutover establishment is unchanged");
-        take_bytes(airdress_mls_process_welcome(
-            bob.id,
-            started.welcome.as_ptr(),
-            started.welcome.len(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        take_bytes(unsafe {
+            airdress_mls_process_welcome(bob.id, started.welcome.as_ptr(), started.welcome.len())
+        })
         .expect("bob joins");
         assert_eq!(
-            take_bytes(airdress_mls_decrypt(
-                bob.id,
-                started.group_id.as_ptr(),
-                started.group_id.len(),
-                started.first_application.as_ptr(),
-                started.first_application.len(),
-            ))
+            // SAFETY: live local buffers and C strings, each with its own
+            // length, outliving the call; the result is freed by a take_* helper.
+            take_bytes(unsafe {
+                airdress_mls_decrypt(
+                    bob.id,
+                    started.group_id.as_ptr(),
+                    started.group_id.len(),
+                    started.first_application.as_ptr(),
+                    started.first_application.len(),
+                )
+            })
             .expect("unbound decrypt"),
             b"hello bob"
         );
@@ -1664,25 +2344,33 @@ mod tests {
         let bob = engine(BOB, 0x3a, "bob-e", true);
         let bob_kp = key_package(&bob);
 
-        let err = take_start(airdress_mls_start_group_bound(
-            alice.id,
-            bob_kp.as_ptr(),
-            bob_kp.len(),
-            b"hi".as_ptr(),
-            b"hi".len(),
-            std::ptr::null(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        let err = take_start(unsafe {
+            airdress_mls_start_group_bound(
+                alice.id,
+                bob_kp.as_ptr(),
+                bob_kp.len(),
+                b"hi".as_ptr(),
+                b"hi".len(),
+                std::ptr::null(),
+            )
+        })
         .expect_err("a bound establishment without a sender must be refused");
         assert!(err.contains("from_airdress"), "unexpected error: {err}");
 
-        let err = take_bytes(airdress_mls_encrypt_bound(
-            alice.id,
-            b"gid".as_ptr(),
-            3,
-            b"hi".as_ptr(),
-            2,
-            std::ptr::null(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        let err = take_bytes(unsafe {
+            airdress_mls_encrypt_bound(
+                alice.id,
+                b"gid".as_ptr(),
+                3,
+                b"hi".as_ptr(),
+                2,
+                std::ptr::null(),
+            )
+        })
         .expect_err("a bound encrypt without a sender must be refused");
         assert!(err.contains("from_airdress"), "unexpected error: {err}");
     }
@@ -1705,37 +2393,45 @@ mod tests {
 
         let c_alice = CString::new(ALICE).unwrap();
         let bob_kp = key_package(&bob);
-        let started = take_start(airdress_mls_start_group_bound(
-            alice.id,
-            bob_kp.as_ptr(),
-            bob_kp.len(),
-            b"hello bob".as_ptr(),
-            b"hello bob".len(),
-            c_alice.as_ptr(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        let started = take_start(unsafe {
+            airdress_mls_start_group_bound(
+                alice.id,
+                bob_kp.as_ptr(),
+                bob_kp.len(),
+                b"hello bob".as_ptr(),
+                b"hello bob".len(),
+                c_alice.as_ptr(),
+            )
+        })
         .expect("establish");
 
         assert_eq!(
-            take_bytes(airdress_mls_message_group_id(
-                started.first_application.as_ptr(),
-                started.first_application.len(),
-            ))
+            // SAFETY: live local buffers and C strings, each with its own
+            // length, outliving the call; the result is freed by a take_* helper.
+            take_bytes(unsafe {
+                airdress_mls_message_group_id(
+                    started.first_application.as_ptr(),
+                    started.first_application.len(),
+                )
+            })
             .expect("an application message names its group in the clear"),
             started.group_id,
             "the framing's group id is the group the receiver must file by"
         );
 
-        take_bytes(airdress_mls_message_group_id(
-            started.welcome.as_ptr(),
-            started.welcome.len(),
-        ))
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        take_bytes(unsafe {
+            airdress_mls_message_group_id(started.welcome.as_ptr(), started.welcome.len())
+        })
         .expect_err("a Welcome carries no group id in its framing");
 
-        take_bytes(airdress_mls_message_group_id(
-            b"not an mls message".as_ptr(),
-            18,
-        ))
-        .expect_err("garbage is a parse error, not a group id");
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        take_bytes(unsafe { airdress_mls_message_group_id(b"not an mls message".as_ptr(), 18) })
+            .expect_err("garbage is a parse error, not a group id");
     }
 
     /// The minting export, through the C boundary: the vector's inputs give
@@ -1767,17 +2463,21 @@ mod tests {
             cs(&m["device_label"]),
         );
         let mint = |key: &[u8]| {
-            take_bytes(airdress_mls_mint_agent_delegation(
-                seed.as_ptr(),
-                seed.len(),
-                airdress.as_ptr(),
-                device_id.as_ptr(),
-                key.as_ptr(),
-                key.len(),
-                harness.as_ptr(),
-                label.as_ptr(),
-                m["issued_at_unix"].as_u64().unwrap(),
-            ))
+            // SAFETY: live local buffers and C strings, each with its own
+            // length, outliving the call; the result is freed by a take_* helper.
+            take_bytes(unsafe {
+                airdress_mls_mint_agent_delegation(
+                    seed.as_ptr(),
+                    seed.len(),
+                    airdress.as_ptr(),
+                    device_id.as_ptr(),
+                    key.as_ptr(),
+                    key.len(),
+                    harness.as_ptr(),
+                    label.as_ptr(),
+                    m["issued_at_unix"].as_u64().unwrap(),
+                )
+            })
         };
         let json = mint(&key).expect("minted");
         let minted: serde_json::Value = serde_json::from_slice(&json).unwrap();
@@ -1785,5 +2485,141 @@ mod tests {
 
         let err = mint(&key[..31]).expect_err("a short key is refused");
         assert!(err.contains("device_public_key"), "{err}");
+    }
+
+    /// An empty input may arrive as a null pointer with length 0 — what
+    /// `calloc(0)` can hand Dart — and is the empty slice, not an error.
+    #[test]
+    fn a_null_input_with_zero_length_is_the_empty_input() {
+        let alice = engine(ALICE, 0x51, "alice-null", true);
+        let c_alice = CString::new(ALICE).unwrap();
+        let started = take_start(
+            // SAFETY: a null, zero-length message (the case under test)
+            // and a live C string.
+            unsafe {
+                airdress_mls_start_group_solo(alice.id, std::ptr::null(), 0, c_alice.as_ptr())
+            },
+        )
+        .expect("a null, zero-length first message is an empty one");
+        let sent = take_bytes(
+            // SAFETY: a live group id with its length, a null zero-length
+            // plaintext, and a live C string.
+            unsafe {
+                airdress_mls_encrypt_bound(
+                    alice.id,
+                    started.group_id.as_ptr(),
+                    started.group_id.len(),
+                    std::ptr::null(),
+                    0,
+                    c_alice.as_ptr(),
+                )
+            },
+        )
+        .expect("an empty plaintext encrypts");
+        assert!(!sent.is_empty());
+    }
+
+    /// A null pointer with a non-zero length, and a length no allocation
+    /// can have, are refused with an error naming the argument — before
+    /// either reaches `slice::from_raw_parts`, where the first is
+    /// undefined behaviour and the second aborts a debug build.
+    #[test]
+    fn a_null_or_impossible_input_is_an_error_not_a_crash() {
+        let err = take_bytes(
+            // SAFETY: a null pointer with a non-zero length, refused before
+            // any read (the case under test).
+            unsafe { airdress_mls_message_group_id(std::ptr::null(), 16) },
+        )
+        .expect_err("null with a length is refused");
+        assert!(err.contains("message is null"), "{err}");
+
+        let alice = engine(ALICE, 0x52, "alice-bad-len", true);
+        let c_alice = CString::new(ALICE).unwrap();
+        let err = take_bytes(
+            // SAFETY: the pointers are live; the length is the bug under
+            // test and is refused before any read.
+            unsafe {
+                airdress_mls_encrypt_bound(
+                    alice.id,
+                    b"gid".as_ptr(),
+                    usize::MAX,
+                    b"hi".as_ptr(),
+                    2,
+                    c_alice.as_ptr(),
+                )
+            },
+        )
+        .expect_err("an impossible length is refused");
+        assert!(err.contains("group_id has an impossible length"), "{err}");
+
+        // The epoch exports have no error string: a refused input is -2.
+        assert_eq!(
+            // SAFETY: a null pointer with a length, refused before any read.
+            unsafe { super::airdress_mls_group_epoch(alice.id, std::ptr::null(), 4) },
+            -2
+        );
+    }
+
+    /// A panic inside an export — here injected while the engine table
+    /// is locked, which is where one inside `mls-rs` would happen —
+    /// comes back as an error result instead of unwinding into the
+    /// host, and the poisoned table is recovered: the same engine
+    /// answers the next call.
+    #[test]
+    fn a_panic_is_an_error_and_the_engine_keeps_working() {
+        let alice = engine(ALICE, 0x53, "alice-panic", true);
+        let c_alice = CString::new(ALICE).unwrap();
+        let started = take_start(
+            // SAFETY: a live message and C string with their lengths.
+            unsafe {
+                airdress_mls_start_group_solo(alice.id, b"one".as_ptr(), 3, c_alice.as_ptr())
+            },
+        )
+        .expect("establish");
+
+        let encrypt = || {
+            take_bytes(
+                // SAFETY: live buffers and a C string with their lengths.
+                unsafe {
+                    airdress_mls_encrypt_bound(
+                        alice.id,
+                        started.group_id.as_ptr(),
+                        started.group_id.len(),
+                        b"two".as_ptr(),
+                        3,
+                        c_alice.as_ptr(),
+                    )
+                },
+            )
+        };
+
+        INJECT_PANIC.with(|flag| flag.set(true));
+        let err = encrypt().expect_err("a panic is an error result");
+        assert!(err.contains("a panic was caught"), "{err}");
+        assert!(err.contains("injected by a test"), "{err}");
+
+        // Every return shape has a panic answer, not only `FfiBytes`.
+        INJECT_PANIC.with(|flag| flag.set(true));
+        assert_eq!(
+            super::airdress_mls_is_v2_cutover(alice.id),
+            super::PANIC_I32
+        );
+        INJECT_PANIC.with(|flag| flag.set(true));
+        assert_eq!(
+            // SAFETY: a live group id with its length.
+            unsafe {
+                super::airdress_mls_group_epoch(
+                    alice.id,
+                    started.group_id.as_ptr(),
+                    started.group_id.len(),
+                )
+            },
+            super::PANIC_I64
+        );
+
+        // The lock was poisoned by the first panic; it is recovered, and
+        // the engine carries on from the state the failed call left.
+        encrypt().expect("the engine answers after a caught panic");
+        assert_eq!(super::airdress_mls_is_v2_cutover(alice.id), 1);
     }
 }
