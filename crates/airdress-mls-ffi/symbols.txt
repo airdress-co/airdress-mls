@@ -83,3 +83,6 @@ airdress_mls_message_group_id
 # its device id, harness and label) and the operator admits the agent on
 # it. The one export that borrows the root seed, for one signature.
 airdress_mls_mint_agent_delegation
+
+# Stable error codes, read off an error string before it is freed.
+airdress_mls_error_code

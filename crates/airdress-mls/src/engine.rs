@@ -69,6 +69,61 @@ impl core::fmt::Display for EngineError {
 
 impl std::error::Error for EngineError {}
 
+impl EngineError {
+    /// The stable code for this error — what a caller branches on.
+    /// `Display` is the sentence for a journal and may be reworded;
+    /// the code may not (rust guide R-ERR-6).
+    #[must_use]
+    pub const fn code(&self) -> ErrorCode {
+        match self {
+            Self::EpochUnavailable { .. } => ErrorCode::EpochUnavailable,
+            Self::Other(_) => ErrorCode::Engine,
+        }
+    }
+}
+
+/// Stable error codes: what failed, as a number a client can branch
+/// on without reading the message (rust guide R-ERR-6, R-ERR-7).
+///
+/// The values cross the C ABI (`airdress_mls_error_code`) and are a
+/// promise to apps in the field: a value is never reused or renumbered,
+/// and a new condition is a new value. Each says what the caller can do
+/// about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(i32)]
+pub enum ErrorCode {
+    /// The engine refused or failed, for a reason with no code of its
+    /// own (a bad credential, a corrupt message, a storage failure).
+    /// Not retryable as is; the message says why.
+    Engine = 1,
+    /// An argument was null, the wrong length or not UTF-8. A bug in
+    /// the caller; retrying the same call fails the same way.
+    InvalidArgument = 2,
+    /// The engine handle names no live engine: it was destroyed, or
+    /// never created. Create a new engine.
+    InvalidHandle = 3,
+    /// A panic inside the library was caught. A bug in this library or
+    /// in mls-rs; the engine stays usable, and the input that caused it
+    /// should be dropped rather than retried.
+    Internal = 4,
+    /// The message is from an epoch this device has deliberately
+    /// trimmed from its sealed state ([`EngineError::EpochUnavailable`]).
+    /// Not corrupt and not retryable: catch up from the current epoch
+    /// (or rejoin), and drop the message.
+    EpochUnavailable = 5,
+    /// An unbound send or establishment past the v2 credential cutover.
+    /// Call the `_bound` form with the sender's airdress.
+    BindingRequired = 6,
+}
+
+impl ErrorCode {
+    /// The number that crosses the C ABI.
+    #[must_use]
+    pub const fn as_i32(self) -> i32 {
+        self as i32
+    }
+}
+
 impl From<String> for EngineError {
     fn from(msg: String) -> Self {
         Self::Other(msg)
