@@ -5,7 +5,7 @@ members = ["crates/airdress-mls", "crates/airdress-mls-ffi", "crates/airdress-ml
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.92"
 license = "Apache-2.0"
@@ -17,7 +17,7 @@ publish = false
 # ranges unless a comment says why a pin is load-bearing.
 
 # The engine itself, for the FFI and client crates in this workspace.
-airdress-mls = { path = "crates/airdress-mls", version = "0.3.0" }
+airdress-mls = { path = "crates/airdress-mls", version = "0.4.0" }
 
 # The RFC 9420 implementation everything here wraps. No default features:
 # `std` plus the RFC-compliant extension set, and the faster codec.

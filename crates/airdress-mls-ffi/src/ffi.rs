@@ -464,11 +464,15 @@ pub unsafe extern "C" fn airdress_mls_create_engine_from_seed(
 
 /// Host-supplied root-key cache callback.
 ///
-/// Called with the peer's airdress (NUL-terminated UTF-8) and a
-/// 32-byte output buffer. The host returns 1 after filling the buffer
-/// with the root public key its cache holds for that airdress (24h
-/// TTL, populated at first contact), or 0 when it has none — which
-/// rejects the peer's leaf. The callback must be thread-safe and must
+/// Called with a pin subject (NUL-terminated UTF-8) and a 32-byte
+/// output buffer. The subject is the peer's bare airdress for an
+/// owner's leaf, and `airdress ‖ 0x1F ‖ person_id` for the leaf of
+/// another person of that airdress (a `v: 3` credential), whose root is
+/// their own. The host returns 1 after filling the buffer with the root
+/// public key its cache holds for that subject (24h TTL, populated at
+/// first contact), or 0 when it has none — which rejects the peer's
+/// leaf. A host that does not resolve person roots returns 0 for any
+/// subject containing 0x1F. The callback must be thread-safe and must
 /// not call back into this library.
 pub type AirdressRootKeyLookupFn =
     extern "C" fn(airdress: *const c_char, out_root_public_key: *mut u8) -> i32;
@@ -2143,6 +2147,135 @@ mod tests {
             .expect("alice reads the reply"),
             b"hi alice"
         );
+    }
+
+    /// The pin subjects a test's root-key callback was asked for.
+    static ASKED_SUBJECTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    /// `(pin subject, root)` pairs the test's root-key callback answers.
+    static ANSWERS: std::sync::Mutex<Vec<(String, [u8; 32])>> = std::sync::Mutex::new(Vec::new());
+
+    /// A host's root-key cache as the phone implements it: a table
+    /// keyed by pin subject, `None` for anything else.
+    extern "C" fn subject_table_lookup(
+        subject: *const std::os::raw::c_char,
+        out_root_public_key: *mut u8,
+    ) -> i32 {
+        // SAFETY: the library passes a live NUL-terminated string.
+        let subject = unsafe { CStr::from_ptr(subject) }
+            .to_string_lossy()
+            .into_owned();
+        ASKED_SUBJECTS.lock().unwrap().push(subject.clone());
+        let answers = ANSWERS.lock().unwrap();
+        let Some((_, root)) = answers.iter().find(|(s, _)| *s == subject) else {
+            return 0;
+        };
+        // SAFETY: the library passes a 32-byte output buffer.
+        unsafe { std::ptr::copy_nonoverlapping(root.as_ptr(), out_root_public_key, 32) };
+        1
+    }
+
+    /// **A household member's device, over the C ABI.** The host hands
+    /// in a `v: 3` delegation (it carries `person_id`) and the person's
+    /// own root; no export changes, the version follows the delegation.
+    /// A peer verifying that member's key package asks its root-key
+    /// callback for the pin subject `airdress ‖ 0x1F ‖ person_id`, and
+    /// the leaf is admitted only under that subject.
+    #[test]
+    fn a_member_leaf_is_verified_under_its_pin_subject_through_the_c_abi() {
+        const PERSON: &str = "019f3c2a-5e71-7b04-a8d3-4e1f9c6b2a85";
+        let owner = engine(ALICE, 0x51, "owner-phone", true);
+
+        // The member's engine: same airdress, a person root of its own.
+        let dir = tempfile::tempdir().expect("state dir");
+        let seed = [0x52u8; 32];
+        let person_root = SigningKey::from_bytes(&[0x53; 32]);
+        let session_pub = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        let delegation = airdress_mls::credential::test_support::signed_delegation_json_v3(
+            &person_root,
+            ALICE,
+            PERSON,
+            &session_pub,
+            "member-phone",
+            "2099-01-01T00:00:00Z",
+        );
+        let c_airdress = CString::new(ALICE).unwrap();
+        let c_delegation = CString::new(delegation).unwrap();
+        let c_dir = CString::new(dir.path().to_str().unwrap()).unwrap();
+        let person_pub = person_root.verifying_key().to_bytes();
+        let state_key = [0x78u8; 32];
+        // SAFETY: every argument is a live local buffer with its own
+        // length, or a live `CString`, all outliving the call.
+        let result = unsafe {
+            airdress_mls_create_engine_from_seed(
+                c_airdress.as_ptr(),
+                seed.as_ptr(),
+                seed.len(),
+                person_pub.as_ptr(),
+                person_pub.len(),
+                c_delegation.as_ptr(),
+                c_dir.as_ptr(),
+                state_key.as_ptr(),
+                state_key.len(),
+            )
+        };
+        assert!(
+            result.error.is_null(),
+            "member engine: {}",
+            take_error(result.error)
+        );
+        // SAFETY: the public key buffer the call returned, freed once.
+        unsafe { super::airdress_mls_free_bytes(result.public_key_ptr, result.public_key_len) };
+        let member = Handle {
+            id: result.handle_id,
+            dir,
+        };
+        let member_kp = key_package(&member);
+
+        // The owner's host pins the airdress root under the bare
+        // airdress, as every host does today, and knows nothing for the
+        // member's subject yet.
+        let owner_root = SigningKey::from_bytes(&[0x51u8.wrapping_add(0x40); 32])
+            .verifying_key()
+            .to_bytes();
+        ANSWERS.lock().unwrap().push((ALICE.to_owned(), owner_root));
+        assert_eq!(
+            // SAFETY: a plain function, callable for the life of the
+            // process, that never calls back into the library.
+            unsafe {
+                super::airdress_mls_set_root_key_lookup(owner.id, Some(subject_table_lookup))
+            },
+            0
+        );
+        let subject = format!("{ALICE}\u{1f}{PERSON}");
+        let start = |handle: &Handle| {
+            // SAFETY: live local buffers and C strings, each with its own
+            // length, outliving the call; the result is freed by take_start.
+            take_start(unsafe {
+                airdress_mls_start_group_bound(
+                    handle.id,
+                    member_kp.as_ptr(),
+                    member_kp.len(),
+                    b"hello".as_ptr(),
+                    b"hello".len(),
+                    c_airdress.as_ptr(),
+                )
+            })
+        };
+        assert!(
+            start(&owner).is_err(),
+            "a host that cannot resolve the person subject must reject the leaf, \
+             whatever it holds for the bare airdress"
+        );
+        assert!(ASKED_SUBJECTS.lock().unwrap().contains(&subject));
+
+        // Under its own subject, it is admitted.
+        ANSWERS.lock().unwrap().push((subject, person_pub));
+        let started = start(&owner).expect("the member's leaf verifies under its pin subject");
+        // SAFETY: live local buffers, outliving the call; freed by take_bytes.
+        take_bytes(unsafe {
+            airdress_mls_process_welcome(member.id, started.welcome.as_ptr(), started.welcome.len())
+        })
+        .expect("the member joins");
     }
 
     /// **SPEC-061 task 7.2 — the self thread of a single-device owner.**

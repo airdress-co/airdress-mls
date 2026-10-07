@@ -18,6 +18,69 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 - Consumers pin a tag, never a branch (rust guide R-API-6).
   `cargo-semver-checks` runs in CI against the base revision.
 
+## v0.4.0 — unreleased
+
+A third credential form, for every person of an airdress who is not its
+owner.
+
+### Breaking
+
+- **`IdentityVersion` has a third variant, `V3`.** An exhaustive `match`
+  on it needs the arm. `parse_identity` now accepts `"v": 3` (it used to
+  refuse it as an unknown version) and holds it to its fields: a `v: 3`
+  without `delegation`, `root_public_key` or `airdress` is still an error,
+  never a legacy identity.
+- **`RootKeyLookup` is asked for a pin subject, not always an airdress.**
+  The signature is unchanged, and for every `v: 1` and `v: 2` leaf the
+  argument is the bare airdress exactly as before. For a `v: 3` leaf it is
+  `airdress ‖ 0x1F ‖ person_id`. A host that does not resolve that form
+  answers `None` and the leaf is refused (`RootKeyUnavailable`), which is
+  the intended failure for a host that has not learned about persons; it
+  must not strip the suffix and answer with the airdress root. The C
+  callback registered with `airdress_mls_set_root_key_lookup` receives
+  the same string.
+
+### Added
+
+- **`v: 3`**: a delegation that carries `person_id` (with `device_id` and
+  `expires_at`, as `v: 2`), signed by that person's own root rather than
+  the airdress root. `AirdressIdentity::from_delegation` infers it from
+  `person_id` alone, so a delegation naming a person without the other
+  two fields is a malformed `v: 3`, never a `v: 1`. Member identity:
+  `airdress ‖ 0x1F ‖ person_id ‖ 0x1F ‖ device_id`, which cannot equal
+  any `v: 1` or `v: 2` member identity. Checks 1, 3, 4 and 5 apply as to
+  `v: 2` (revocation stays keyed on `device_id`); check 2 looks the root
+  up under the pin subject. `valid_successor` never accepts a successor
+  of another version or another `person_id`. Past the v2 cutover `v: 3`
+  is a live form.
+- `AirdressIdentity::pin_subject`, `AirdressIdentity::person_id`,
+  `credential::pin_subject_for_person`, `credential::split_pin_subject`
+  and `credential::PERSON_ID_FIELD`.
+- `test_support::signed_delegation_json_v3`.
+- Vector `person-v3-delegation`, carrying an `identity` block with the
+  expected `pin_subject` and `member_identity`, so every implementation
+  checks the same strings.
+
+### Changed
+
+- The C ABI is unchanged: no export added, renamed or re-laid-out. A host
+  makes a `v: 3` device by handing `airdress_mls_create_engine_from_seed`
+  a delegation that carries `person_id` and the person's own root public
+  key.
+- `airdress-mls-client`'s `PinStore` documents that its keys are pin
+  subjects; pins already written are under the bare airdress, which is
+  the owner's subject, so nothing moves.
+
+### Not changed, and worth knowing
+
+- **The removal rule is still per airdress.** A member may propose
+  `Remove` only for leaves of its own airdress, and an owner and a
+  household member share one, so in a group holding both, either may
+  remove the other's devices. That is what lets a remaining device
+  remove a revoked person's leaves; whether it should also stop a
+  household member removing the owner's is an open question, not
+  decided here.
+
 ## v0.3.0 — 2026-10-07
 
 Everything since `5cf9036` (0.2.0, the revision the operator pins).

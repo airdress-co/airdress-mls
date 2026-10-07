@@ -8,6 +8,13 @@
 //! phone's store, so both refuse the same things.
 //!
 //! Times are the caller's (RFC 3339 strings): this crate keeps no clock.
+//!
+//! Pins are keyed by **pin subject**
+//! ([`airdress_mls::credential::AirdressIdentity::pin_subject`]), which is
+//! the bare airdress for an owner's root — so every pin written before
+//! `v: 3` credentials existed is already under the right key — and
+//! `airdress ‖ 0x1F ‖ person_id` for another person of that airdress.
+//! The `airdress` arguments below accept either form.
 
 use std::collections::BTreeMap;
 use std::path::Path;

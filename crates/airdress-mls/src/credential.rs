@@ -29,8 +29,18 @@
 //!   and `expires_at` (RFC 3339). The member identity becomes
 //!   `airdress ‖ 0x1F ‖ device_id`, so a multi-leaf group is
 //!   representable, and the delegation acquires a named lifetime.
+//! - **`v: 3`** — the `v: 2` delegation plus `person_id`: a device of
+//!   one *person* of an airdress who is not its owner (a household
+//!   member). Such a person holds a root of their own, the **person
+//!   root**, and it is that root which signs the delegation and sits in
+//!   `root_public_key`. The member identity becomes
+//!   `airdress ‖ 0x1F ‖ person_id ‖ 0x1F ‖ device_id`, and check 2
+//!   looks the root up under the **pin subject**
+//!   `airdress ‖ 0x1F ‖ person_id` instead of the bare airdress
+//!   ([`AirdressIdentity::pin_subject`]). The owner keeps `v: 2` and
+//!   the bare airdress, unchanged.
 //!
-//! Both fields are inside the object the root signs, so adding them
+//! Each added field is inside the object the root signs, so adding it
 //! is a version break, not an extension.
 //!
 //! A legacy bare-string identity (a pre-cutover client) still parses,
@@ -47,14 +57,20 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Map, Value};
 
-/// Separator between the airdress and the `device_id` in the member
-/// identity bytes (FR-16, design D-4).
+/// Separator between the airdress, the `person_id` and the `device_id`
+/// in the member identity bytes and the pin subject (FR-16, design D-4).
 ///
 /// ASCII unit separator: not legal in an airdress FQDN and not legal
-/// in a UUID, so `airdress ‖ 0x1F ‖ device_id` is unambiguous. Both
-/// components are rejected if they contain it, because "cannot occur"
-/// is only true of well-formed inputs and neither component is ours.
+/// in a UUID, so `airdress ‖ 0x1F ‖ device_id` and
+/// `airdress ‖ 0x1F ‖ person_id ‖ 0x1F ‖ device_id` are unambiguous,
+/// and never equal to each other. Every component is rejected if it
+/// contains it, because "cannot occur" is only true of well-formed
+/// inputs and none of the components is ours.
 pub const IDENTITY_SEPARATOR: u8 = 0x1F;
+
+/// The delegation field that names the person a `v: 3` delegation is
+/// for. Inside the signed object, like every field a check reads.
+pub const PERSON_ID_FIELD: &str = "person_id";
 
 /// Default delegation lifetime (design D-4): 180 days.
 ///
@@ -80,7 +96,12 @@ pub enum IdentityVersion {
     /// Pre-cutover: airdress-scoped member identity, no expiry.
     V1,
     /// SPEC-061: device-scoped member identity, `expires_at` enforced.
+    /// The owner of an airdress, whose root is the airdress root.
     V2,
+    /// A person of an airdress other than its owner: `v: 2` plus
+    /// `person_id`, signed by that person's own root and pinned under
+    /// `airdress ‖ 0x1F ‖ person_id` (SPEC-144).
+    V3,
 }
 
 impl IdentityVersion {
@@ -88,6 +109,7 @@ impl IdentityVersion {
         match self {
             Self::V1 => 1,
             Self::V2 => 2,
+            Self::V3 => 3,
         }
     }
 
@@ -95,6 +117,7 @@ impl IdentityVersion {
         match v {
             1 => Some(Self::V1),
             2 => Some(Self::V2),
+            3 => Some(Self::V3),
             _ => None,
         }
     }
@@ -107,7 +130,8 @@ pub struct AirdressIdentity {
     pub version: IdentityVersion,
     /// The airdress the delegation names.
     pub airdress: String,
-    /// The airdress root's Ed25519 public key, which signed the delegation.
+    /// The Ed25519 public key that signed the delegation: the airdress
+    /// root for `v: 1` and `v: 2`, the person root for `v: 3`.
     pub root_public_key: [u8; 32],
     /// The full delegation object, `signature` field included.
     pub delegation: Map<String, Value>,
@@ -116,8 +140,14 @@ pub struct AirdressIdentity {
 impl AirdressIdentity {
     /// Build an identity around a delegation this device just minted,
     /// choosing the version from the delegation's own fields: a
-    /// delegation carrying both `device_id` and `expires_at` is `v: 2`,
-    /// anything else is `v: 1`.
+    /// delegation carrying `person_id` is `v: 3`; otherwise one carrying
+    /// both `device_id` and `expires_at` is `v: 2`; anything else is
+    /// `v: 1`.
+    ///
+    /// `person_id` decides on its own, without the other two: a
+    /// delegation naming a person that lacks a `device_id` or an expiry
+    /// is a malformed `v: 3` that fails verification loudly, never a
+    /// `v: 1` that would look its root up under the bare airdress.
     ///
     /// This is deliberately the ONLY place version is inferred, and it
     /// applies only to identities we mint for ourselves. Inference
@@ -132,12 +162,13 @@ impl AirdressIdentity {
         root_public_key: [u8; 32],
         delegation: Map<String, Value>,
     ) -> Self {
-        let version =
-            if delegation.contains_key("device_id") && delegation.contains_key("expires_at") {
-                IdentityVersion::V2
-            } else {
-                IdentityVersion::V1
-            };
+        let version = if delegation.contains_key(PERSON_ID_FIELD) {
+            IdentityVersion::V3
+        } else if delegation.contains_key("device_id") && delegation.contains_key("expires_at") {
+            IdentityVersion::V2
+        } else {
+            IdentityVersion::V1
+        };
         Self {
             version,
             airdress,
@@ -181,9 +212,65 @@ impl AirdressIdentity {
         self.delegation.get("expires_at").and_then(Value::as_str)
     }
 
+    /// The person a `v: 3` delegation is for, or `None` when the
+    /// delegation does not name one (every `v: 1` and `v: 2` one).
+    #[must_use]
+    pub fn person_id(&self) -> Option<&str> {
+        self.delegation.get(PERSON_ID_FIELD).and_then(Value::as_str)
+    }
+
+    /// The `person_id` of a `v: 3` identity, checked: present,
+    /// non-empty, and free of the separator byte.
+    fn checked_person_id(&self) -> Result<&str, CredentialVerifyError> {
+        let person_id = self.person_id().filter(|p| !p.is_empty()).ok_or_else(|| {
+            CredentialVerifyError::Malformed("v3 delegation missing person_id".into())
+        })?;
+        if person_id.as_bytes().contains(&IDENTITY_SEPARATOR) {
+            return Err(CredentialVerifyError::Malformed(
+                "person_id contains the identity separator".into(),
+            ));
+        }
+        Ok(person_id)
+    }
+
+    /// What a peer pins this identity's root under, and so what check 2
+    /// asks the host's [`RootKeyLookup`] for.
+    ///
+    /// - `v: 1` and `v: 2`: the bare airdress. Its root is the airdress
+    ///   root, and every pin a peer already holds is under this string.
+    /// - `v: 3`: `airdress ‖ 0x1F ‖ person_id`. A person's root is not
+    ///   the airdress root, so it is pinned apart from it; and a host
+    ///   that has never heard of persons receives a string it cannot
+    ///   resolve and answers `None`, which rejects the leaf. That is the
+    ///   safe failure for an old client meeting a new member.
+    ///
+    /// The airdress is the identity's own field; `person_id` is read
+    /// from inside the signed delegation.
+    ///
+    /// # Errors
+    ///
+    /// [`CredentialVerifyError::Malformed`] when the airdress contains
+    /// the separator byte, or a `v: 3` delegation carries no usable
+    /// `person_id`.
+    pub fn pin_subject(&self) -> Result<String, CredentialVerifyError> {
+        if self.airdress.as_bytes().contains(&IDENTITY_SEPARATOR) {
+            return Err(CredentialVerifyError::Malformed(
+                "airdress contains the identity separator".into(),
+            ));
+        }
+        match self.version {
+            IdentityVersion::V1 | IdentityVersion::V2 => Ok(self.airdress.clone()),
+            IdentityVersion::V3 => Ok(pin_subject_for_person(
+                &self.airdress,
+                self.checked_person_id()?,
+            )),
+        }
+    }
+
     /// The member identity `mls-rs` uses to detect duplicate members
-    /// (FR-16): `airdress ‖ 0x1F ‖ device_id` for `v: 2`, the bare
-    /// airdress for `v: 1`.
+    /// (FR-16): `airdress ‖ 0x1F ‖ device_id` for `v: 2`,
+    /// `airdress ‖ 0x1F ‖ person_id ‖ 0x1F ‖ device_id` for `v: 3`, the
+    /// bare airdress for `v: 1`.
     ///
     /// The version decides this, not the presence of `device_id`. A
     /// `v: 1` leaf's member identity must stay exactly what it was, or
@@ -194,10 +281,11 @@ impl AirdressIdentity {
     ///
     /// # Errors
     ///
-    /// [`CredentialVerifyError::MissingDeviceId`] when a `v: 2`
-    /// delegation carries no `device_id`;
-    /// [`CredentialVerifyError::Malformed`] when either component
-    /// contains the separator byte.
+    /// [`CredentialVerifyError::MissingDeviceId`] when a `v: 2` or
+    /// `v: 3` delegation carries no `device_id`;
+    /// [`CredentialVerifyError::Malformed`] when any component contains
+    /// the separator byte, or a `v: 3` delegation carries no
+    /// `person_id`.
     pub fn member_identity(&self) -> Result<Vec<u8>, CredentialVerifyError> {
         if self.airdress.as_bytes().contains(&IDENTITY_SEPARATOR) {
             return Err(CredentialVerifyError::Malformed(
@@ -207,24 +295,70 @@ impl AirdressIdentity {
         match self.version {
             IdentityVersion::V1 => Ok(self.airdress.clone().into_bytes()),
             IdentityVersion::V2 => {
-                let device_id = self
-                    .device_id()
-                    .ok_or(CredentialVerifyError::MissingDeviceId)?;
-                if device_id.is_empty() {
-                    return Err(CredentialVerifyError::MissingDeviceId);
-                }
-                if device_id.as_bytes().contains(&IDENTITY_SEPARATOR) {
-                    return Err(CredentialVerifyError::Malformed(
-                        "device_id contains the identity separator".into(),
-                    ));
-                }
+                let device_id = self.checked_device_id()?;
                 let mut out = Vec::with_capacity(self.airdress.len() + 1 + device_id.len());
                 out.extend_from_slice(self.airdress.as_bytes());
                 out.push(IDENTITY_SEPARATOR);
                 out.extend_from_slice(device_id.as_bytes());
                 Ok(out)
             }
+            IdentityVersion::V3 => {
+                let subject = self.pin_subject()?;
+                let device_id = self.checked_device_id()?;
+                let mut out = Vec::with_capacity(subject.len() + 1 + device_id.len());
+                out.extend_from_slice(subject.as_bytes());
+                out.push(IDENTITY_SEPARATOR);
+                out.extend_from_slice(device_id.as_bytes());
+                Ok(out)
+            }
         }
+    }
+
+    /// The `device_id` of a `v: 2` or `v: 3` identity, checked: present,
+    /// non-empty, and free of the separator byte.
+    fn checked_device_id(&self) -> Result<&str, CredentialVerifyError> {
+        let device_id = self
+            .device_id()
+            .ok_or(CredentialVerifyError::MissingDeviceId)?;
+        if device_id.is_empty() {
+            return Err(CredentialVerifyError::MissingDeviceId);
+        }
+        if device_id.as_bytes().contains(&IDENTITY_SEPARATOR) {
+            return Err(CredentialVerifyError::Malformed(
+                "device_id contains the identity separator".into(),
+            ));
+        }
+        Ok(device_id)
+    }
+}
+
+/// The pin subject of a person of `airdress` other than its owner:
+/// `airdress ‖ 0x1F ‖ person_id`. What a host keys a person's pinned
+/// root under, and what its [`RootKeyLookup`] receives for a `v: 3`
+/// leaf. The owner's subject is the bare airdress.
+#[must_use]
+pub fn pin_subject_for_person(airdress: &str, person_id: &str) -> String {
+    format!("{airdress}{}{person_id}", char::from(IDENTITY_SEPARATOR))
+}
+
+/// Split a pin subject into the airdress and, for a person other than
+/// the owner, the `person_id`.
+///
+/// What a host's [`RootKeyLookup`] does first: the bare airdress
+/// (`(airdress, None)`) is the owner's root, fetched as before;
+/// `(airdress, Some(person_id))` is a person root, which a host that
+/// does not know persons answers with `None`. Returns `None` for a
+/// subject with more than one separator or an empty component, which
+/// no identity produces.
+#[must_use]
+pub fn split_pin_subject(subject: &str) -> Option<(&str, Option<&str>)> {
+    let sep = char::from(IDENTITY_SEPARATOR);
+    let mut parts = subject.split(sep);
+    let airdress = parts.next().filter(|a| !a.is_empty())?;
+    match (parts.next(), parts.next()) {
+        (None, _) => Some((airdress, None)),
+        (Some(person), None) if !person.is_empty() => Some((airdress, Some(person))),
+        _ => None,
     }
 }
 
@@ -240,8 +374,8 @@ pub enum ParsedIdentity {
 
 /// Parse credential identity bytes into one of the two forms.
 ///
-/// Rules: bytes that parse as a JSON object with a known `"v"` (1 or
-/// 2) are the structured form and must then be fully well-formed (an
+/// Rules: bytes that parse as a JSON object with a known `"v"` (1, 2
+/// or 3) are the structured form and must then be fully well-formed (an
 /// error, not a fallback, otherwise). Anything else that is valid
 /// UTF-8 is a legacy bare-string identity. Invalid UTF-8 is an error.
 ///
@@ -380,8 +514,16 @@ impl mls_rs_core::error::IntoAnyError for CredentialVerifyError {
 /// the 24-hour TTL cache, and exposes both through this lookup.
 /// Returning `None` (nothing cached, fetch failed) rejects the leaf —
 /// check 2 is never optional or warn-only.
+///
+/// The argument is a **pin subject** ([`AirdressIdentity::pin_subject`]):
+/// the bare airdress for an owner's leaf (`v: 1`, `v: 2`), and
+/// `airdress ‖ 0x1F ‖ person_id` for another person's (`v: 3`).
+/// [`split_pin_subject`] tells the two apart. A host that does not
+/// resolve person roots answers `None` for the second form, which
+/// rejects the leaf.
 pub trait RootKeyLookup: Send + Sync {
-    /// The root public key cached for `airdress`, or `None`, which rejects.
+    /// The root public key cached for the pin subject `airdress`, or
+    /// `None`, which rejects.
     fn root_public_key(&self, airdress: &str) -> Option<[u8; 32]>;
 }
 
@@ -608,10 +750,13 @@ fn verify_chain(
 
     // Check 2 — the published root key. This is what turns the
     // delegation from a self-assertion into an identity chain; a miss
-    // or a mismatch is a hard reject, never a warning.
+    // or a mismatch is a hard reject, never a warning. Asked under the
+    // pin subject: the bare airdress for the owner, the airdress and
+    // the signed `person_id` for another person, whose root is their
+    // own and never the airdress root.
     if let Some(lookup) = lookup {
         let published = lookup
-            .root_public_key(&identity.airdress)
+            .root_public_key(&identity.pin_subject()?)
             .ok_or(CredentialVerifyError::RootKeyUnavailable)?;
         if published != identity.root_public_key {
             return Err(CredentialVerifyError::RootKeyMismatch);
@@ -635,7 +780,7 @@ fn verify_chain(
         return Err(CredentialVerifyError::SessionKeyMismatch);
     }
 
-    // Check 4 (FR-18) — expiry. A `v: 2` delegation MUST carry
+    // Check 4 (FR-18) — expiry. A `v: 2` or `v: 3` delegation MUST carry
     // `expires_at`. A `v: 1` delegation normally carries none, but if
     // one is present it is enforced anyway: the field is inside the
     // signed object, so honouring it costs nothing and refusing to
@@ -656,11 +801,17 @@ fn verify_chain(
                 "v2 delegation missing expires_at".into(),
             ));
         }
+        (IdentityVersion::V3, None) => {
+            return Err(CredentialVerifyError::Malformed(
+                "v3 delegation missing expires_at".into(),
+            ));
+        }
         (IdentityVersion::V1, None) => {}
     }
 
-    // Check 5 (FR-19) — revocation, keyed on the stable `device_id`.
-    // A `v: 2` delegation must carry one; a `v: 1` delegation that
+    // Check 5 (FR-19) — revocation, keyed on the stable `device_id`,
+    // for every version: a person's device is revoked like any other.
+    // A `v: 2` or `v: 3` delegation must carry one; a `v: 1` delegation that
     // happens to carry one is checked too, for the same reason as
     // check 4.
     match (identity.version, identity.device_id()) {
@@ -675,7 +826,9 @@ fn verify_chain(
                 }
             }
         }
-        (IdentityVersion::V2, _) => return Err(CredentialVerifyError::MissingDeviceId),
+        (IdentityVersion::V2 | IdentityVersion::V3, _) => {
+            return Err(CredentialVerifyError::MissingDeviceId);
+        }
         (IdentityVersion::V1, _) => {}
     }
 
@@ -1248,6 +1401,23 @@ pub mod test_support {
         obj.insert("expires_at".to_owned(), Value::from(expires_at));
         sign(root, obj)
     }
+
+    /// The `v: 3` form: the `v: 2` object plus `person_id`, signed by
+    /// `person_root` — that person's own root, not the airdress root.
+    pub fn signed_delegation_json_v3(
+        person_root: &SigningKey,
+        airdress: &str,
+        person_id: &str,
+        session_public_key: &[u8; 32],
+        device_id: &str,
+        expires_at: &str,
+    ) -> String {
+        let mut obj = base(airdress, session_public_key);
+        obj.insert("person_id".to_owned(), Value::from(person_id));
+        obj.insert("device_id".to_owned(), Value::from(device_id));
+        obj.insert("expires_at".to_owned(), Value::from(expires_at));
+        sign(person_root, obj)
+    }
 }
 
 #[cfg(test)]
@@ -1348,6 +1518,100 @@ mod tests {
         }
     }
 
+    /// The `v: 3` vector in the shared fixture: a household member's
+    /// delegation, signed by that person's own root. Also returns the
+    /// vector's `identity` block, which carries the expected pin
+    /// subject and member identity for every implementation to match.
+    fn fixture_identity_v3() -> (AirdressIdentity, Value) {
+        let parsed: Value = serde_json::from_str(crate::vectors::DELEGATION).unwrap();
+        let vector = parsed["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == json!("person-v3-delegation"))
+            .expect("fixture carries the person vector")
+            .clone();
+        let identity = AirdressIdentity {
+            version: IdentityVersion::V3,
+            airdress: vector["delegation"]["airdress"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            root_public_key: {
+                use base64::Engine as _;
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(vector["root_public_key_b64url"].as_str().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap()
+            },
+            delegation: vector["delegation"].as_object().unwrap().clone(),
+        };
+        (identity, vector["identity"].clone())
+    }
+
+    #[test]
+    fn v3_identity_bytes_round_trip() {
+        let (identity, _) = fixture_identity_v3();
+        let bytes = identity.to_identity_bytes().unwrap();
+        let as_value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(as_value["v"], json!(3));
+
+        match parse_identity(&bytes).unwrap() {
+            ParsedIdentity::Structured(back) => {
+                assert_eq!(back, identity);
+                assert_eq!(back.version, IdentityVersion::V3);
+                assert_eq!(
+                    back.person_id(),
+                    Some("019f3c2a-5e71-7b04-a8d3-4e1f9c6b2a85")
+                );
+            }
+            ParsedIdentity::Legacy(_) => panic!("v3 identity parsed as legacy"),
+        }
+    }
+
+    #[test]
+    fn the_person_vector_names_its_pin_subject_and_member_identity() {
+        // The vector carries both strings so the phone (over FFI) and
+        // the operator check the same bytes this crate produces.
+        let (identity, expected) = fixture_identity_v3();
+        assert_eq!(expected["v"], json!(3));
+        assert_eq!(
+            identity.pin_subject().unwrap(),
+            expected["pin_subject"].as_str().unwrap()
+        );
+        assert_eq!(
+            identity.member_identity().unwrap(),
+            expected["member_identity"].as_str().unwrap().as_bytes()
+        );
+        assert_eq!(
+            super::split_pin_subject(&identity.pin_subject().unwrap()),
+            Some((
+                "alice.humans.airdress.co",
+                Some("019f3c2a-5e71-7b04-a8d3-4e1f9c6b2a85")
+            ))
+        );
+    }
+
+    #[test]
+    fn owner_forms_keep_the_bare_airdress_as_their_pin_subject() {
+        let v1 = fixture_identity();
+        let v2 = fixture_identity_v2();
+        assert_eq!(v1.pin_subject().unwrap(), "alice.humans.airdress.co");
+        assert_eq!(v2.pin_subject().unwrap(), v2.airdress);
+        assert_eq!(
+            super::split_pin_subject("alice.humans.airdress.co"),
+            Some(("alice.humans.airdress.co", None))
+        );
+    }
+
+    #[test]
+    fn a_pin_subject_no_identity_produces_does_not_split() {
+        for bad in ["", "\u{1f}p", "a\u{1f}", "a\u{1f}p\u{1f}d"] {
+            assert_eq!(super::split_pin_subject(bad), None, "{bad:?}");
+        }
+    }
+
     #[test]
     fn version_is_inferred_from_the_delegations_own_fields() {
         let v1 = fixture_identity();
@@ -1359,6 +1623,23 @@ mod tests {
         let inferred_v2 =
             AirdressIdentity::from_delegation(v2.airdress, v2.root_public_key, v2.delegation);
         assert_eq!(inferred_v2.version, IdentityVersion::V2);
+
+        let (v3, _) = fixture_identity_v3();
+        let inferred_v3 = AirdressIdentity::from_delegation(
+            v3.airdress.clone(),
+            v3.root_public_key,
+            v3.delegation.clone(),
+        );
+        assert_eq!(inferred_v3.version, IdentityVersion::V3);
+
+        // `person_id` decides on its own: without an expiry the
+        // delegation is a malformed v3, never a v1 pinned under the
+        // bare airdress.
+        let mut no_expiry = v3.delegation;
+        no_expiry.remove("expires_at");
+        let inferred =
+            AirdressIdentity::from_delegation(v3.airdress, v3.root_public_key, no_expiry);
+        assert_eq!(inferred.version, IdentityVersion::V3);
     }
 
     #[test]
@@ -1396,16 +1677,26 @@ mod tests {
 
     #[test]
     fn unknown_version_is_an_error_not_a_silent_downgrade() {
-        // A future v:3 must fail loudly rather than be demoted to a
+        // A future v:4 must fail loudly rather than be demoted to a
         // bare-string airdress, which would drop every check.
+        let bytes = br#"{"v":4,"airdress":"alice.test","root_public_key":"","delegation":{}}"#;
+        assert!(parse_identity(bytes).is_err());
+    }
+
+    #[test]
+    fn a_malformed_v3_is_refused() {
+        // `v: 3` is a known version now; known means held to its
+        // fields, never demoted to legacy.
         let bytes = br#"{"v":3,"airdress":"alice.test","root_public_key":"","delegation":{}}"#;
         assert!(parse_identity(bytes).is_err());
+        assert!(parse_identity(br#"{"v":3,"airdress":"alice.test"}"#).is_err());
     }
 
     #[test]
     fn versioned_object_with_bad_fields_is_an_error_not_legacy() {
         assert!(parse_identity(br#"{"v":1,"airdress":"alice.test"}"#).is_err());
         assert!(parse_identity(br#"{"v":2,"airdress":"alice.test"}"#).is_err());
+        assert!(parse_identity(br#"{"v":3,"airdress":"alice.test"}"#).is_err());
     }
 
     #[test]
@@ -2125,5 +2416,321 @@ mod tests {
         fn now_unix_seconds_checked(&self) -> Option<u64> {
             None
         }
+    }
+
+    // -- v: 3, a person of the airdress other than its owner --
+
+    const AIRDRESS: &str = "alice.humans.airdress.co";
+    const SAM: &str = "019f3c2a-5e71-7b04-a8d3-4e1f9c6b2a85";
+    const ROBIN: &str = "019f3c2a-6a10-7d55-9e02-b3c4d5e6f708";
+
+    /// A `v: 3` identity for one device of `person_id`, signed by
+    /// `person_root`: `(identity, session_pub)`.
+    fn v3_identity(
+        person_root: &SigningKey,
+        person_id: &str,
+        session_seed: u8,
+        device_id: &str,
+    ) -> (AirdressIdentity, [u8; 32]) {
+        let session = SigningKey::from_bytes(&[session_seed; 32]);
+        let session_pub = session.verifying_key().to_bytes();
+        let json = super::test_support::signed_delegation_json_v3(
+            person_root,
+            AIRDRESS,
+            person_id,
+            &session_pub,
+            device_id,
+            FAR_FUTURE,
+        );
+        let delegation: Value = serde_json::from_str(&json).unwrap();
+        (
+            AirdressIdentity::from_delegation(
+                AIRDRESS.to_owned(),
+                person_root.verifying_key().to_bytes(),
+                delegation.as_object().unwrap().clone(),
+            ),
+            session_pub,
+        )
+    }
+
+    /// What a recording lookup was asked for.
+    type Asked = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A root lookup that answers exactly one subject, and records
+    /// every subject it was asked for.
+    fn one_subject_lookup(
+        subject: String,
+        root: [u8; 32],
+    ) -> (impl Fn(&str) -> Option<[u8; 32]> + Send + Sync, Asked) {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let lookup = move |s: &str| {
+            seen.lock().unwrap().push(s.to_owned());
+            (s == subject).then_some(root)
+        };
+        (lookup, asked)
+    }
+
+    #[test]
+    fn a_v3_leaf_is_checked_against_its_person_root_under_the_person_subject() {
+        let sam_root = SigningKey::from_bytes(&[0x51; 32]);
+        let (identity, session_pub) = v3_identity(&sam_root, SAM, 0x61, "sam-phone");
+        assert_eq!(identity.version, IdentityVersion::V3);
+        let subject = super::pin_subject_for_person(AIRDRESS, SAM);
+        let (lookup, asked) =
+            one_subject_lookup(subject.clone(), sam_root.verifying_key().to_bytes());
+        let active = |_: &str| Some(DeviceStatus::Active);
+        verify_identity_at(&identity, &session_pub, &lookup, Some(&active), NOW)
+            .expect("a member's device chains to the member's own root");
+        assert_eq!(*asked.lock().unwrap(), vec![subject]);
+    }
+
+    #[test]
+    fn a_v3_leaf_is_refused_by_a_host_that_only_answers_the_bare_airdress() {
+        // The host of today: it pins roots by airdress and has never
+        // heard of persons. It is asked a subject it cannot resolve
+        // and answers None, which rejects the leaf, even if the key it
+        // holds for the airdress happened to be this person's.
+        let sam_root = SigningKey::from_bytes(&[0x51; 32]);
+        let (identity, session_pub) = v3_identity(&sam_root, SAM, 0x61, "sam-phone");
+        let (lookup, _) =
+            one_subject_lookup(AIRDRESS.to_owned(), sam_root.verifying_key().to_bytes());
+        let active = |_: &str| Some(DeviceStatus::Active);
+        assert_eq!(
+            verify_identity_at(&identity, &session_pub, &lookup, Some(&active), NOW),
+            Err(CredentialVerifyError::RootKeyUnavailable)
+        );
+    }
+
+    #[test]
+    fn a_v3_leaf_is_refused_when_its_subject_holds_another_root() {
+        // The airdress root (the owner's) answered under the person's
+        // subject is a mismatch like any other.
+        let owner_root = SigningKey::from_bytes(&[11u8; 32]);
+        let sam_root = SigningKey::from_bytes(&[0x51; 32]);
+        let (identity, session_pub) = v3_identity(&sam_root, SAM, 0x61, "sam-phone");
+        let (lookup, _) = one_subject_lookup(
+            super::pin_subject_for_person(AIRDRESS, SAM),
+            owner_root.verifying_key().to_bytes(),
+        );
+        let active = |_: &str| Some(DeviceStatus::Active);
+        assert_eq!(
+            verify_identity_at(&identity, &session_pub, &lookup, Some(&active), NOW),
+            Err(CredentialVerifyError::RootKeyMismatch)
+        );
+    }
+
+    #[test]
+    fn the_owner_v2_leaf_is_still_looked_up_under_the_bare_airdress() {
+        let owner_root = SigningKey::from_bytes(&[11u8; 32]);
+        let (identity, session_pub) =
+            v2_identity(&owner_root, AIRDRESS, 22, "owner-phone", FAR_FUTURE);
+        let (lookup, asked) =
+            one_subject_lookup(AIRDRESS.to_owned(), owner_root.verifying_key().to_bytes());
+        let active = |_: &str| Some(DeviceStatus::Active);
+        verify_identity_at(&identity, &session_pub, &lookup, Some(&active), NOW)
+            .expect("v2 verification is unchanged");
+        assert_eq!(*asked.lock().unwrap(), vec![AIRDRESS.to_owned()]);
+    }
+
+    #[test]
+    fn a_separator_byte_in_the_person_id_is_refused() {
+        let sam_root = SigningKey::from_bytes(&[0x51; 32]);
+        let (identity, session_pub) = v3_identity(&sam_root, "sam\u{1f}robin", 0x61, "sam-phone");
+        assert!(matches!(
+            identity.pin_subject(),
+            Err(CredentialVerifyError::Malformed(_))
+        ));
+        assert!(matches!(
+            identity.member_identity(),
+            Err(CredentialVerifyError::Malformed(_))
+        ));
+        let lookup = |_: &str| Some(sam_root.verifying_key().to_bytes());
+        let active = |_: &str| Some(DeviceStatus::Active);
+        assert!(matches!(
+            verify_identity_at(&identity, &session_pub, &lookup, Some(&active), NOW),
+            Err(CredentialVerifyError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn a_v3_without_its_fields_is_refused() {
+        let sam_root = SigningKey::from_bytes(&[0x51; 32]);
+        let lookup = |_: &str| Some(sam_root.verifying_key().to_bytes());
+        let active = |_: &str| Some(DeviceStatus::Active);
+        let (identity, session_pub) = v3_identity(&sam_root, SAM, 0x61, "sam-phone");
+
+        // An empty person_id: no subject to pin under. (The field is
+        // inside the signature, so this fails before check 1 would.)
+        let mut empty = identity.clone();
+        empty
+            .delegation
+            .insert("person_id".to_owned(), Value::from(""));
+        assert!(matches!(
+            empty.pin_subject(),
+            Err(CredentialVerifyError::Malformed(_))
+        ));
+
+        // A v3 that names no device: no member identity, no revocation key.
+        let mut no_device = identity.clone();
+        no_device.delegation.remove("device_id");
+        assert_eq!(
+            no_device.member_identity(),
+            Err(CredentialVerifyError::MissingDeviceId)
+        );
+
+        // A v3 with no expiry, re-signed so check 1 passes and the
+        // expiry rule is what refuses it.
+        let mut obj = identity.delegation;
+        obj.remove("signature");
+        obj.remove("expires_at");
+        let canonical = crate::canonical::canonical_delegation_bytes(&obj).unwrap();
+        let sig = ed25519_dalek::Signer::sign(&sam_root, &canonical);
+        obj.insert(
+            "signature".to_owned(),
+            Value::from({
+                use base64::Engine as _;
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes())
+            }),
+        );
+        let no_expiry = AirdressIdentity::from_delegation(
+            AIRDRESS.to_owned(),
+            sam_root.verifying_key().to_bytes(),
+            obj,
+        );
+        assert_eq!(no_expiry.version, IdentityVersion::V3);
+        assert_eq!(
+            verify_identity_at(&no_expiry, &session_pub, &lookup, Some(&active), NOW),
+            Err(CredentialVerifyError::Malformed(
+                "v3 delegation missing expires_at".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_revoked_member_device_is_refused_by_device_id() {
+        let sam_root = SigningKey::from_bytes(&[0x51; 32]);
+        let (identity, session_pub) = v3_identity(&sam_root, SAM, 0x61, "sam-phone");
+        let lookup = |_: &str| Some(sam_root.verifying_key().to_bytes());
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = asked.clone();
+        let revoked = move |d: &str| {
+            seen.lock().unwrap().push(d.to_owned());
+            Some(DeviceStatus::Revoked)
+        };
+        assert_eq!(
+            verify_identity_at(&identity, &session_pub, &lookup, Some(&revoked), NOW),
+            Err(CredentialVerifyError::DeviceRevoked)
+        );
+        assert_eq!(*asked.lock().unwrap(), vec!["sam-phone".to_owned()]);
+    }
+
+    #[test]
+    fn member_identities_of_owner_and_persons_never_collide() {
+        let owner_root = SigningKey::from_bytes(&[11u8; 32]);
+        let sam_root = SigningKey::from_bytes(&[0x51; 32]);
+        let robin_root = SigningKey::from_bytes(&[0x52; 32]);
+        // The same device id under three people.
+        let (owner, owner_pub) = v2_identity(&owner_root, AIRDRESS, 22, "phone-1", FAR_FUTURE);
+        let (sam, sam_pub) = v3_identity(&sam_root, SAM, 0x61, "phone-1");
+        let (robin, robin_pub) = v3_identity(&robin_root, ROBIN, 0x62, "phone-1");
+
+        let provider = AirdressIdentityProvider::new();
+        let ext = mls_rs::ExtensionList::default();
+        let ids = [
+            provider
+                .identity(&leaf_for(&owner, &owner_pub), &ext)
+                .unwrap(),
+            provider.identity(&leaf_for(&sam, &sam_pub), &ext).unwrap(),
+            provider
+                .identity(&leaf_for(&robin, &robin_pub), &ext)
+                .unwrap(),
+        ];
+        assert_ne!(ids[0], ids[1]);
+        assert_ne!(ids[0], ids[2]);
+        assert_ne!(ids[1], ids[2]);
+        assert_eq!(
+            ids[1],
+            [
+                AIRDRESS.as_bytes(),
+                &[IDENTITY_SEPARATOR],
+                SAM.as_bytes(),
+                &[IDENTITY_SEPARATOR],
+                b"phone-1"
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn valid_successor_refuses_across_versions_and_across_persons() {
+        let sam_root = SigningKey::from_bytes(&[0x51; 32]);
+        let provider = AirdressIdentityProvider::new();
+        let ext = mls_rs::ExtensionList::default();
+        let (sam, sam_pub) = v3_identity(&sam_root, SAM, 0x61, "phone-1");
+
+        // The same device re-delegated by the same person: still the member.
+        let (sam_again, sam_again_pub) = v3_identity(&sam_root, SAM, 0x63, "phone-1");
+        assert!(
+            provider
+                .valid_successor(
+                    &leaf_for(&sam, &sam_pub),
+                    &leaf_for(&sam_again, &sam_again_pub),
+                    &ext
+                )
+                .unwrap()
+        );
+
+        // Same device id, same root, another person: a different member.
+        let (other, other_pub) = v3_identity(&sam_root, ROBIN, 0x61, "phone-1");
+        assert!(
+            !provider
+                .valid_successor(
+                    &leaf_for(&sam, &sam_pub),
+                    &leaf_for(&other, &other_pub),
+                    &ext
+                )
+                .unwrap()
+        );
+
+        // Same device id, same root, as v2: a different form, never a successor,
+        // in either direction.
+        let (as_v2, as_v2_pub) = v2_identity(&sam_root, AIRDRESS, 0x61, "phone-1", FAR_FUTURE);
+        assert!(
+            !provider
+                .valid_successor(
+                    &leaf_for(&as_v2, &as_v2_pub),
+                    &leaf_for(&sam, &sam_pub),
+                    &ext
+                )
+                .unwrap()
+        );
+        assert!(
+            !provider
+                .valid_successor(
+                    &leaf_for(&sam, &sam_pub),
+                    &leaf_for(&as_v2, &as_v2_pub),
+                    &ext
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn v3_is_a_live_form_past_the_cutover() {
+        let sam_root = SigningKey::from_bytes(&[0x51; 32]);
+        let (sam, sam_pub) = v3_identity(&sam_root, SAM, 0x61, "sam-phone");
+        let sam_root_pub = sam_root.verifying_key().to_bytes();
+        let subject = super::pin_subject_for_person(AIRDRESS, SAM);
+        let provider = AirdressIdentityProvider::new();
+        provider.set_root_key_lookup(std::sync::Arc::new(move |s: &str| {
+            (s == subject).then_some(sam_root_pub)
+        }));
+        provider.set_clock(std::sync::Arc::new(FixedClock(NOW)));
+        provider.set_revocation_lookup(std::sync::Arc::new(|_: &str| Some(DeviceStatus::Active)));
+        provider.set_v2_cutover();
+        provider
+            .validate_external_sender(&leaf_for(&sam, &sam_pub), None, None)
+            .expect("a member's leaf validates past the cutover");
     }
 }
