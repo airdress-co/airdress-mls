@@ -10,13 +10,17 @@ use std::path::{Path, PathBuf};
 
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng, Payload, rand_core::RngCore};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use zeroize::Zeroizing;
 
 const NONCE_LEN: usize = 12;
 
 /// A sealed file at one path, under one key, for one purpose.
+///
+/// Holds a copy of the host's state key, wiped when the file handle is
+/// dropped (rust guide R-TYP-8).
 pub(crate) struct SealedFile {
     path: PathBuf,
-    key: [u8; 32],
+    key: Zeroizing<[u8; 32]>,
     label: &'static [u8],
 }
 
@@ -24,7 +28,7 @@ impl SealedFile {
     pub(crate) fn new(path: PathBuf, key: &[u8; 32], label: &'static [u8]) -> Self {
         Self {
             path,
-            key: *key,
+            key: Zeroizing::new(*key),
             label,
         }
     }
@@ -33,6 +37,10 @@ impl SealedFile {
     ///
     /// A file that exists and does not open is an error, never an empty
     /// value: starting over from nothing would forget every group.
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "an AEAD failure is opaque by design; the message says what happened"
+    )]
     pub(crate) fn read(&self) -> Result<Option<Vec<u8>>, String> {
         let bytes = match std::fs::read(&self.path) {
             Ok(b) => b,
@@ -43,7 +51,7 @@ impl SealedFile {
             return Err(format!("{} is truncated", self.path.display()));
         }
         let (nonce, body) = bytes.split_at(NONCE_LEN);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(self.key.as_slice()));
         cipher
             .decrypt(
                 Nonce::from_slice(nonce),
@@ -63,10 +71,14 @@ impl SealedFile {
 
     /// Seal and write, atomically: a crash leaves the old file or the
     /// new one, never half of either.
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "an AEAD failure is opaque by design; the message says what happened"
+    )]
     pub(crate) fn write(&self, plaintext: &[u8]) -> Result<(), String> {
         let mut nonce = [0u8; NONCE_LEN];
         OsRng.fill_bytes(&mut nonce);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(self.key.as_slice()));
         let body = cipher
             .encrypt(
                 Nonce::from_slice(&nonce),

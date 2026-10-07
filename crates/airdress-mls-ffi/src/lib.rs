@@ -13,11 +13,6 @@
 //! both directions, so an export added here without the list (or the
 //! other way round) fails before it reaches a phone.
 
-// Every unsafe operation is spelled out and justified where it happens,
-// and every unsafe fn says what its caller owes (rust guide R-UNS-2).
-#![deny(unsafe_op_in_unsafe_fn)]
-#![deny(clippy::undocumented_unsafe_blocks, clippy::missing_safety_doc)]
-
 // `catch_unwind` around every export is what keeps a Rust panic from
 // unwinding into Dart. Built with `panic = "abort"` it catches nothing,
 // and a panic on hostile input aborts the app again — so that build is
@@ -28,8 +23,16 @@ compile_error!(
 );
 
 // The FFI layer requires unsafe at the C boundary; the engine it wraps
-// (in `airdress-mls`) remains safe Rust.
-#[allow(unsafe_code)]
+// (in `airdress-mls`) remains safe Rust. Its exports are `pub` so they
+// can be `extern "C"` symbols, not so Rust can name them.
+#[expect(
+    unsafe_code,
+    reason = "the C ABI: raw pointers in, raw pointers out (R-UNS-1)"
+)]
+#[expect(
+    unreachable_pub,
+    reason = "the exports are reached by the dynamic linker, not by a Rust path"
+)]
 mod ffi;
 
 pub use airdress_mls::*;

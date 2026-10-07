@@ -53,6 +53,7 @@ pub const MAX_DEVICE_LABEL_CHARS: usize = 80;
 /// What the root is asked to sign about one agent device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDelegationRequest<'a> {
+    /// The airdress the agent device joins; the root signing is its root.
     pub airdress: &'a str,
     /// `[A-Za-z0-9-]{1,64}`; a UUID fits.
     pub device_id: &'a str,

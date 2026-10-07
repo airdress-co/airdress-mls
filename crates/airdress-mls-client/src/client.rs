@@ -162,6 +162,13 @@ pub struct Client {
     directory: Directory,
 }
 
+impl core::fmt::Debug for Client {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Sealed content and the key it is sealed under stay out of logs.
+        f.debug_struct("Client").finish_non_exhaustive()
+    }
+}
+
 impl Client {
     /// Wrap an engine; open the directory in `state_dir` under the same
     /// key the engine's state is sealed with.

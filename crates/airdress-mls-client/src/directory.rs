@@ -44,6 +44,13 @@ pub struct Directory {
     doc: Doc,
 }
 
+impl core::fmt::Debug for Directory {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Sealed content and the key it is sealed under stay out of logs.
+        f.debug_struct("Directory").finish_non_exhaustive()
+    }
+}
+
 impl Directory {
     /// Open (or start) the directory in `dir`.
     ///
