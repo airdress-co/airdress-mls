@@ -214,6 +214,28 @@
         "device_label": "Claude Code on build-host",
         "issued_at_unix": 1791201600
       }
+    },
+    {
+      "name": "nested-object-keys-unsorted-in-source",
+      "root_seed_b64url": "Dg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4",
+      "root_public_key_b64url": "C-71qeZ55qPhNP4ng3v_MsfLX11E6gm8sOVCutakwMw",
+      "canonical_b64url": "eyJhaXJkcmVzcyI6Im5pbmEuaHVtYW5zLmFpcmRyZXNzLmNvIiwiY2FwYWJpbGl0aWVzIjp7ImFscGhhIjoyLCJiZXRhIjoieCIsInpldGEiOnsiYWEiOjIsIm1tIjpbMyx7ImIiOmZhbHNlLCJ5Ijp0cnVlfV0sInp6IjoxfX0sImRldmljZV9zZXNzaW9uX3B1YmxpY19rZXkiOiJubm5uIiwiaXNzdWVkX2F0IjoiMjAyNi0wNC0xMVQwOTo0NTowMFoiLCJyb2xlIjoiaHVtYW5faGVsZCJ9",
+      "delegation": {
+        "role": "human_held",
+        "issued_at": "2026-04-11T09:45:00Z",
+        "device_session_public_key": "nnnn",
+        "capabilities": {
+          "zeta": {
+            "zz": 1,
+            "aa": 2,
+            "mm": [3, {"y": true, "b": false}]
+          },
+          "alpha": 2,
+          "beta": "x"
+        },
+        "airdress": "nina.humans.airdress.co",
+        "signature": "Udew3Sqxj3FSl94I2iUMOeXNPzmxQq9r8lo6AXLzts8gU4QKFRg6uMROKP4WC4MR3vdbLIpk_EQdELg-AmLtDA"
+      }
     }
   ]
 }
