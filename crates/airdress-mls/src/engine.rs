@@ -136,6 +136,21 @@ impl From<&str> for EngineError {
     }
 }
 
+/// The MLS group id a message carries in its framing, in the clear.
+///
+/// RFC 9420 puts `group_id` in `PrivateMessage` and `PublicMessage`
+/// outside the encryption, so this needs no key and no engine: a
+/// receiver files a message by the group it names, which MLS then
+/// authenticates on decrypt. A Welcome carries none (the group's
+/// identity is inside the encrypted `GroupInfo`) and is an error, as is
+/// anything that does not parse.
+pub fn message_group_id(message: &[u8]) -> Result<Vec<u8>, String> {
+    let msg = MlsMessage::from_bytes(message).map_err(|e| format!("bad message: {e}"))?;
+    msg.group_id()
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| "this message carries no group id in its framing".to_owned())
+}
+
 /// Pool size established at first init, matching the operator-side
 /// KeyPackage count. A package whose private half is lost is a
 /// Welcome the client can never join, so the private halves (and the

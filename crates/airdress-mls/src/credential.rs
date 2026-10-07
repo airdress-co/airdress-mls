@@ -679,7 +679,7 @@ fn verify_chain(
 /// Returns `None` for anything else, including timestamps before
 /// 1970: a delegation cannot legitimately expire then, and returning
 /// a clamped value would silently accept one.
-fn parse_rfc3339_seconds(s: &str) -> Option<u64> {
+pub(crate) fn parse_rfc3339_seconds(s: &str) -> Option<u64> {
     let b = s.as_bytes();
     if b.len() < 20 {
         return None;

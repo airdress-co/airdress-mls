@@ -332,7 +332,11 @@ impl GroupRecord {
         let state_len = u32::from_le_bytes(take(&mut cursor, 4)?.try_into().map_err(|_| err())?);
         let state = take(&mut cursor, state_len as usize)?;
         let count = u32::from_le_bytes(take(&mut cursor, 4)?.try_into().map_err(|_| err())?);
-        let mut epochs = Vec::with_capacity(count as usize);
+        // The count is read from the record, so it only bounds the loop:
+        // every entry takes at least 12 bytes, and reserving for more than
+        // the bytes left could hold is an allocation the input chose (the
+        // group-record fuzz target found a 110 GB one).
+        let mut epochs = Vec::with_capacity((count as usize).min(cursor.len() / 12));
         for _ in 0..count {
             let id = u64::from_le_bytes(take(&mut cursor, 8)?.try_into().map_err(|_| err())?);
             let len = u32::from_le_bytes(take(&mut cursor, 4)?.try_into().map_err(|_| err())?);
@@ -341,7 +345,25 @@ impl GroupRecord {
                 data: take(&mut cursor, len as usize)?,
             });
         }
+        // `encode` never writes past the last epoch, so bytes after it
+        // are not a record this code wrote (found by the fuzz target).
+        if !cursor.is_empty() {
+            return Err(StorageError("group record has trailing bytes".to_owned()));
+        }
         Ok(Self { state, epochs })
+    }
+}
+
+/// The group-record decoder's fuzz entry (`fuzz/`): whatever decodes
+/// re-encodes to exactly the input.
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_group_record(bytes: &[u8]) {
+    if let Ok(record) = GroupRecord::decode(bytes) {
+        assert_eq!(
+            record.encode(),
+            bytes,
+            "a decoded record re-encodes to its input"
+        );
     }
 }
 
@@ -660,6 +682,14 @@ mod tests {
         assert_eq!(back.state, record.state);
         assert_eq!(back.epochs, record.epochs);
         assert!(GroupRecord::decode(&[]).is_err());
+        // A huge epoch count with nothing behind it is truncated, not an
+        // attempt to allocate for it.
+        let mut lying = vec![GROUP_RECORD_VERSION, 0, 0, 0, 0];
+        lying.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(GroupRecord::decode(&lying).is_err());
+        let mut trailing = record.encode();
+        trailing.push(0);
+        assert!(GroupRecord::decode(&trailing).is_err());
         assert!(GroupRecord::decode(&[2]).is_err());
     }
 

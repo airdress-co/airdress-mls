@@ -1311,15 +1311,7 @@ pub unsafe extern "C" fn airdress_mls_message_group_id(
             Ok(m) => m,
             Err(e) => return FfiBytes::err(e),
         };
-        match mls_rs::MlsMessage::from_bytes(message) {
-            Ok(msg) => match msg.group_id() {
-                Some(gid) => FfiBytes::ok(gid.to_vec()),
-                None => FfiBytes::err(String::from(
-                    "this message carries no group id in its framing",
-                )),
-            },
-            Err(e) => FfiBytes::err(format!("bad message: {e}")),
-        }
+        FfiBytes::from_result(airdress_mls::engine::message_group_id(message))
     })
 }
 
@@ -2812,5 +2804,51 @@ mod tests {
         unsafe { super::airdress_mls_free_error(raw) };
         assert_eq!(super::airdress_mls_error_code(raw), -1);
         assert_eq!(super::airdress_mls_error_code(std::ptr::null()), 0);
+    }
+
+    /// The argument checks on their own, with no engine: what the Miri
+    /// lane in CI runs, because these are the raw-pointer paths
+    /// (rust guide R-UNS-5) and an engine is too slow under Miri.
+    #[test]
+    fn arguments_are_checked_before_they_are_read() {
+        use super::{borrowed, required_key32, required_str};
+
+        let bytes = [1u8, 2, 3];
+        // SAFETY: a live array with its own length.
+        assert_eq!(unsafe { borrowed(bytes.as_ptr(), 3, "b") }.unwrap(), &bytes);
+        // SAFETY: null with length 0, the empty input.
+        let empty = unsafe { borrowed(std::ptr::null(), 0, "b") };
+        assert!(empty.unwrap().is_empty());
+        // SAFETY: refused before any read.
+        assert!(unsafe { borrowed(std::ptr::null(), 1, "b") }.is_err());
+        // SAFETY: a live pointer; the length is refused before any read.
+        assert!(unsafe { borrowed(bytes.as_ptr(), usize::MAX, "b") }.is_err());
+
+        let key = [7u8; 32];
+        // SAFETY: a live 32-byte array.
+        let copied = unsafe { required_key32(key.as_ptr(), 32, "k") };
+        assert_eq!(copied.unwrap(), key);
+        // SAFETY: refused on length before any read.
+        assert!(unsafe { required_key32(key.as_ptr(), 31, "k") }.is_err());
+        // SAFETY: refused before any read.
+        assert!(unsafe { required_key32(std::ptr::null(), 32, "k") }.is_err());
+
+        let name = CString::new("alice").unwrap();
+        // SAFETY: a live C string.
+        let read = unsafe { required_str(name.as_ptr(), "s") };
+        assert_eq!(read.unwrap(), "alice");
+        // SAFETY: refused before any read.
+        assert!(unsafe { required_str(std::ptr::null(), "s") }.is_err());
+        let bad = [0xffu8, 0];
+        // SAFETY: a live NUL-terminated byte string.
+        assert!(unsafe { required_str(bad.as_ptr().cast(), "s") }.is_err());
+
+        // An error string round-trips through the code table and the free.
+        let raw = FfiBytes::err(String::from("x")).error;
+        assert_eq!(super::airdress_mls_error_code(raw), 1);
+        // SAFETY: an error this crate made, freed once.
+        unsafe { super::airdress_mls_free_error(raw) };
+        let ok = FfiBytes::ok(vec![1, 2]);
+        assert_eq!(take_buffer(ok.ptr, ok.len), [1, 2]);
     }
 }

@@ -18,13 +18,13 @@ jobs:
     timeout-minutes: 20
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # The hygiene scan reads every commit, not the tip.
           fetch-depth: 0
       # rust-toolchain.toml pins the compiler; this installs it.
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # No private dependency and no credential: every dependency is on
       # crates.io, which is what lets a public checkout build.
       - run: cargo fmt --all --check
@@ -45,6 +45,10 @@ jobs:
             || { echo "$features"; echo "::error::chacha20 is built without zeroize"; exit 1; }
       - name: Tests (all three crates)
         run: cargo test --workspace --locked
+      - name: Docs build without a warning (rust guide R-LNT-5)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --document-private-items --locked
       - name: Document numbers stay out of code
         run: scripts/check-doc-numbers.sh
       - name: No internal names, in the tree or the history
@@ -59,9 +63,9 @@ jobs:
     timeout-minutes: 20
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Named, so a filter that stops matching shows up as "0 passed"
       # here rather than as a quietly shorter suite.
       - name: Delegation vectors (canonical bytes and signatures)
@@ -88,7 +92,7 @@ jobs:
     timeout-minutes: 15
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: rustup toolchain install
       # The pinned binary, not EmbarkStudios/cargo-deny-action: that
       # action runs in a container, and in airdress-cli its inability to
@@ -106,3 +110,96 @@ jobs:
           tar xzf "$tarball" --strip-components=1 \
             "cargo-deny-${DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny"
           ./cargo-deny --all-features check licenses advisories bans sources
+
+  semver:
+    # The engine and the client crate are linked by the operator and the
+    # CLI at a tag: an API break without a version bump fails here
+    # (rust guide R-API-6). The FFI crate's Rust API is not its contract;
+    # scripts/check-symbols.sh holds the C one.
+    name: Semver against the base
+    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install
+      - name: cargo-semver-checks, pinned binary
+        env:
+          SEMVER_CHECKS_VERSION: v0.51.0
+          SEMVER_CHECKS_SHA256: 396c8508d973c83de52660943a057e971b586f7511c3ba695762373452b43d5b
+        run: |
+          set -euo pipefail
+          tarball=cargo-semver-checks-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL -o "$tarball" \
+            "https://github.com/obi1kenobi/cargo-semver-checks/releases/download/${SEMVER_CHECKS_VERSION}/${tarball}"
+          echo "${SEMVER_CHECKS_SHA256}  ${tarball}" | sha256sum -c -
+          tar xzf "$tarball" cargo-semver-checks
+      - name: Engine and client against the base revision
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: ./cargo-semver-checks semver-checks -p airdress-mls -p airdress-mls-client --baseline-rev "$BASE"
+
+  msrv:
+    # rust-version is the one place the MSRV lives (rust guide R-API-7);
+    # the pinned toolchain is newer, so this is the only build that sees
+    # the oldest compiler a consumer may use.
+    name: Build on the MSRV
+    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build with exactly rust-version
+        run: |
+          set -euo pipefail
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          rustup toolchain install "$msrv" --profile minimal
+          cargo "+$msrv" build --workspace --locked
+
+  miri:
+    # The pure parsers, the sealed-record codec and the FFI's argument
+    # checks under Miri (rust guide R-UNS-5). Anything that builds an MLS
+    # engine or touches the filesystem is left out: Miri runs those in
+    # hours, not minutes, and the raw-pointer paths are all in the
+    # argument checks.
+    name: Miri over the parsers and the FFI argument checks
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup toolchain install nightly --profile minimal --component miri,rust-src
+      - name: airdress-mls parsers and record codec
+        run: |
+          cargo +nightly miri test --locked -p airdress-mls --lib -- \
+            canonical::tests::maps_serialise_sorted_whatever_the_insertion_order \
+            storage::tests::group_record_round_trip \
+            credential::tests::legacy_bare_string_still_parses \
+            credential::tests::json_object_without_a_version_is_legacy \
+            credential::tests::versioned_object_with_bad_fields_is_an_error_not_legacy \
+            credential::tests::rfc3339
+      - name: FFI argument checks and buffers
+        run: |
+          cargo +nightly miri test --locked -p airdress-mls-ffi --lib -- \
+            ffi::tests::arguments_are_checked_before_they_are_read
+
+  fuzz:
+    # Every parser of bytes a peer or a disk chose has a target (rust
+    # guide R-TST-3). CI builds them all and runs each briefly; a longer
+    # run is `cargo +nightly fuzz run <target>` from fuzz/.
+    name: Fuzz targets, built and run briefly
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup toolchain install nightly --profile minimal
+      - run: cargo +nightly install cargo-fuzz --version 0.13.2 --locked
+      - name: Build every target
+        working-directory: fuzz
+        run: cargo +nightly fuzz build
+      - name: Run each for 30 seconds
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          for target in $(cargo +nightly fuzz list); do
+            cargo +nightly fuzz run "$target" -- -max_total_time=30
+          done
