@@ -10,6 +10,16 @@
 //!   them; only use values returned by
 //!   `airdress_mls_create_engine_from_seed`.
 //!
+//! ## Error codes
+//!
+//! Every non-null `error` string has a stable code, read with
+//! `airdress_mls_error_code(error)` before the string is freed. The
+//! values are [`ErrorCode`]'s and never change; branch on them, never on
+//! the message. `5` (`EpochUnavailable`) is the trimmed-epoch case whose
+//! message reads "this message is older than the keys still on this
+//! device". The result structs are unchanged: a field would have moved
+//! every byte of `FfiBytesList` under apps already in the field.
+//!
 //! ## Safety contract
 //!
 //! Every `unsafe extern "C"` function below relies on its caller — the
@@ -60,7 +70,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-use airdress_mls::engine::{CommitOutcome, MlsEngine};
+use airdress_mls::engine::{CommitOutcome, EngineError, ErrorCode, MlsEngine};
 
 // ---------------------------------------------------------------------------
 // Handle table
@@ -104,14 +114,17 @@ fn with_engine<T>(
     }
 }
 
-/// The text of a caught panic, for the error the caller sees.
-fn panic_message(payload: &(dyn Any + Send)) -> String {
+/// The error a caught panic becomes.
+fn panic_error(payload: &(dyn Any + Send)) -> FfiError {
     let detail = payload
         .downcast_ref::<&str>()
         .map(|s| (*s).to_owned())
         .or_else(|| payload.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "no message".to_owned());
-    format!("internal error in airdress-mls (a panic was caught): {detail}")
+    FfiError::new(
+        ErrorCode::Internal,
+        format!("internal error in airdress-mls (a panic was caught): {detail}"),
+    )
 }
 
 /// Run an export's body, turning a panic into `on_panic(message)`.
@@ -119,9 +132,8 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 /// `AssertUnwindSafe` is sound here because nothing the closure borrows
 /// is observed after a panic except through [`engines`], whose
 /// recovery is argued there.
-fn guarded<T>(on_panic: impl FnOnce(String) -> T, body: impl FnOnce() -> T) -> T {
-    catch_unwind(AssertUnwindSafe(body))
-        .unwrap_or_else(|payload| on_panic(panic_message(&*payload)))
+fn guarded<T>(on_panic: impl FnOnce(FfiError) -> T, body: impl FnOnce() -> T) -> T {
+    catch_unwind(AssertUnwindSafe(body)).unwrap_or_else(|payload| on_panic(panic_error(&*payload)))
 }
 
 // ---------------------------------------------------------------------------
@@ -138,19 +150,23 @@ fn guarded<T>(on_panic: impl FnOnce(String) -> T, body: impl FnOnce() -> T) -> T
 ///
 /// `ptr` is null, or points to `len` initialised bytes that stay valid
 /// and are not written for `'a` (contract 1).
-unsafe fn borrowed<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], String> {
+unsafe fn borrowed<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], FfiError> {
     if ptr.is_null() {
         return if len == 0 {
             Ok(&[])
         } else {
-            Err(format!("{name} is null with a length of {len}"))
+            Err(FfiError::invalid_argument(format!(
+                "{name} is null with a length of {len}"
+            )))
         };
     }
     // No allocation is larger than `isize::MAX` bytes, so such a length is
     // the caller's mistake; `from_raw_parts` would be undefined behaviour
     // (and a process abort in a debug build) rather than an error.
     if isize::try_from(len).is_err() {
-        return Err(format!("{name} has an impossible length {len}"));
+        return Err(FfiError::invalid_argument(format!(
+            "{name} has an impossible length {len}"
+        )));
     }
     // SAFETY: `ptr` is non-null; the caller guarantees it points to `len`
     // initialised bytes that live and stay unwritten for `'a`; `u8` needs
@@ -164,15 +180,15 @@ unsafe fn borrowed<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8
 ///
 /// `ptr` is null, or points to a NUL-terminated string that stays valid
 /// and unwritten for `'a` (contract 2).
-unsafe fn required_str<'a>(ptr: *const c_char, name: &str) -> Result<&'a str, String> {
+unsafe fn required_str<'a>(ptr: *const c_char, name: &str) -> Result<&'a str, FfiError> {
     if ptr.is_null() {
-        return Err(format!("{name} is null"));
+        return Err(FfiError::invalid_argument(format!("{name} is null")));
     }
     // SAFETY: `ptr` is non-null and, per the caller's contract, points to
     // a NUL-terminated string valid and unwritten for `'a`.
     unsafe { CStr::from_ptr(ptr) }
         .to_str()
-        .map_err(|e| format!("{name} is not valid UTF-8: {e}"))
+        .map_err(|e| FfiError::invalid_argument(format!("{name} is not valid UTF-8: {e}")))
 }
 
 /// Copy a required 32-byte argument, rejecting null and wrong lengths.
@@ -183,18 +199,20 @@ unsafe fn required_str<'a>(ptr: *const c_char, name: &str) -> Result<&'a str, St
 ///
 /// As [`borrowed`]: `ptr` is null, or points to `len` initialised bytes
 /// valid and unwritten for the call (contract 1).
-unsafe fn required_key32(ptr: *const u8, len: usize, name: &str) -> Result<[u8; 32], String> {
+unsafe fn required_key32(ptr: *const u8, len: usize, name: &str) -> Result<[u8; 32], FfiError> {
     if ptr.is_null() {
-        return Err(format!("{name} is null"));
+        return Err(FfiError::invalid_argument(format!("{name} is null")));
     }
     if len != 32 {
-        return Err(format!("{name} must be 32 bytes, got {len}"));
+        return Err(FfiError::invalid_argument(format!(
+            "{name} must be 32 bytes, got {len}"
+        )));
     }
     // SAFETY: forwarded from this function's own contract.
     let slice = unsafe { borrowed(ptr, len, name) }?;
     slice
         .try_into()
-        .map_err(|e| format!("{name} length error: {e}"))
+        .map_err(|e| FfiError::invalid_argument(format!("{name} length error: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -225,10 +243,80 @@ fn into_raw_bytes(data: Vec<u8>) -> (*mut u8, usize) {
 }
 
 /// An owned C string for an `error` field, freed by
-/// `airdress_mls_free_error`. A message with an interior NUL becomes the
+/// `airdress_mls_free_error`, with its code recorded for
+/// `airdress_mls_error_code`. A message with an interior NUL becomes the
 /// empty string, which is still a non-null error.
-fn into_raw_error(msg: &str) -> *mut c_char {
-    std::ffi::CString::new(msg).unwrap_or_default().into_raw()
+fn into_raw_error(error: &FfiError) -> *mut c_char {
+    let raw = std::ffi::CString::new(error.message.as_str())
+        .unwrap_or_default()
+        .into_raw();
+    error_codes().insert(raw as usize, error.code.as_i32());
+    raw
+}
+
+/// Error strings this library has handed out and not yet had back,
+/// keyed by address, with their codes.
+///
+/// A side table rather than a field: `FfiBytes` is returned by value
+/// and laid out in arrays (`FfiBytesList`), so a new field would change
+/// its size under every app already in the field. The address of a live
+/// allocation is unique, and an entry leaves the table when its string
+/// is freed, before the allocator can hand the address out again.
+static ERROR_CODES: std::sync::LazyLock<Mutex<HashMap<usize, i32>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The error-code table, recovered if a panic poisoned it (as
+/// [`engines`]; nothing panics while holding it).
+fn error_codes() -> MutexGuard<'static, HashMap<usize, i32>> {
+    ERROR_CODES.lock().unwrap_or_else(|poisoned| {
+        ERROR_CODES.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+/// An error on its way across the boundary: a stable code for the
+/// caller to branch on and a sentence for a person or a journal.
+#[derive(Debug)]
+struct FfiError {
+    code: ErrorCode,
+    message: String,
+}
+
+impl FfiError {
+    fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn invalid_argument(message: String) -> Self {
+        Self::new(ErrorCode::InvalidArgument, message)
+    }
+
+    fn invalid_handle() -> Self {
+        Self::new(ErrorCode::InvalidHandle, "invalid handle")
+    }
+
+    /// The unbound exports' post-cutover refusal.
+    fn binding_required() -> Self {
+        Self::new(ErrorCode::BindingRequired, UNBOUND_PAST_CUTOVER)
+    }
+}
+
+/// An engine operation's `String` error: no code of its own.
+impl From<String> for FfiError {
+    fn from(message: String) -> Self {
+        Self::new(ErrorCode::Engine, message)
+    }
+}
+
+/// An engine error keeps its own code, so `EpochUnavailable` is
+/// distinguishable across the boundary without reading the sentence.
+impl From<EngineError> for FfiError {
+    fn from(error: EngineError) -> Self {
+        Self::new(error.code(), error.to_string())
+    }
 }
 
 impl FfiBytes {
@@ -241,22 +329,18 @@ impl FfiBytes {
         }
     }
 
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "takes the String every caller owns, so guarded(FfiBytes::err, ..) names it directly"
-    )]
-    fn err(msg: String) -> Self {
+    fn err(error: impl Into<FfiError>) -> Self {
         Self {
             ptr: std::ptr::null_mut(),
             len: 0,
-            error: into_raw_error(&msg),
+            error: into_raw_error(&error.into()),
         }
     }
 
-    fn from_result(result: Result<Vec<u8>, String>) -> Self {
+    fn from_result<E: Into<FfiError>>(result: Result<Vec<u8>, E>) -> Self {
         match result {
             Ok(data) => Self::ok(data),
-            Err(msg) => Self::err(msg),
+            Err(e) => Self::err(e),
         }
     }
 }
@@ -297,12 +381,12 @@ const PANIC_I64: i64 = -2;
 // Exports
 // ---------------------------------------------------------------------------
 
-fn ffi_handle_err(msg: &str) -> FfiHandleResult {
+fn ffi_handle_err(error: impl Into<FfiError>) -> FfiHandleResult {
     FfiHandleResult {
         handle_id: 0,
         public_key_ptr: std::ptr::null_mut(),
         public_key_len: 0,
-        error: into_raw_error(msg),
+        error: into_raw_error(&error.into()),
     }
 }
 
@@ -334,50 +418,48 @@ pub unsafe extern "C" fn airdress_mls_create_engine_from_seed(
     state_key: *const u8,
     state_key_len: usize,
 ) -> FfiHandleResult {
-    guarded(
-        |msg| ffi_handle_err(&msg),
-        || {
-            let parsed = (|| -> Result<MlsEngine, String> {
-                // SAFETY: each pointer is an input of the kind this
-                // function's `# Safety` names.
-                let (airdress, root, delegation, state_dir) = unsafe {
-                    (
-                        required_str(airdress, "airdress")?,
-                        required_key32(root_pubkey, root_pubkey_len, "root_pubkey")?,
-                        required_str(delegation_json, "delegation_json")?,
-                        required_str(state_dir, "state_dir")?,
-                    )
-                };
-                // The two secrets are copied onto the stack by the checks,
-                // so both copies are zeroized however the build ends.
-                // SAFETY: a byte input (contract 1).
-                let seed = zeroize::Zeroizing::new(unsafe {
-                    required_key32(session_seed, session_seed_len, "session_seed")
-                }?);
-                // SAFETY: a byte input (contract 1).
-                let key = zeroize::Zeroizing::new(unsafe {
-                    required_key32(state_key, state_key_len, "state_key")
-                }?);
-                MlsEngine::from_seed(airdress, &seed, &root, delegation, state_dir, &key)
-            })();
+    guarded(ffi_handle_err, || {
+        let parsed = (|| -> Result<MlsEngine, FfiError> {
+            // SAFETY: each pointer is an input of the kind this
+            // function's `# Safety` names.
+            let (airdress, root, delegation, state_dir) = unsafe {
+                (
+                    required_str(airdress, "airdress")?,
+                    required_key32(root_pubkey, root_pubkey_len, "root_pubkey")?,
+                    required_str(delegation_json, "delegation_json")?,
+                    required_str(state_dir, "state_dir")?,
+                )
+            };
+            // The two secrets are copied onto the stack by the checks,
+            // so both copies are zeroized however the build ends.
+            // SAFETY: a byte input (contract 1).
+            let seed = zeroize::Zeroizing::new(unsafe {
+                required_key32(session_seed, session_seed_len, "session_seed")
+            }?);
+            // SAFETY: a byte input (contract 1).
+            let key = zeroize::Zeroizing::new(unsafe {
+                required_key32(state_key, state_key_len, "state_key")
+            }?);
+            Ok(MlsEngine::from_seed(
+                airdress, &seed, &root, delegation, state_dir, &key,
+            )?)
+        })();
 
-            match parsed {
-                Ok(engine) => {
-                    let (public_key_ptr, public_key_len) =
-                        into_raw_bytes(engine.public_key().to_vec());
-                    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-                    engines().insert(id, engine);
-                    FfiHandleResult {
-                        handle_id: id,
-                        public_key_ptr,
-                        public_key_len,
-                        error: std::ptr::null_mut(),
-                    }
+        match parsed {
+            Ok(engine) => {
+                let (public_key_ptr, public_key_len) = into_raw_bytes(engine.public_key().to_vec());
+                let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                engines().insert(id, engine);
+                FfiHandleResult {
+                    handle_id: id,
+                    public_key_ptr,
+                    public_key_len,
+                    error: std::ptr::null_mut(),
                 }
-                Err(msg) => ffi_handle_err(&msg),
             }
-        },
-    )
+            Err(e) => ffi_handle_err(e),
+        }
+    })
 }
 
 /// Host-supplied root-key cache callback.
@@ -536,7 +618,7 @@ pub extern "C" fn airdress_mls_generate_key_package(handle_id: u64) -> FfiBytes 
     guarded(FfiBytes::err, || {
         with_engine(
             handle_id,
-            || FfiBytes::err("invalid handle".into()),
+            || FfiBytes::err(FfiError::invalid_handle()),
             |engine| FfiBytes::from_result(engine.generate_key_package()),
         )
     })
@@ -566,22 +648,18 @@ impl FfiBytesList {
         }
     }
 
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "takes the String every caller owns, so guarded(FfiBytesList::err, ..) names it directly"
-    )]
-    fn err(msg: String) -> Self {
+    fn err(error: impl Into<FfiError>) -> Self {
         Self {
             items: std::ptr::null_mut(),
             len: 0,
-            error: into_raw_error(&msg),
+            error: into_raw_error(&error.into()),
         }
     }
 
-    fn from_result(result: Result<Vec<Vec<u8>>, String>) -> Self {
+    fn from_result<E: Into<FfiError>>(result: Result<Vec<Vec<u8>>, E>) -> Self {
         match result {
             Ok(buffers) => Self::ok(buffers),
-            Err(msg) => Self::err(msg),
+            Err(e) => Self::err(e),
         }
     }
 
@@ -607,7 +685,7 @@ pub extern "C" fn airdress_mls_generate_key_packages(handle_id: u64, count: usiz
     guarded(FfiBytesList::err, || {
         with_engine(
             handle_id,
-            || FfiBytesList::err("invalid handle".into()),
+            || FfiBytesList::err(FfiError::invalid_handle()),
             |engine| FfiBytesList::from_result(engine.generate_key_packages(count)),
         )
     })
@@ -620,7 +698,7 @@ pub extern "C" fn airdress_mls_stored_key_packages(handle_id: u64) -> FfiBytesLi
     guarded(FfiBytesList::err, || {
         with_engine(
             handle_id,
-            || FfiBytesList::err("invalid handle".into()),
+            || FfiBytesList::err(FfiError::invalid_handle()),
             |engine| FfiBytesList::from_result(engine.stored_key_packages()),
         )
     })
@@ -706,22 +784,17 @@ pub unsafe extern "C" fn airdress_mls_start_group(
     first_msg_ptr: *const u8,
     first_msg_len: usize,
 ) -> FfiStartGroupResult {
-    guarded(
-        |msg| ffi_start_group_err(&msg),
-        || {
-            // SAFETY: two byte inputs (contract 1), per `# Safety`.
-            let inputs = unsafe {
-                borrowed(peer_kp_ptr, peer_kp_len, "peer_kp")
-                    .and_then(|kp| Ok((kp, borrowed(first_msg_ptr, first_msg_len, "first_msg")?)))
-            };
-            match inputs {
-                Ok((peer_kp, first_msg)) => {
-                    start_group_into_ffi(handle_id, peer_kp, first_msg, None)
-                }
-                Err(e) => ffi_start_group_err(&e),
-            }
-        },
-    )
+    guarded(ffi_start_group_err, || {
+        // SAFETY: two byte inputs (contract 1), per `# Safety`.
+        let inputs = unsafe {
+            borrowed(peer_kp_ptr, peer_kp_len, "peer_kp")
+                .and_then(|kp| Ok((kp, borrowed(first_msg_ptr, first_msg_len, "first_msg")?)))
+        };
+        match inputs {
+            Ok((peer_kp, first_msg)) => start_group_into_ffi(handle_id, peer_kp, first_msg, None),
+            Err(e) => ffi_start_group_err(e),
+        }
+    })
 }
 
 /// Start a group with a peer's KeyPackage, carrying the SPEC-061
@@ -759,28 +832,25 @@ pub unsafe extern "C" fn airdress_mls_start_group_bound(
     first_msg_len: usize,
     from_airdress: *const c_char,
 ) -> FfiStartGroupResult {
-    guarded(
-        |msg| ffi_start_group_err(&msg),
-        || {
-            // SAFETY: two byte inputs (contract 1) and a string input
-            // (contract 2), per `# Safety`.
-            let inputs = unsafe {
-                (|| -> Result<_, String> {
-                    Ok((
-                        borrowed(peer_kp_ptr, peer_kp_len, "peer_kp")?,
-                        borrowed(first_msg_ptr, first_msg_len, "first_msg")?,
-                        required_str(from_airdress, "from_airdress")?,
-                    ))
-                })()
-            };
-            match inputs {
-                Ok((peer_kp, first_msg, airdress)) => {
-                    start_group_into_ffi(handle_id, peer_kp, first_msg, Some(airdress))
-                }
-                Err(e) => ffi_start_group_err(&e),
+    guarded(ffi_start_group_err, || {
+        // SAFETY: two byte inputs (contract 1) and a string input
+        // (contract 2), per `# Safety`.
+        let inputs = unsafe {
+            (|| -> Result<_, FfiError> {
+                Ok((
+                    borrowed(peer_kp_ptr, peer_kp_len, "peer_kp")?,
+                    borrowed(first_msg_ptr, first_msg_len, "first_msg")?,
+                    required_str(from_airdress, "from_airdress")?,
+                ))
+            })()
+        };
+        match inputs {
+            Ok((peer_kp, first_msg, airdress)) => {
+                start_group_into_ffi(handle_id, peer_kp, first_msg, Some(airdress))
             }
-        },
-    )
+            Err(e) => ffi_start_group_err(e),
+        }
+    })
 }
 
 /// Start a group with **no other member** — the owner's self thread on
@@ -818,26 +888,23 @@ pub unsafe extern "C" fn airdress_mls_start_group_solo(
     first_msg_len: usize,
     from_airdress: *const c_char,
 ) -> FfiStartGroupResult {
-    guarded(
-        |msg| ffi_start_group_err(&msg),
-        || {
-            // SAFETY: a byte input (contract 1) and a string input
-            // (contract 2), per `# Safety`.
-            let inputs = unsafe {
-                borrowed(first_msg_ptr, first_msg_len, "first_msg")
-                    .and_then(|msg| Ok((msg, required_str(from_airdress, "from_airdress")?)))
-            };
-            let (first_msg, airdress) = match inputs {
-                Ok(inputs) => inputs,
-                Err(e) => return ffi_start_group_err(&e),
-            };
-            with_engine(
-                handle_id,
-                || ffi_start_group_err("invalid handle"),
-                |engine| marshal_start_group(engine.start_group_solo(first_msg, airdress)),
-            )
-        },
-    )
+    guarded(ffi_start_group_err, || {
+        // SAFETY: a byte input (contract 1) and a string input
+        // (contract 2), per `# Safety`.
+        let inputs = unsafe {
+            borrowed(first_msg_ptr, first_msg_len, "first_msg")
+                .and_then(|msg| Ok((msg, required_str(from_airdress, "from_airdress")?)))
+        };
+        let (first_msg, airdress) = match inputs {
+            Ok(inputs) => inputs,
+            Err(e) => return ffi_start_group_err(e),
+        };
+        with_engine(
+            handle_id,
+            || ffi_start_group_err(FfiError::invalid_handle()),
+            |engine| marshal_start_group(engine.start_group_solo(first_msg, airdress)),
+        )
+    })
 }
 
 /// The body both establishment exports share: resolve the handle, run
@@ -851,12 +918,12 @@ fn start_group_into_ffi(
 ) -> FfiStartGroupResult {
     with_engine(
         handle_id,
-        || ffi_start_group_err("invalid handle"),
+        || ffi_start_group_err(FfiError::invalid_handle()),
         |engine| {
             let from_airdress = match from_airdress {
                 Some(a) => a,
                 None if engine.is_v2_cutover() => {
-                    return ffi_start_group_err(UNBOUND_PAST_CUTOVER);
+                    return ffi_start_group_err(FfiError::binding_required());
                 }
                 // Pre-cutover the AAD is empty regardless, so the value is
                 // never read. Naming it here keeps the unbound export
@@ -904,7 +971,7 @@ fn marshal_start_group(
                 error: std::ptr::null_mut(),
             }
         }
-        Err(e) => ffi_start_group_err(&e),
+        Err(e) => ffi_start_group_err(e),
     }
 }
 
@@ -928,7 +995,7 @@ pub unsafe extern "C" fn airdress_mls_process_welcome(
         };
         with_engine(
             handle_id,
-            || FfiBytes::err("invalid handle".into()),
+            || FfiBytes::err(FfiError::invalid_handle()),
             |engine| FfiBytes::from_result(engine.process_welcome(welcome)),
         )
     })
@@ -946,7 +1013,7 @@ unsafe fn group_and_payload<'a>(
     payload_ptr: *const u8,
     payload_len: usize,
     payload_name: &str,
-) -> Result<(&'a [u8], &'a [u8]), String> {
+) -> Result<(&'a [u8], &'a [u8]), FfiError> {
     // SAFETY: forwarded from this function's own contract.
     unsafe {
         Ok((
@@ -987,10 +1054,10 @@ pub unsafe extern "C" fn airdress_mls_encrypt(
         };
         with_engine(
             handle_id,
-            || FfiBytes::err("invalid handle".into()),
+            || FfiBytes::err(FfiError::invalid_handle()),
             |engine| {
                 if engine.is_v2_cutover() {
-                    return FfiBytes::err(UNBOUND_PAST_CUTOVER.to_owned());
+                    return FfiBytes::err(FfiError::binding_required());
                 }
                 FfiBytes::from_result(engine.encrypt(group_id, plaintext, ""))
             },
@@ -1029,10 +1096,10 @@ pub unsafe extern "C" fn airdress_mls_decrypt(
         };
         with_engine(
             handle_id,
-            || FfiBytes::err("invalid handle".into()),
+            || FfiBytes::err(FfiError::invalid_handle()),
             |engine| {
                 if engine.is_v2_cutover() {
-                    return FfiBytes::err(UNBOUND_PAST_CUTOVER.to_owned());
+                    return FfiBytes::err(FfiError::binding_required());
                 }
                 // SPEC-061 FR-22: the variant is distinguishable in Rust;
                 // across the C boundary it is still one sentence, per the
@@ -1040,7 +1107,7 @@ pub unsafe extern "C" fn airdress_mls_decrypt(
                 FfiBytes::from_result(
                     engine
                         .decrypt(group_id, message, "")
-                        .map_err(|e| e.to_string()),
+                        .map_err(FfiError::from),
                 )
             },
         )
@@ -1079,7 +1146,7 @@ pub struct FfiCommitResult {
     pub error: *mut c_char,
 }
 
-fn ffi_commit_err(msg: &str) -> FfiCommitResult {
+fn ffi_commit_err(error: impl Into<FfiError>) -> FfiCommitResult {
     FfiCommitResult {
         commit_ptr: std::ptr::null_mut(),
         commit_len: 0,
@@ -1090,7 +1157,7 @@ fn ffi_commit_err(msg: &str) -> FfiCommitResult {
         added: FfiBytesList::empty(),
         removed: FfiBytesList::empty(),
         members: FfiBytesList::empty(),
-        error: into_raw_error(msg),
+        error: into_raw_error(&error.into()),
     }
 }
 
@@ -1154,7 +1221,7 @@ pub unsafe extern "C" fn airdress_mls_encrypt_bound(
         };
         with_engine(
             handle_id,
-            || FfiBytes::err("invalid handle".into()),
+            || FfiBytes::err(FfiError::invalid_handle()),
             |engine| FfiBytes::from_result(engine.encrypt(group_id, plaintext, airdress)),
         )
     })
@@ -1198,12 +1265,12 @@ pub unsafe extern "C" fn airdress_mls_decrypt_bound(
         };
         with_engine(
             handle_id,
-            || FfiBytes::err("invalid handle".into()),
+            || FfiBytes::err(FfiError::invalid_handle()),
             |engine| {
                 FfiBytes::from_result(
                     engine
                         .decrypt(group_id, message, airdress)
-                        .map_err(|e| e.to_string()),
+                        .map_err(FfiError::from),
                 )
             },
         )
@@ -1247,7 +1314,9 @@ pub unsafe extern "C" fn airdress_mls_message_group_id(
         match mls_rs::MlsMessage::from_bytes(message) {
             Ok(msg) => match msg.group_id() {
                 Some(gid) => FfiBytes::ok(gid.to_vec()),
-                None => FfiBytes::err("this message carries no group id in its framing".into()),
+                None => FfiBytes::err(String::from(
+                    "this message carries no group id in its framing",
+                )),
             },
             Err(e) => FfiBytes::err(format!("bad message: {e}")),
         }
@@ -1289,7 +1358,7 @@ pub unsafe extern "C" fn airdress_mls_propose_add(
         };
         with_engine(
             handle_id,
-            || FfiBytes::err("invalid handle".into()),
+            || FfiBytes::err(FfiError::invalid_handle()),
             |engine| FfiBytes::from_result(engine.propose_add(group_id, kp).map(|()| Vec::new())),
         )
     })
@@ -1318,7 +1387,7 @@ pub unsafe extern "C" fn airdress_mls_propose_remove(
         };
         with_engine(
             handle_id,
-            || FfiBytes::err("invalid handle".into()),
+            || FfiBytes::err(FfiError::invalid_handle()),
             |engine| {
                 FfiBytes::from_result(
                     engine
@@ -1353,7 +1422,7 @@ pub unsafe extern "C" fn airdress_mls_propose_update(
         };
         with_engine(
             handle_id,
-            || FfiBytes::err("invalid handle".into()),
+            || FfiBytes::err(FfiError::invalid_handle()),
             |engine| FfiBytes::from_result(engine.propose_update(group_id)),
         )
     })
@@ -1391,7 +1460,7 @@ pub unsafe extern "C" fn airdress_mls_process_proposal(
         };
         with_engine(
             handle_id,
-            || FfiBytes::err("invalid handle".into()),
+            || FfiBytes::err(FfiError::invalid_handle()),
             |engine| {
                 FfiBytes::from_result(
                     engine
@@ -1420,24 +1489,21 @@ pub unsafe extern "C" fn airdress_mls_commit_pending(
     group_id_ptr: *const u8,
     group_id_len: usize,
 ) -> FfiCommitResult {
-    guarded(
-        |msg| ffi_commit_err(&msg),
-        || {
-            // SAFETY: a byte input (contract 1), per `# Safety`.
-            let group_id = match unsafe { borrowed(group_id_ptr, group_id_len, "group_id") } {
-                Ok(g) => g,
-                Err(e) => return ffi_commit_err(&e),
-            };
-            with_engine(
-                handle_id,
-                || ffi_commit_err("invalid handle"),
-                |engine| match engine.commit_pending(group_id) {
-                    Ok(outcome) => ffi_commit_ok(outcome),
-                    Err(e) => ffi_commit_err(&e),
-                },
-            )
-        },
-    )
+    guarded(ffi_commit_err, || {
+        // SAFETY: a byte input (contract 1), per `# Safety`.
+        let group_id = match unsafe { borrowed(group_id_ptr, group_id_len, "group_id") } {
+            Ok(g) => g,
+            Err(e) => return ffi_commit_err(e),
+        };
+        with_engine(
+            handle_id,
+            || ffi_commit_err(FfiError::invalid_handle()),
+            |engine| match engine.commit_pending(group_id) {
+                Ok(outcome) => ffi_commit_ok(outcome),
+                Err(e) => ffi_commit_err(e),
+            },
+        )
+    })
 }
 
 /// Persist a commit built by `airdress_mls_commit_pending` (phase two).
@@ -1524,33 +1590,30 @@ pub unsafe extern "C" fn airdress_mls_process_commit(
     message_ptr: *const u8,
     message_len: usize,
 ) -> FfiCommitResult {
-    guarded(
-        |msg| ffi_commit_err(&msg),
-        || {
-            // SAFETY: two byte inputs (contract 1), per `# Safety`.
-            let inputs = unsafe {
-                group_and_payload(
-                    group_id_ptr,
-                    group_id_len,
-                    message_ptr,
-                    message_len,
-                    "message",
-                )
-            };
-            let (group_id, message) = match inputs {
-                Ok(inputs) => inputs,
-                Err(e) => return ffi_commit_err(&e),
-            };
-            with_engine(
-                handle_id,
-                || ffi_commit_err("invalid handle"),
-                |engine| match engine.process_commit(group_id, message) {
-                    Ok(outcome) => ffi_commit_ok(outcome),
-                    Err(e) => ffi_commit_err(&e.to_string()),
-                },
+    guarded(ffi_commit_err, || {
+        // SAFETY: two byte inputs (contract 1), per `# Safety`.
+        let inputs = unsafe {
+            group_and_payload(
+                group_id_ptr,
+                group_id_len,
+                message_ptr,
+                message_len,
+                "message",
             )
-        },
-    )
+        };
+        let (group_id, message) = match inputs {
+            Ok(inputs) => inputs,
+            Err(e) => return ffi_commit_err(e),
+        };
+        with_engine(
+            handle_id,
+            || ffi_commit_err(FfiError::invalid_handle()),
+            |engine| match engine.process_commit(group_id, message) {
+                Ok(outcome) => ffi_commit_ok(outcome),
+                Err(e) => ffi_commit_err(e),
+            },
+        )
+    })
 }
 
 /// The group's current epoch — the value the client declares as
@@ -1608,7 +1671,7 @@ pub unsafe extern "C" fn airdress_mls_group_members(
         };
         with_engine(
             handle_id,
-            || FfiBytesList::err("invalid handle".into()),
+            || FfiBytesList::err(FfiError::invalid_handle()),
             |engine| {
                 FfiBytesList::from_result(
                     engine
@@ -1685,7 +1748,7 @@ pub unsafe extern "C" fn airdress_mls_mint_agent_delegation(
     issued_at_unix: u64,
 ) -> FfiBytes {
     guarded(FfiBytes::err, || {
-        let minted = (|| -> Result<Vec<u8>, String> {
+        let minted = (|| -> Result<Vec<u8>, FfiError> {
             // SAFETY: a byte input (contract 1), per `# Safety`. The copy is
             // zeroized on drop, on every path out of this closure.
             let seed = zeroize::Zeroizing::new(unsafe {
@@ -1709,7 +1772,8 @@ pub unsafe extern "C" fn airdress_mls_mint_agent_delegation(
             };
             let delegation = airdress_mls::delegation::mint_agent_delegation(&seed, &req)
                 .map_err(|e| e.to_string())?;
-            serde_json::to_vec(&serde_json::Value::Object(delegation)).map_err(|e| e.to_string())
+            Ok(serde_json::to_vec(&serde_json::Value::Object(delegation))
+                .map_err(|e| e.to_string())?)
         })();
         FfiBytes::from_result(minted)
     })
@@ -1749,6 +1813,9 @@ pub unsafe extern "C" fn airdress_mls_free_error(ptr: *mut c_char) {
         |_| (),
         || {
             if !ptr.is_null() {
+                // Out of the table before the allocation is released, so
+                // a later error at the same address gets its own code.
+                error_codes().remove(&(ptr as usize));
                 // SAFETY: a non-null error was made by `into_raw_error`
                 // (`CString::into_raw`) and is reclaimed once, per the
                 // caller's contract.
@@ -1758,7 +1825,30 @@ pub unsafe extern "C" fn airdress_mls_free_error(ptr: *mut c_char) {
     );
 }
 
-fn ffi_start_group_err(msg: &str) -> FfiStartGroupResult {
+/// The stable code of an error string this library returned, for the
+/// caller to branch on instead of matching the message (rust guide
+/// R-ERR-6). Call it before `airdress_mls_free_error`.
+///
+/// Returns one of the [`ErrorCode`] values — `5`
+/// (`EpochUnavailable`, "older than the keys still on this device") is
+/// the one the app routes to catch-up — `0` for a null pointer, and `-1`
+/// for a pointer this library did not hand out or has already freed.
+/// The pointer is only compared, never read, so any value is safe to
+/// pass.
+#[unsafe(no_mangle)]
+pub extern "C" fn airdress_mls_error_code(error: *const c_char) -> i32 {
+    guarded(
+        |_| -1,
+        || {
+            if error.is_null() {
+                return 0;
+            }
+            error_codes().get(&(error as usize)).copied().unwrap_or(-1)
+        },
+    )
+}
+
+fn ffi_start_group_err(error: impl Into<FfiError>) -> FfiStartGroupResult {
     FfiStartGroupResult {
         group_id_ptr: std::ptr::null_mut(),
         group_id_len: 0,
@@ -1766,7 +1856,7 @@ fn ffi_start_group_err(msg: &str) -> FfiStartGroupResult {
         welcome_len: 0,
         first_app_ptr: std::ptr::null_mut(),
         first_app_len: 0,
-        error: into_raw_error(msg),
+        error: into_raw_error(&error.into()),
     }
 }
 
@@ -1786,6 +1876,8 @@ mod tests {
     use std::ffi::{CStr, CString};
 
     use ed25519_dalek::SigningKey;
+
+    use airdress_mls::EngineError;
 
     use super::{
         FfiBytes, FfiStartGroupResult, airdress_mls_create_engine_from_seed, airdress_mls_decrypt,
@@ -2638,5 +2730,87 @@ mod tests {
         // the engine carries on from the state the failed call left.
         encrypt().expect("the engine answers after a caught panic");
         assert_eq!(super::airdress_mls_is_v2_cutover(alice.id), 1);
+    }
+
+    /// Read an error's code and message, then free it — what the app's
+    /// `_checkError` does, in that order.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "taking the result by value is the point: it is freed here"
+    )]
+    fn take_coded(result: FfiBytes) -> (i32, String) {
+        assert!(!result.error.is_null(), "expected an error");
+        let code = super::airdress_mls_error_code(result.error);
+        (code, take_error(result.error))
+    }
+
+    /// Every refusal carries a stable code, readable off the error string
+    /// until it is freed, and gone (-1) afterwards; null is 0.
+    #[test]
+    fn errors_carry_stable_codes() {
+        use airdress_mls::ErrorCode;
+
+        let alice = engine(ALICE, 0x54, "alice-codes", true);
+        let c_alice = CString::new(ALICE).unwrap();
+
+        let (code, _) = take_coded(airdress_mls_generate_key_package(u64::MAX));
+        assert_eq!(code, ErrorCode::InvalidHandle.as_i32());
+
+        let (code, msg) = take_coded(
+            // SAFETY: a null pointer with a length, refused before any read.
+            unsafe { airdress_mls_message_group_id(std::ptr::null(), 4) },
+        );
+        assert_eq!(code, ErrorCode::InvalidArgument.as_i32(), "{msg}");
+
+        let (code, _) = take_coded(
+            // SAFETY: live buffers with their own lengths.
+            unsafe { airdress_mls_decrypt(alice.id, b"gid".as_ptr(), 3, b"msg".as_ptr(), 3) },
+        );
+        assert_eq!(code, ErrorCode::BindingRequired.as_i32());
+
+        let (code, _) = take_coded(
+            // SAFETY: a live buffer with its own length.
+            unsafe { airdress_mls_message_group_id(b"junk".as_ptr(), 4) },
+        );
+        assert_eq!(code, ErrorCode::Engine.as_i32());
+
+        let (code, _) = take_coded(
+            // SAFETY: live buffers and a C string with their own lengths.
+            unsafe {
+                airdress_mls_encrypt_bound(
+                    alice.id,
+                    b"gid".as_ptr(),
+                    3,
+                    b"hi".as_ptr(),
+                    2,
+                    c_alice.as_ptr(),
+                )
+            },
+        );
+        assert_eq!(code, ErrorCode::Engine.as_i32());
+
+        INJECT_PANIC.with(|flag| flag.set(true));
+        let (code, _) = take_coded(airdress_mls_generate_key_package(alice.id));
+        assert_eq!(code, ErrorCode::Internal.as_i32());
+
+        // The trimmed-epoch case the app routes to catch-up: code 5, and
+        // the sentence it used to match on, unchanged.
+        let (code, msg) = take_coded(FfiBytes::err(EngineError::EpochUnavailable {
+            requested: 1,
+            oldest_retained: Some(4),
+        }));
+        assert_eq!(code, 5);
+        assert_eq!(code, ErrorCode::EpochUnavailable.as_i32());
+        assert_eq!(
+            msg,
+            "this message is older than the keys still on this device"
+        );
+
+        // Freed errors and null are not codes.
+        let raw = FfiBytes::err(String::from("x")).error;
+        // SAFETY: an error this crate made, freed once.
+        unsafe { super::airdress_mls_free_error(raw) };
+        assert_eq!(super::airdress_mls_error_code(raw), -1);
+        assert_eq!(super::airdress_mls_error_code(std::ptr::null()), 0);
     }
 }

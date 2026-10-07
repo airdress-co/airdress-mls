@@ -34,7 +34,7 @@ pub mod storage;
 pub mod vectors;
 
 pub use binding::MessageBinding;
-pub use engine::{CommitOutcome, EngineError, GroupMember, MlsEngine};
+pub use engine::{CommitOutcome, EngineError, ErrorCode, GroupMember, MlsEngine};
 
 #[cfg(test)]
 mod tests {
