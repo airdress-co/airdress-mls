@@ -1,6 +1,28 @@
+# commit-msg is installed beside pre-commit so `prek install` (and
+# `just hooks-install-all`) also checks the commit message.
+default_install_hook_types: [pre-commit, commit-msg]
+# Hooks without `stages` stay pre-commit only; otherwise every hook would
+# also run against the commit message file.
+default_stages: [pre-commit]
+
 repos:
   - repo: local
     hooks:
+      # Every commit message is a Conventional Commit (owner, 2026-10-09).
+      # Vendored unchanged from airdress-ops (`just conventional-commit-vendor`).
+      - id: conventional-commit
+        name: conventional commit message
+        entry: python3 scripts/check-conventional-commit.py
+        language: system
+        stages: [commit-msg]
+
+      - id: conventional-commit-tests
+        name: conventional commit checker tests
+        entry: python3 -m unittest discover -s scripts -p test_check_conventional_commit.py
+        language: system
+        pass_filenames: false
+        files: ^scripts/(check-conventional-commit|test_check_conventional_commit)\.py$
+
       - id: cargo-fmt
         name: cargo fmt
         entry: cargo fmt --all --check
