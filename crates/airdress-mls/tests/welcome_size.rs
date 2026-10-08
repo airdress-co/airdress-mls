@@ -4,10 +4,11 @@
 //! A Welcome carries the whole ratchet tree — one leaf per device, each
 //! with its credential, and an Airdress credential carries the device's
 //! root-signed delegation — plus the group context with its four group
-//! extensions. It travels as one envelope, and the operator refuses an
-//! envelope over its `max_message_size_bytes` (65 536 by default). So the
-//! number of leaves a group may hold is set by this measurement, with 20 %
-//! headroom.
+//! extensions. It travels as one envelope, and the operator refuses a
+//! Welcome over its `max_welcome_bytes` (147 456 by default; its own limit
+//! by the owner's ruling of 2026-10-09, as audio has one). So the number of
+//! leaves a group may hold is set by this measurement against that limit,
+//! with 20 % headroom.
 //!
 //! The leaves are realistic: hosted airdress names (`<uuid>.a.airdr.es`),
 //! UUID device ids, a device label, and delegations shaped as the phone
@@ -38,8 +39,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer as _, SigningKey};
 use serde_json::{Map, Value, json};
 
-/// The operator's default `chat.limits.max_message_size_bytes`.
-const ENVELOPE_LIMIT: usize = 65_536;
+/// The operator's default `chat.limits.max_welcome_bytes`.
+const ENVELOPE_LIMIT: usize = 147_456;
 
 /// NFR-5: the Welcome at the cap fits the limit with 20 % headroom.
 const BUDGET: usize = ENVELOPE_LIMIT * 80 / 100;
@@ -177,8 +178,9 @@ fn the_welcome_at_the_cap_fits_the_envelope_with_headroom() {
         "GROUP_LEAF_CAP {GROUP_LEAF_CAP} is more than the {measured_cap} measured to fit"
     );
 
-    // The cap itself, built: fifteen persons with four devices each.
-    let at_cap = welcome_bytes(GROUP_LEAF_CAP / 4, 4);
-    println!("built at {} leaves -> {at_cap} B", GROUP_LEAF_CAP / 4 * 4);
+    // Next to the cap, built: 27 persons with 5 devices each (135 leaves,
+    // within the 32-person cap).
+    let at_cap = welcome_bytes(GROUP_LEAF_CAP / 5, 5);
+    println!("built at {} leaves -> {at_cap} B", GROUP_LEAF_CAP / 5 * 5);
     assert!(at_cap <= BUDGET, "{at_cap} B at the cap is over {BUDGET} B");
 }
