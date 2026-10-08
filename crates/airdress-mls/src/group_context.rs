@@ -49,6 +49,15 @@ pub const GROUP_EXTENSION_VERSION: u8 = 1;
 /// the owner may override). A committing device refuses an `Add` past it.
 pub const GROUP_MAX_PERSONS: usize = 32;
 
+/// The most leaves (devices) a group may hold (design D-11, NFR-5): the
+/// number whose Welcome fits the operator's default 65 536-byte envelope
+/// limit with 20 % headroom. Measured by `tests/welcome_size.rs` on
+/// 2026-10-08: 853 bytes a leaf plus 643 fixed, so 60 leaves come to about
+/// 51.8 KB against a 52.4 KB budget. 32 persons fit at one device each and
+/// not at two (64 leaves, 55.2 KB): the person cap and the device counts
+/// are the owner's to weigh. A committing device refuses past either cap.
+pub const GROUP_LEAF_CAP: usize = 60;
+
 /// The longest title, in characters (FR-17).
 pub const GROUP_TITLE_MAX_CHARS: usize = 100;
 

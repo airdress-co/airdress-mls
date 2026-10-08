@@ -11,7 +11,7 @@
 
 use ed25519_dalek::SigningKey;
 
-use super::{GroupRule, PERSON_CAP, SEND_UNCHECKED};
+use super::{GroupRule, LEAF_CAP, PERSON_CAP, SEND_UNCHECKED};
 use crate::credential::test_support::signed_delegation_json_v2;
 use crate::engine::{MlsEngine, message_epoch};
 use crate::group_context::{
@@ -487,4 +487,21 @@ fn g_ext_titled(g: &Group, title: &str) -> GroupExtensions {
     let mut ext = g.extensions();
     ext.profile.title = title.into();
     ext
+}
+
+#[test]
+fn the_committer_holds_the_leaf_cap_too() {
+    LEAF_CAP.with(|c| c.set(4));
+    let mut g = three();
+    let id = g.id.clone();
+    let ben2 = Device::new(BEN, "ben2", 5);
+    let kp = ben2.engine.generate_key_package().unwrap();
+    g.get("ben").engine.propose_add(&id, &kp).unwrap();
+    assert!(g.commit("ben").is_ok(), "four leaves");
+    let ben3 = Device::new(BEN, "ben3", 6);
+    let kp = ben3.engine.generate_key_package().unwrap();
+    g.get("ben").engine.propose_add(&id, &kp).unwrap();
+    let refused = g.commit("ben");
+    LEAF_CAP.with(|c| c.set(crate::group_context::GROUP_LEAF_CAP));
+    rule_error(refused, GroupRule::TooManyPersons);
 }
