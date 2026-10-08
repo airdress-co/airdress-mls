@@ -47,7 +47,8 @@ base64 = "0.22"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 # Test-only: a throwaway state directory per test.
 tempfile = "3"
-# The client crate's envelope wire types.
+# The client crate's envelope wire types, and the engine's group context
+# extension bodies.
 serde = { version = "1", features = ["derive"] }
 # The client crate's content digests.
 sha2 = "0.10"

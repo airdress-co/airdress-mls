@@ -86,3 +86,13 @@ airdress_mls_mint_agent_delegation
 
 # Stable error codes, read off an error string before it is freed.
 airdress_mls_error_code
+
+# SPEC-145 §3.3 — group conversations across airdresses: create with the
+# four group context extensions, read and stage them, leave, read the
+# roster by person, and read a message's epoch before processing it.
+airdress_mls_group_create_with_extensions
+airdress_mls_group_extensions
+airdress_mls_propose_extensions
+airdress_mls_propose_self_remove
+airdress_mls_group_roster
+airdress_mls_message_epoch

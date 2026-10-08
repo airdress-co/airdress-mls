@@ -48,3 +48,10 @@ path = "fuzz_targets/message_group_id.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "group_extensions_decode"
+path = "fuzz_targets/group_extensions_decode.rs"
+test = false
+doc = false
+bench = false

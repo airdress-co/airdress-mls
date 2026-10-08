@@ -1870,6 +1870,232 @@ fn ffi_start_group_err(error: impl Into<FfiError>) -> FfiStartGroupResult {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Group conversations (SPEC-145 design §3.3). JSON in, JSON out: the group
+// extensions and the roster are small structured values the Dart side
+// decodes, and a JSON shape can grow a field without moving any struct.
+// ---------------------------------------------------------------------------
+
+/// Read the group extensions' JSON.
+fn group_json(
+    bytes: &[u8],
+    name: &str,
+) -> Result<airdress_mls::group_context::GroupExtensions, FfiError> {
+    serde_json::from_slice(bytes)
+        .map_err(|e| FfiError::invalid_argument(format!("{name} is not valid JSON: {e}")))
+}
+
+/// Create a group conversation with this device as its only leaf and the
+/// four group extensions in its context. `(extensions_ptr, extensions_len)`
+/// is the JSON of `{profile, roles, policy, sequencer}`; `roles` names this
+/// device's person as the sole admin and first member. Returns the group id.
+///
+/// # Safety
+///
+/// `(extensions_ptr, extensions_len)` is a byte input (contract 1). The
+/// result is freed per contract 3.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn airdress_mls_group_create_with_extensions(
+    handle_id: u64,
+    extensions_ptr: *const u8,
+    extensions_len: usize,
+) -> FfiBytes {
+    guarded(FfiBytes::err, || {
+        // SAFETY: a byte input (contract 1), per `# Safety`.
+        let raw = match unsafe { borrowed(extensions_ptr, extensions_len, "extensions") } {
+            Ok(r) => r,
+            Err(e) => return FfiBytes::err(e),
+        };
+        let extensions = match group_json(raw, "extensions") {
+            Ok(x) => x,
+            Err(e) => return FfiBytes::err(e),
+        };
+        with_engine(
+            handle_id,
+            || FfiBytes::err(FfiError::invalid_handle()),
+            |engine| FfiBytes::from_result(engine.create_group_with_extensions(&extensions)),
+        )
+    })
+}
+
+/// The group conversation's extensions at the current epoch, as JSON;
+/// `null` (the four bytes) for a group that is not a group conversation.
+///
+/// # Safety
+///
+/// `(group_id_ptr, group_id_len)` is a byte input (contract 1). The result
+/// is freed per contract 3.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn airdress_mls_group_extensions(
+    handle_id: u64,
+    group_id_ptr: *const u8,
+    group_id_len: usize,
+) -> FfiBytes {
+    guarded(FfiBytes::err, || {
+        // SAFETY: a byte input (contract 1), per `# Safety`.
+        let group_id = match unsafe { borrowed(group_id_ptr, group_id_len, "group_id") } {
+            Ok(g) => g,
+            Err(e) => return FfiBytes::err(e),
+        };
+        with_engine(
+            handle_id,
+            || FfiBytes::err(FfiError::invalid_handle()),
+            |engine| {
+                FfiBytes::from_result(engine.group_extensions(group_id).and_then(|ext| {
+                    serde_json::to_vec(&ext).map_err(|e| format!("serialize: {e}"))
+                }))
+            },
+        )
+    })
+}
+
+/// Stage a change to the group conversation's extensions for the next
+/// commit, by value: the JSON is the whole set as it should read after it.
+/// The group's rules decide, when the commit is built, whether this device
+/// may make it. Returns an empty buffer on success.
+///
+/// # Safety
+///
+/// `(group_id_ptr, group_id_len)` and `(extensions_ptr, extensions_len)`
+/// are byte inputs (contract 1). The result is freed per contract 3.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn airdress_mls_propose_extensions(
+    handle_id: u64,
+    group_id_ptr: *const u8,
+    group_id_len: usize,
+    extensions_ptr: *const u8,
+    extensions_len: usize,
+) -> FfiBytes {
+    guarded(FfiBytes::err, || {
+        // SAFETY: two byte inputs (contract 1), per `# Safety`.
+        let inputs = unsafe {
+            group_and_payload(
+                group_id_ptr,
+                group_id_len,
+                extensions_ptr,
+                extensions_len,
+                "extensions",
+            )
+        };
+        let (group_id, raw) = match inputs {
+            Ok(i) => i,
+            Err(e) => return FfiBytes::err(e),
+        };
+        let extensions = match group_json(raw, "extensions") {
+            Ok(x) => x,
+            Err(e) => return FfiBytes::err(e),
+        };
+        with_engine(
+            handle_id,
+            || FfiBytes::err(FfiError::invalid_handle()),
+            |engine| {
+                FfiBytes::from_result(
+                    engine
+                        .propose_extensions(group_id, extensions)
+                        .map(|()| Vec::new()),
+                )
+            },
+        )
+    })
+}
+
+/// Propose removing this device's own leaf: leaving a group conversation.
+/// Returns the bare proposal, by reference, for the next member online to
+/// commit; the caller sends it and then wipes the group locally.
+///
+/// # Safety
+///
+/// `(group_id_ptr, group_id_len)` is a byte input (contract 1). The result
+/// is freed per contract 3.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn airdress_mls_propose_self_remove(
+    handle_id: u64,
+    group_id_ptr: *const u8,
+    group_id_len: usize,
+) -> FfiBytes {
+    guarded(FfiBytes::err, || {
+        // SAFETY: a byte input (contract 1), per `# Safety`.
+        let group_id = match unsafe { borrowed(group_id_ptr, group_id_len, "group_id") } {
+            Ok(g) => g,
+            Err(e) => return FfiBytes::err(e),
+        };
+        with_engine(
+            handle_id,
+            || FfiBytes::err(FfiError::invalid_handle()),
+            |engine| FfiBytes::from_result(engine.propose_self_remove(group_id)),
+        )
+    })
+}
+
+/// Every leaf with its person and device, as a JSON array of
+/// `{index, airdress, pin_subject, device_id, own}` in leaf-index order:
+/// what the app groups into persons.
+///
+/// # Safety
+///
+/// `(group_id_ptr, group_id_len)` is a byte input (contract 1). The result
+/// is freed per contract 3.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn airdress_mls_group_roster(
+    handle_id: u64,
+    group_id_ptr: *const u8,
+    group_id_len: usize,
+) -> FfiBytes {
+    guarded(FfiBytes::err, || {
+        // SAFETY: a byte input (contract 1), per `# Safety`.
+        let group_id = match unsafe { borrowed(group_id_ptr, group_id_len, "group_id") } {
+            Ok(g) => g,
+            Err(e) => return FfiBytes::err(e),
+        };
+        with_engine(
+            handle_id,
+            || FfiBytes::err(FfiError::invalid_handle()),
+            |engine| {
+                FfiBytes::from_result(engine.group_roster(group_id).and_then(|roster| {
+                    let entries: Vec<serde_json::Value> = roster
+                        .into_iter()
+                        .map(|e| {
+                            serde_json::json!({
+                                "index": e.index,
+                                "airdress": e.airdress,
+                                "pin_subject": e.pin_subject,
+                                "device_id": e.device_id,
+                                "own": e.own,
+                            })
+                        })
+                        .collect();
+                    serde_json::to_vec(&entries).map_err(|e| format!("serialize: {e}"))
+                }))
+            },
+        )
+    })
+}
+
+/// The epoch a message or commit was made in, read off its framing with
+/// no key and no engine: the client holds what is ahead of it. Returns the
+/// epoch, or `-2` for bytes that do not parse or carry no epoch (a Welcome).
+///
+/// # Safety
+///
+/// `(message_ptr, message_len)` is a byte input (contract 1).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn airdress_mls_message_epoch(
+    message_ptr: *const u8,
+    message_len: usize,
+) -> i64 {
+    guarded(
+        |_| PANIC_I64,
+        || {
+            // SAFETY: a byte input (contract 1), per `# Safety`.
+            let Ok(message) = (unsafe { borrowed(message_ptr, message_len, "message") }) else {
+                return -2;
+            };
+            airdress_mls::engine::message_epoch(message)
+                .map_or(-2, |e| i64::try_from(e).unwrap_or(i64::MAX))
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     //! SPEC-061 FR-17a / design D-8 at the **FFI** boundary.
@@ -3016,5 +3242,108 @@ mod tests {
         unsafe { super::airdress_mls_free_error(raw) };
         let ok = FfiBytes::ok(vec![1, 2]);
         assert_eq!(take_buffer(ok.ptr, ok.len), [1, 2]);
+    }
+
+    /// The group exports through the C ABI: create with the extensions,
+    /// read them back, stage a change and commit it, read the roster by
+    /// person and a commit's epoch off its framing, and propose leaving.
+    #[test]
+    fn group_conversations_through_the_c_abi() {
+        let ana = engine(ALICE, 0x31, "ana-phone", true);
+        let extensions = serde_json::json!({
+            "profile": { "v": 1, "title": "Ski trip" },
+            "roles": { "v": 1, "admins": [ALICE], "join_order": [ALICE] },
+            "policy": { "v": 1, "members_may_add": false, "members_may_edit_profile": true },
+            "sequencer": { "v": 1, "operator_fqdn": ALICE, "kid": "k-0011223344556677" },
+        })
+        .to_string();
+        // SAFETY: a live buffer with its own length.
+        let group_id = take_bytes(unsafe {
+            super::airdress_mls_group_create_with_extensions(
+                ana.id,
+                extensions.as_ptr(),
+                extensions.len(),
+            )
+        })
+        .expect("create");
+        assert_eq!(
+            group_id.len(),
+            32,
+            "the group id the operator's group_ref names"
+        );
+
+        // SAFETY: a live buffer with its own length.
+        let read = take_bytes(unsafe {
+            super::airdress_mls_group_extensions(ana.id, group_id.as_ptr(), group_id.len())
+        })
+        .expect("extensions");
+        let read: serde_json::Value = serde_json::from_slice(&read).unwrap();
+        assert_eq!(read["profile"]["title"], "Ski trip");
+        assert_eq!(read["roles"]["admins"][0], ALICE);
+
+        let mut renamed = read;
+        renamed["profile"]["title"] = "Ski trip 2027".into();
+        let renamed = renamed.to_string();
+        // SAFETY: two live buffers with their own lengths.
+        take_bytes(unsafe {
+            super::airdress_mls_propose_extensions(
+                ana.id,
+                group_id.as_ptr(),
+                group_id.len(),
+                renamed.as_ptr(),
+                renamed.len(),
+            )
+        })
+        .expect("stage");
+        // SAFETY: a live buffer with its own length.
+        let committed = unsafe {
+            super::airdress_mls_commit_pending(ana.id, group_id.as_ptr(), group_id.len())
+        };
+        assert!(committed.error.is_null());
+        let commit = take_buffer(committed.commit_ptr, committed.commit_len);
+        // SAFETY: the remaining buffers of that result, freed once.
+        unsafe {
+            super::airdress_mls_free_bytes(committed.welcome_ptr, committed.welcome_len);
+            super::airdress_mls_free_bytes_list(committed.added);
+            super::airdress_mls_free_bytes_list(committed.removed);
+            super::airdress_mls_free_bytes_list(committed.members);
+        }
+        let epoch =
+            // SAFETY: a live buffer with its own length.
+            unsafe { super::airdress_mls_message_epoch(commit.as_ptr(), commit.len()) };
+        assert_eq!(epoch, 0);
+        let not_mls =
+            // SAFETY: a live buffer with its own length.
+            unsafe { super::airdress_mls_message_epoch(b"x".as_ptr(), 1) };
+        assert_eq!(not_mls, -2);
+        // SAFETY: a live buffer with its own length.
+        let confirmed = unsafe {
+            super::airdress_mls_confirm_commit(ana.id, group_id.as_ptr(), group_id.len())
+        };
+        assert_eq!(confirmed, 1);
+
+        // SAFETY: a live buffer with its own length.
+        let roster = take_bytes(unsafe {
+            super::airdress_mls_group_roster(ana.id, group_id.as_ptr(), group_id.len())
+        })
+        .expect("roster");
+        let roster: serde_json::Value = serde_json::from_slice(&roster).unwrap();
+        assert_eq!(roster[0]["pin_subject"], ALICE);
+        assert_eq!(roster[0]["device_id"], "ana-phone");
+        assert_eq!(roster[0]["own"], true);
+
+        // SAFETY: a live buffer with its own length.
+        let leave = take_bytes(unsafe {
+            super::airdress_mls_propose_self_remove(ana.id, group_id.as_ptr(), group_id.len())
+        })
+        .expect("leave");
+        assert!(!leave.is_empty());
+
+        // Malformed JSON is an argument error, not a panic.
+        // SAFETY: a live buffer with its own length.
+        let refused = take_bytes(unsafe {
+            super::airdress_mls_group_create_with_extensions(ana.id, b"{".as_ptr(), 1)
+        });
+        assert!(refused.unwrap_err().contains("not valid JSON"));
     }
 }

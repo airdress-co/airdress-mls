@@ -48,6 +48,7 @@ dependencies = [
  "mls-rs",
  "mls-rs-core",
  "mls-rs-crypto-rustcrypto",
+ "serde",
  "serde_json",
  "tempfile",
  "zeroize",

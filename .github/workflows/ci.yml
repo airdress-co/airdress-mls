@@ -190,7 +190,8 @@ jobs:
             credential::tests::legacy_bare_string_still_parses \
             credential::tests::json_object_without_a_version_is_legacy \
             credential::tests::versioned_object_with_bad_fields_is_an_error_not_legacy \
-            credential::tests::rfc3339
+            credential::tests::rfc3339 \
+            group_context::tests
       - name: FFI argument checks and buffers
         run: |
           cargo +nightly miri test --locked -p airdress-mls-ffi --lib -- \
