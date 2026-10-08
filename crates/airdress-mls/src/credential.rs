@@ -1112,6 +1112,23 @@ impl AirdressIdentityProvider {
         )
     }
 
+    /// The registered revocation lookup, if any, with no cutover
+    /// refusal. What the MLS rules read when a `Remove` of another
+    /// person's leaf needs the revocation witness: there, "no lookup"
+    /// is simply "no witness", which refuses the removal.
+    ///
+    /// # Panics
+    ///
+    /// If the revocation lock is poisoned — unrecoverable.
+    pub(crate) fn registered_revocation_lookup(
+        &self,
+    ) -> Option<std::sync::Arc<dyn RevocationLookup>> {
+        self.revocation
+            .read()
+            .expect("revocation lock poisoned")
+            .clone()
+    }
+
     /// The registered revocation lookup, or a refusal when the v2
     /// cutover is on and none is registered.
     ///

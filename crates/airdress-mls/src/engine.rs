@@ -405,7 +405,12 @@ impl MlsEngine {
         let client = Client::builder()
             .key_package_repo(key_package_store.clone())
             .group_state_storage(group_store.clone())
-            .mls_rules(AirdressMlsRules::new())
+            // The rules read the revocation witness from the same
+            // provider that runs check 5, so a host registers one
+            // lookup and both answer from it.
+            .mls_rules(AirdressMlsRules::sharing_revocation_with(
+                &identity_provider,
+            ))
             .crypto_provider(RustCryptoProvider::default())
             .identity_provider(identity_provider.clone())
             .signing_identity(signing_identity, secret_key, CIPHER_SUITE)
@@ -926,23 +931,30 @@ impl MlsEngine {
     /// commit (SPEC-061 FR-2). Staged by value, for the same reason as
     /// [`MlsEngine::propose_add`].
     ///
-    /// ## Cross-airdress removal is refused here too (FR-25)
+    /// ## A refused removal fails here first
     ///
     /// [`crate::rules::AirdressMlsRules`] is the enforcement point and
-    /// catches this on both the send and the receive side, including
-    /// for a hand-crafted proposal from a client that has had this
-    /// check patched out. The check repeated here is the early refusal
-    /// FR-25 asks for: it fails before the proposal exists, so the
-    /// caller gets a comprehensible error rather than a commit that
-    /// will not build.
+    /// catches a refused removal on both the send and the receive side,
+    /// including a hand-crafted proposal from a client that has had
+    /// this check patched out. The check repeated here is the early
+    /// refusal SPEC-061 FR-25 asks for: it fails before the proposal
+    /// exists, so the caller gets a comprehensible error rather than a
+    /// commit that will not build. It is the rules' own function, with
+    /// this engine's revocation lookup, so the two cannot disagree:
+    ///
+    /// - another airdress's leaf is refused (FR-25);
+    /// - inside one airdress, once a `v: 3` leaf is on either side,
+    ///   another person's leaf is refused unless it is a `v: 3` leaf
+    ///   whose `device_id` the registered revocation lookup answers
+    ///   `Revoked` for (SPEC-144 F-7, FR-53).
     ///
     /// # Errors
     ///
-    /// The group is unknown, the index names no leaf, or the leaf
-    /// belongs to another airdress.
+    /// The group is unknown, the index names no leaf, or the rules
+    /// refuse the removal.
     pub fn propose_remove(&mut self, group_id: &[u8], index: u32) -> Result<(), String> {
         let group = self.load_group(group_id)?;
-        Self::refuse_cross_airdress_removal(&group, index)?;
+        self.refuse_unauthorised_removal(&group, index)?;
         drop(group);
         self.staged
             .entry(group_id.to_vec())
@@ -951,19 +963,24 @@ impl MlsEngine {
         Ok(())
     }
 
-    fn refuse_cross_airdress_removal(group: &Group<MlsConfig>, index: u32) -> Result<(), String> {
+    fn refuse_unauthorised_removal(
+        &self,
+        group: &Group<MlsConfig>,
+        index: u32,
+    ) -> Result<(), String> {
         let own = group
             .member_at_index(Self::own_index(group))
             .ok_or("this device has no leaf in the group")?;
         let target = group
             .member_at_index(index)
             .ok_or_else(|| format!("no member at leaf {index}"))?;
-        let own_airdress = airdress_of(own.signing_identity()).map_err(|e| e.to_string())?;
-        let target_airdress = airdress_of(target.signing_identity()).map_err(|e| e.to_string())?;
-        if own_airdress == target_airdress {
-            return Ok(());
-        }
-        Err("only a device of the same airdress may remove that airdress's devices".to_owned())
+        let revocation = self.identity_provider.registered_revocation_lookup();
+        crate::rules::check_removal(
+            own.signing_identity(),
+            target.signing_identity(),
+            revocation.as_deref(),
+        )
+        .map_err(|e| e.to_string())
     }
 
     /// Propose replacing this device's own leaf key (SPEC-061 FR-1) —
@@ -1001,8 +1018,9 @@ impl MlsEngine {
     /// # Errors
     ///
     /// The group is unknown, the bytes are not a proposal, or the
-    /// proposal is refused by the MLS rules (a cross-airdress `Remove`
-    /// is refused here — FR-25's receive side).
+    /// proposal is refused by the MLS rules (a cross-airdress `Remove`,
+    /// or another person's leaf without the revocation witness, is
+    /// refused here — the rules' receive side).
     pub fn process_proposal(
         &mut self,
         group_id: &[u8],
