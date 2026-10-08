@@ -146,6 +146,9 @@ pub enum MlsRulesError {
         /// The airdress both leaves belong to.
         airdress: String,
     },
+    /// A group conversation's rules refused the proposal set (SPEC-145
+    /// design D-5): which rule, and nothing about who.
+    Group(crate::group_rules::GroupRule),
     /// A roster leaf carried a credential that could not be read.
     /// Distinct from the above so a malformed leaf is not reported as
     /// an attempted removal.
@@ -162,6 +165,7 @@ impl core::fmt::Display for MlsRulesError {
             Self::CrossPersonRemoval { .. } => f.write_str(
                 "only a person's own devices may remove that person's devices, unless the device is revoked",
             ),
+            Self::Group(rule) => rule.fmt(f),
             Self::UnreadableLeaf(msg) => write!(f, "unreadable group member: {msg}"),
         }
     }
@@ -177,19 +181,19 @@ impl IntoAnyError for MlsRulesError {
 
 /// What the removal rule needs to know about one leaf, read from its
 /// credential.
-struct Leaf {
-    airdress: String,
+pub(crate) struct Leaf {
+    pub(crate) airdress: String,
     /// `None` for a legacy bare-string identity, which is the owner's
     /// by construction (it predates persons).
     version: Option<IdentityVersion>,
     /// The pin subject, computed only when a `v: 3` leaf is involved —
     /// see [`authorise_removal`].
     pin_subject: Result<String, String>,
-    device_id: Option<String>,
+    pub(crate) device_id: Option<String>,
 }
 
 impl Leaf {
-    fn of(signing_identity: &SigningIdentity) -> Result<Self, MlsRulesError> {
+    pub(crate) fn of(signing_identity: &SigningIdentity) -> Result<Self, MlsRulesError> {
         let basic = signing_identity.credential.as_basic().ok_or_else(|| {
             MlsRulesError::UnreadableLeaf("credential is not a basic credential".to_owned())
         })?;
@@ -213,7 +217,7 @@ impl Leaf {
         self.version == Some(IdentityVersion::V3)
     }
 
-    fn pin_subject(&self) -> Result<&str, MlsRulesError> {
+    pub(crate) fn pin_subject(&self) -> Result<&str, MlsRulesError> {
         self.pin_subject
             .as_deref()
             .map_err(|e| MlsRulesError::UnreadableLeaf(e.clone()))
@@ -221,7 +225,7 @@ impl Leaf {
 }
 
 /// The leaf at `index`, or an error naming why it could not be read.
-fn leaf_at(roster: &Roster<'_>, index: u32) -> Result<Leaf, MlsRulesError> {
+pub(crate) fn leaf_at(roster: &Roster<'_>, index: u32) -> Result<Leaf, MlsRulesError> {
     let member = roster
         .member_with_index(index)
         .map_err(|e| MlsRulesError::UnreadableLeaf(e.to_string()))?;
@@ -233,7 +237,7 @@ fn leaf_at(roster: &Roster<'_>, index: u32) -> Result<Leaf, MlsRulesError> {
 ///
 /// Read from the roster, never from the proposal body — a sender that
 /// could name its own airdress or person could name someone else's.
-fn proposer_leaf(
+pub(crate) fn proposer_leaf(
     sender: Sender,
     source: &CommitSource,
     roster: &Roster<'_>,
@@ -259,7 +263,7 @@ fn proposer_leaf(
 /// Order matters and is the module's: airdress first (unchanged), then
 /// — only when a `v: 3` leaf is on either side — pin subject, then the
 /// revocation witness for a `v: 3` target.
-fn authorise_removal(
+pub(crate) fn authorise_removal(
     by: &Leaf,
     target: &Leaf,
     revocation: Option<&dyn RevocationLookup>,
@@ -365,6 +369,30 @@ impl mls_rs::MlsRules for AirdressMlsRules {
         mut proposals: ProposalBundle,
     ) -> Result<ProposalBundle, Self::Error> {
         let revocation = self.revocation();
+        // A group conversation (its context carries the group extensions)
+        // has its own rule set, which replaces the removal rule below: an
+        // admin removes across airdresses there (SPEC-145 F-1).
+        if let Some(view) =
+            crate::group_rules::GroupView::of(current_roster, &current_context.extensions)?
+        {
+            crate::group_rules::filter(
+                &view,
+                direction,
+                &source,
+                &mut proposals,
+                revocation.as_deref(),
+            )?;
+            return self
+                .inner
+                .filter_proposals(
+                    direction,
+                    source,
+                    current_roster,
+                    current_context,
+                    proposals,
+                )
+                .map_err(|e: core::convert::Infallible| match e {});
+        }
         proposals.retain_by_type::<RemoveProposal, _, Self::Error>(|info| {
             let target = leaf_at(current_roster, info.proposal.to_remove())?;
             let Some(by) = proposer_leaf(*info.sender(), &source, current_roster)? else {

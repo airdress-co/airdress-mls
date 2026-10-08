@@ -15,10 +15,15 @@ use crate::binding::aad_for;
 use crate::credential::{
     AirdressIdentity, AirdressIdentityProvider, Clock, RevocationLookup, RootKeyLookup, airdress_of,
 };
+use crate::group_context::{GROUP_EXTENSION_TYPES, GroupExtensions};
 use crate::rules::AirdressMlsRules;
 use crate::storage::{
     DEFAULT_MAX_EPOCH_RETENTION, SealedGroupStore, SealedKeyPackageStore, SealedStore,
 };
+
+#[path = "engine_group.rs"]
+mod group;
+pub use group::{RosterEntry, message_epoch};
 
 const CIPHER_SUITE: CipherSuite = CipherSuite::CURVE25519_CHACHA;
 
@@ -286,6 +291,9 @@ enum StagedProposal {
     Add(Vec<u8>),
     /// Leaf index of the member to remove.
     Remove(u32),
+    /// The group conversation's extensions as they should read after the
+    /// commit (SPEC-145 design D-5).
+    Extensions(GroupExtensions),
 }
 
 impl core::fmt::Debug for MlsEngine {
@@ -412,6 +420,11 @@ impl MlsEngine {
                 &identity_provider,
             ))
             .crypto_provider(RustCryptoProvider::default())
+            // Every device can be in a group conversation: RFC 9420 lets a
+            // context carry an extension only when every member's leaf
+            // advertises it, so an engine that predates these is refused
+            // when someone tries to add it to a group.
+            .extension_types(GROUP_EXTENSION_TYPES)
             .identity_provider(identity_provider.clone())
             .signing_identity(signing_identity, secret_key, CIPHER_SUITE)
             .build();
@@ -975,6 +988,22 @@ impl MlsEngine {
             .member_at_index(index)
             .ok_or_else(|| format!("no member at leaf {index}"))?;
         let revocation = self.identity_provider.registered_revocation_lookup();
+        // A modified client, in the tests: the early refusal is skipped
+        // along with the rules on the send side.
+        #[cfg(test)]
+        if crate::group_rules::SEND_UNCHECKED.with(std::cell::Cell::get) {
+            return Ok(());
+        }
+        // A group conversation: its own rule (an admin removes anyone).
+        if let Some(current) = GroupExtensions::from_list(&group.context().extensions)? {
+            return crate::group_rules::check_removal(
+                &current,
+                own.signing_identity(),
+                target.signing_identity(),
+                revocation.as_deref(),
+            )
+            .map_err(|e| e.to_string());
+        }
         crate::rules::check_removal(
             own.signing_identity(),
             target.signing_identity(),
@@ -1106,6 +1135,9 @@ impl MlsEngine {
                 StagedProposal::Remove(index) => builder
                     .remove_member(*index)
                     .map_err(|e| format!("remove member: {e}"))?,
+                StagedProposal::Extensions(ext) => builder
+                    .set_group_context_ext(ext.to_list()?)
+                    .map_err(|e| format!("group extensions: {e}"))?,
             };
         }
         let output = builder.build().map_err(|e| format!("commit: {e}"))?;

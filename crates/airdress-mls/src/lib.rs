@@ -29,6 +29,8 @@ pub mod canonical;
 pub mod credential;
 pub mod delegation;
 pub mod engine;
+pub mod group_context;
+pub mod group_rules;
 pub mod rules;
 pub mod storage;
 pub mod vectors;
@@ -48,6 +50,13 @@ pub mod fuzzing {
     /// record that decodes must encode back to the same bytes.
     pub fn group_record_round_trip(bytes: &[u8]) {
         crate::storage::fuzz_group_record(bytes);
+    }
+
+    /// `group_context::GroupExtensions::from_list` over four bodies a
+    /// peer chose (split on `0x00`): what parses must validate, and must
+    /// re-encode to a list that parses to the same value.
+    pub fn group_extensions_decode(bytes: &[u8]) {
+        crate::group_context::fuzz_from_list(bytes);
     }
 }
 

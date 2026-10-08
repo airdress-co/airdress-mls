@@ -64,6 +64,26 @@ owner.
   builds its own `mls-rs` client (the operator's agent does) and wants a
   household peer's commit removing a revoked person to apply must do the
   same, or that commit is refused there.
+- **`MlsRulesError` has a fourth variant, `Group(GroupRule)`**: a group
+  conversation's rules refused the proposal set. An exhaustive `match`
+  needs the arm.
+- **A group conversation has its own rule set**, which replaces the
+  per-airdress removal rule there and only there (SPEC-145 design D-5).
+  A group conversation is one whose context carries all four group
+  extensions; every other group is unchanged. In one, an admin may remove
+  any person's devices (across airdresses), a member only their own; a
+  person's devices are added only by that person; a new person only by an
+  admin unless the policy says otherwise; the policy and the sequencer are
+  the admins'; the title and picture follow the policy; and after every
+  commit an admin is still in the group, so a commit removing the last one
+  must carry the forced promotion of the earliest-joined person. A commit
+  breaking any of them is refused on `commit_pending` and on
+  `process_commit`, naming the rule.
+- **Every engine advertises the four group extension types** in its leaf
+  capabilities, so a key package from this version differs from one made
+  by an earlier version. RFC 9420 lets a group context carry an extension
+  only when every leaf advertises it, so an older engine cannot be added
+  to a group conversation.
 
 ### Added
 
@@ -85,6 +105,18 @@ owner.
 - `AirdressMlsRules::sharing_revocation_with(&AirdressIdentityProvider)`:
   the rules, reading the revocation witness from the provider's check-5
   lookup, whenever the host registers it.
+- Group conversations (SPEC-145): `group_context` (the four extensions
+  `airdress_group_profile`, `_roles`, `_policy`, `_sequencer` in the
+  private-use range `0xF5A1`–`0xF5A4`, JSON bodies with a version field;
+  `GroupExtensions`, `canonical_join_order`, `forced_roles`,
+  `GROUP_MAX_PERSONS` = 32), `group_rules` (`GroupRule`), and on
+  `MlsEngine`: `create_group_with_extensions`, `group_extensions`,
+  `propose_extensions`, `propose_self_remove`, `group_roster`
+  (`RosterEntry`), plus `engine::message_epoch`.
+- Six C exports for them: `airdress_mls_group_create_with_extensions`,
+  `airdress_mls_group_extensions`, `airdress_mls_propose_extensions`,
+  `airdress_mls_propose_self_remove`, `airdress_mls_group_roster`,
+  `airdress_mls_message_epoch`. JSON in and out; no result struct changes.
 - Vector `person-v3-delegation`, carrying an `identity` block with the
   expected `pin_subject` and `member_identity`, so every implementation
   checks the same strings.
