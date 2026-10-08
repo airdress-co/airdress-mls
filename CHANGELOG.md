@@ -18,7 +18,7 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 - Consumers pin a tag, never a branch (rust guide R-API-6).
   `cargo-semver-checks` runs in CI against the base revision.
 
-## v0.4.0 — unreleased
+## v0.4.0 — 2026-10-09
 
 A third credential form, for every person of an airdress who is not its
 owner.
