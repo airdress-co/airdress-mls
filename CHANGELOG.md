@@ -22,14 +22,15 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 
 ### Breaking
 
-- **A committing device refuses a group conversation past 60 leaves**
+- **A committing device refuses a group conversation past 137 leaves**
   (`group_context::GROUP_LEAF_CAP`), as it already refused one past 32
   persons, with the same `GroupRule::TooManyPersons` ("that would make the
   group too big"). Only the sending side holds it; a receiver applies a
-  bigger commit. 60 is what fits the operator's default 65 536-byte
-  envelope with 20 % headroom: measured at 854 bytes a leaf plus 640 fixed
-  (SPEC-145 145-G1.14, `tests/welcome_size.rs`, run with `--ignored`).
-  32 persons fit at one device each and not at two (~55.3 KB).
+  bigger commit. 137 is what fits the operator's Welcome limit
+  (`chat.limits.max_welcome_bytes`, default 147 456 — its own limit by the
+  owner's ruling of 2026-10-09) with 20 % headroom: measured at 854 bytes
+  a leaf plus 640 fixed (SPEC-145 145-G1.14, `tests/welcome_size.rs`, run
+  with `--ignored`). 32 persons with 4 devices each (~110 KB) fit.
 
 ### Added
 
