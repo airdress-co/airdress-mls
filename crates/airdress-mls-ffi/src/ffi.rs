@@ -1373,7 +1373,10 @@ pub unsafe extern "C" fn airdress_mls_propose_add(
 
 /// Stage a `Remove` of `leaf_index` for the group's next commit
 /// (FR-2), by value. Refused when the leaf belongs to another airdress
-/// (FR-25). Returns an empty buffer on success.
+/// (FR-25), or, once a `v: 3` leaf is involved, to another person of
+/// the same airdress, unless it is a `v: 3` leaf whose device the
+/// lookup registered with `airdress_mls_set_revocation_lookup` answers
+/// revoked (SPEC-144 F-7, FR-53). Returns an empty buffer on success.
 ///
 /// # Safety
 ///

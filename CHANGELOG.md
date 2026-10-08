@@ -39,6 +39,31 @@ owner.
   must not strip the suffix and answer with the airdress root. The C
   callback registered with `airdress_mls_set_root_key_lookup` receives
   the same string.
+- **A `Remove` is authorised per person once a `v: 3` leaf is involved.**
+  Inside one airdress, a device may remove only leaves with its own pin
+  subject: the owner's devices remove the owner's, a household member's
+  devices remove that member's. A member can never remove an owner
+  device (revoked or not), and the owner can no longer remove a member's
+  live device. The one exception: a `v: 3` leaf whose `device_id` this
+  device's check-5 revocation lookup answers `Revoked` for may be removed
+  by any device of the airdress — the witness is each device's own
+  lookup, on the send and the receive side, so a commit removing a
+  device the receiver holds live is refused (and a receiver with a stale
+  view refreshes and processes the same commit again). Where there used
+  to be an answer there is now a refusal, on `propose_remove` (the
+  message is the rule's sentence) and on `process_commit` /
+  `process_proposal`. Groups with no `v: 3` leaf are unchanged: the
+  airdress rule is still the whole rule there, checked first.
+- **`MlsRulesError` has a third variant, `CrossPersonRemoval { airdress }`.**
+  An exhaustive `match` on it needs the arm. It carries the airdress only,
+  never a `person_id`.
+- **`AirdressMlsRules::new()` admits no revoked exception.** It has no
+  revocation lookup to read, so it refuses every removal of another
+  person's leaf. `MlsEngine` now builds its rules with
+  `AirdressMlsRules::sharing_revocation_with(&provider)`; a host that
+  builds its own `mls-rs` client (the operator's agent does) and wants a
+  household peer's commit removing a revoked person to apply must do the
+  same, or that commit is refused there.
 
 ### Added
 
@@ -57,6 +82,9 @@ owner.
   `credential::pin_subject_for_person`, `credential::split_pin_subject`
   and `credential::PERSON_ID_FIELD`.
 - `test_support::signed_delegation_json_v3`.
+- `AirdressMlsRules::sharing_revocation_with(&AirdressIdentityProvider)`:
+  the rules, reading the revocation witness from the provider's check-5
+  lookup, whenever the host registers it.
 - Vector `person-v3-delegation`, carrying an `identity` block with the
   expected `pin_subject` and `member_identity`, so every implementation
   checks the same strings.
@@ -73,13 +101,11 @@ owner.
 
 ### Not changed, and worth knowing
 
-- **The removal rule is still per airdress.** A member may propose
-  `Remove` only for leaves of its own airdress, and an owner and a
-  household member share one, so in a group holding both, either may
-  remove the other's devices. That is what lets a remaining device
-  remove a revoked person's leaves; whether it should also stop a
-  household member removing the owner's is an open question, not
-  decided here.
+- The C ABI: no export added. The revocation witness is the lookup a host
+  already registers with `airdress_mls_set_revocation_lookup`.
+- `ErrorCode`: a refused removal is still `Engine` (1) across the C ABI.
+  A host that refuses an inbound commit tells this refusal apart by the
+  message, refreshes its revocation state, and retries the same commit.
 
 ## v0.3.0 — 2026-10-07
 
