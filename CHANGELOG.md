@@ -18,6 +18,23 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 - Consumers pin a tag, never a branch (rust guide R-API-6).
   `cargo-semver-checks` runs in CI against the base revision.
 
+## Unreleased
+
+### Breaking
+
+- **A committing device refuses a group conversation past 60 leaves**
+  (`group_context::GROUP_LEAF_CAP`), as it already refused one past 32
+  persons, with the same `GroupRule::TooManyPersons` ("that would make the
+  group too big"). Only the sending side holds it; a receiver applies a
+  bigger commit. 60 is what fits the operator's default 65 536-byte
+  envelope with 20 % headroom: measured at 854 bytes a leaf plus 640 fixed
+  (SPEC-145 145-G1.14, `tests/welcome_size.rs`, run with `--ignored`).
+  32 persons fit at one device each and not at two (~55.3 KB).
+
+### Added
+
+- `group_context::GROUP_LEAF_CAP` and the measurement that sets it.
+
 ## v0.4.0 — 2026-10-09
 
 A third credential form, for every person of an airdress who is not its

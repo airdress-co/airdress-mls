@@ -20,7 +20,8 @@
 //! And after every commit: at least one admin is still in the group (FR-16).
 //! A commit that removes the last admin therefore has to carry the forced
 //! promotion, whoever commits it. A committing device also refuses to take
-//! the group past [`GROUP_MAX_PERSONS`] (D-11).
+//! the group past [`GROUP_MAX_PERSONS`] persons or [`GROUP_LEAF_CAP`]
+//! devices (D-11).
 //!
 //! Authority is read from the roster leaf a proposal's `Sender` points at,
 //! never from anything the proposer wrote. As in [`crate::rules`], a refused
@@ -43,7 +44,7 @@ use mls_rs::group::{Roster, Sender};
 use mls_rs::mls_rules::{CommitDirection, CommitSource, ProposalBundle, ProposalSource};
 
 use crate::credential::RevocationLookup;
-use crate::group_context::{GROUP_MAX_PERSONS, GroupExtensions, forced_roles};
+use crate::group_context::{GROUP_LEAF_CAP, GROUP_MAX_PERSONS, GroupExtensions, forced_roles};
 use crate::rules::{Leaf, MlsRulesError, authorise_removal, leaf_at, proposer_leaf};
 
 /// Which group rule a proposal set broke. The sentence is for a journal;
@@ -115,6 +116,22 @@ thread_local! {
 #[cfg(test)]
 fn person_cap() -> usize {
     PERSON_CAP.with(std::cell::Cell::get)
+}
+
+/// The leaf cap the committing device holds, overridable by tests.
+#[cfg(not(test))]
+const fn leaf_cap() -> usize {
+    GROUP_LEAF_CAP
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LEAF_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(GROUP_LEAF_CAP) };
+}
+
+#[cfg(test)]
+fn leaf_cap() -> usize {
+    LEAF_CAP.with(std::cell::Cell::get)
 }
 
 /// One group's rules, read from the context the commit is made in.
@@ -285,6 +302,12 @@ pub(crate) fn filter(
     }
     // D-11: the committing device holds the cap.
     if direction == CommitDirection::Send && after.len() > person_cap() {
+        return Err(MlsRulesError::Group(GroupRule::TooManyPersons));
+    }
+    // D-11: and the leaf cap, so the Welcome fits one envelope.
+    let leaves_after =
+        roster.members_iter().count() - removed.len() + proposals.add_proposals().len();
+    if direction == CommitDirection::Send && leaves_after > leaf_cap() {
         return Err(MlsRulesError::Group(GroupRule::TooManyPersons));
     }
     Ok(())
