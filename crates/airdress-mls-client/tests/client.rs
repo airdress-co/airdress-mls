@@ -491,3 +491,90 @@ fn five_leaves_with_an_assigned_agent_hear_every_direction() {
     let r = clients[4].process(&deliver(&after, owner, conv(4)));
     assert!(!matches!(r.event, Event::Message(_)), "{:?}", r.event);
 }
+
+/// Removed and added straight back, as a phone does when an agent's
+/// assignment ends and a new one begins: the removed device also receives
+/// the add commit (it is fanned out to every assigned enrollment), then
+/// the Welcome, then a message in the new epoch, which it must read
+/// (SPEC-166 166-B.14, measured on VM2: the agent asked to rejoin
+/// instead).
+#[test]
+fn removed_then_added_back_reads_the_new_epoch() {
+    let a = Device::new("alice.example", 21);
+    let c = Device::new("alice.example", 23);
+    let mut alice = a.open();
+    let mut carol = c.open();
+
+    let carol_kp = carol.key_packages(1).unwrap().remove(0);
+    let out = alice
+        .establish(
+            "conv-a",
+            "alice.example",
+            &carol_kp,
+            &text("one"),
+            "alice.example",
+        )
+        .unwrap();
+    for env in &out {
+        carol.process(&deliver(env, "alice.example", "conv-a"));
+    }
+    assert_eq!(
+        message(
+            &carol
+                .process(&deliver(
+                    &alice
+                        .encrypt("conv-a", &text("in"), "alice.example")
+                        .unwrap(),
+                    "alice.example",
+                    "conv-a"
+                ))
+                .event
+        )
+        .1,
+        "in"
+    );
+
+    let group = alice.directory().group_for("conv-a").unwrap();
+    let carol_identity = alice
+        .engine()
+        .group_members(&group)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.identity)
+        .find(|id| id.ends_with(b"device-23"))
+        .expect("carol's leaf");
+    let removal = alice.prepare_remove("conv-a", &[carol_identity]).unwrap();
+    alice.confirm_commit("conv-a").unwrap();
+    let carol_kp = carol.key_packages(1).unwrap().remove(0);
+    let add = alice.prepare_add("conv-a", &[carol_kp]).unwrap();
+    alice.confirm_commit("conv-a").unwrap();
+    let after = alice
+        .encrypt("conv-a", &text("back"), "alice.example")
+        .unwrap();
+
+    let mut events = Vec::new();
+    for env in [
+        &removal.commit,
+        &add.commit,
+        add.welcome.as_ref().expect("an add carries a welcome"),
+    ] {
+        let p = carol.process(&deliver(env, "alice.example", "conv-a"));
+        assert!(
+            !matches!(p.event, Event::RejoinNeeded { .. }),
+            "{:?} after {:?}",
+            p.event,
+            events
+        );
+        events.push(p.event);
+    }
+    assert_eq!(
+        message(
+            &carol
+                .process(&deliver(&after, "alice.example", "conv-a"))
+                .event
+        )
+        .1,
+        "back",
+        "{events:?}"
+    );
+}
