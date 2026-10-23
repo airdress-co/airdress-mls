@@ -339,6 +339,17 @@ impl Client {
                 },
             };
         };
+        // A group this device was removed from: its state lingers in the
+        // engine, but no commit can apply to it any more, and the one most
+        // likely to arrive is the Add bringing this device straight back,
+        // whose Welcome follows. Asking to rejoin here would be answered
+        // with a second Remove and Add (SPEC-166 166-B.14, measured on
+        // VM2).
+        if self.directory.conversation_for(&group_id).is_none() {
+            return Processed::ack(Event::Ignored {
+                reason: "a commit for a group this device was removed from".to_owned(),
+            });
+        }
         let conversation_id = self.conversation_of(env, &group_id);
         // Built from an epoch this device has passed: a commit that lost
         // the race, or one already applied. Nothing to do.
