@@ -22,6 +22,12 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 
 ### Breaking
 
+- Nothing.
+
+## v0.5.0 — 2026-10-24
+
+### Breaking
+
 - **A committing device refuses a group conversation past 137 leaves**
   (`group_context::GROUP_LEAF_CAP`), as it already refused one past 32
   persons, with the same `GroupRule::TooManyPersons` ("that would make the
