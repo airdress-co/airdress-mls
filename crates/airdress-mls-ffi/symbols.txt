@@ -96,3 +96,6 @@ airdress_mls_propose_extensions
 airdress_mls_propose_self_remove
 airdress_mls_group_roster
 airdress_mls_message_epoch
+
+# SPEC-166 166-G.4 — the sending leaf of an application message.
+airdress_mls_decrypt_bound_with_sender

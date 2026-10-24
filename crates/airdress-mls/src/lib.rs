@@ -61,7 +61,7 @@ pub mod fuzzing {
 }
 
 pub use binding::MessageBinding;
-pub use engine::{CommitOutcome, EngineError, ErrorCode, GroupMember, MlsEngine};
+pub use engine::{CommitOutcome, DecryptedMessage, EngineError, ErrorCode, GroupMember, MlsEngine};
 
 #[cfg(test)]
 mod tests {
@@ -269,6 +269,52 @@ mod tests {
         let bob_reply = bob.encrypt(&outcome.group_id, b"hi alice", "").unwrap();
         let alice_sees = alice.decrypt(&outcome.group_id, &bob_reply, "").unwrap();
         assert_eq!(alice_sees, b"hi alice");
+    }
+
+    /// SPEC-166 166-G.4: a decrypt names the leaf that sent the message,
+    /// so a claim in the plaintext can be held to that leaf. In a group of
+    /// three, each member's message is attributed to that member and not
+    /// to whoever else is in the tree.
+    #[test]
+    fn decrypt_names_the_sending_leaf() {
+        let mut alice = MlsEngine::new("alice.test").unwrap();
+        let mut bob = MlsEngine::new("bob.test").unwrap();
+        let mut carol = MlsEngine::new("carol.test").unwrap();
+
+        let outcome = alice
+            .start_group(&bob.generate_key_package().unwrap(), b"hello", "")
+            .unwrap();
+        let group_id = outcome.group_id.clone();
+        bob.process_welcome(&outcome.welcome).unwrap();
+        let first = bob
+            .decrypt_with_sender(&group_id, &outcome.first_application, "")
+            .unwrap();
+        assert_eq!(first.plaintext, b"hello");
+        assert_eq!(first.sender.airdress, "alice.test");
+
+        alice
+            .propose_add(&group_id, &carol.generate_key_package().unwrap())
+            .unwrap();
+        let add = alice.commit_pending(&group_id).unwrap();
+        alice.confirm_commit(&group_id).unwrap();
+        bob.process_commit(&group_id, &add.commit).unwrap();
+        carol.process_welcome(&add.welcome.unwrap()).unwrap();
+
+        let members = bob.group_members(&group_id).unwrap();
+        let leaf_of = |airdress: &str| {
+            members
+                .iter()
+                .find(|m| m.airdress == airdress)
+                .cloned()
+                .unwrap()
+        };
+
+        for (sender, name) in [(&mut carol, "carol.test"), (&mut alice, "alice.test")] {
+            let msg = sender.encrypt(&group_id, b"the same words", "").unwrap();
+            let got = bob.decrypt_with_sender(&group_id, &msg, "").unwrap();
+            assert_eq!(got.plaintext, b"the same words");
+            assert_eq!(got.sender, leaf_of(name), "attributed to {name}'s leaf");
+        }
     }
 
     // -----------------------------------------------------------------

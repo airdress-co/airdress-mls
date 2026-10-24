@@ -226,6 +226,15 @@ pub struct CommitOutcome {
     pub members: Vec<Vec<u8>>,
 }
 
+/// An application message's plaintext and the leaf that sent it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecryptedMessage {
+    /// The application data, as the sender encrypted it.
+    pub plaintext: Vec<u8>,
+    /// The sending leaf, by the index MLS authenticated.
+    pub sender: GroupMember,
+}
+
 /// One leaf of a group, as the caller sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupMember {
@@ -809,6 +818,24 @@ impl MlsEngine {
         message_bytes: &[u8],
         from_airdress: &str,
     ) -> Result<Vec<u8>, EngineError> {
+        self.decrypt_with_sender(group_id, message_bytes, from_airdress)
+            .map(|d| d.plaintext)
+    }
+
+    /// [`Self::decrypt`], and the leaf that sent the message.
+    ///
+    /// The sender is the member at the message's `sender_index`, which
+    /// MLS authenticates: the framing is signed with that leaf's key, so
+    /// it is the one leaf that could have produced this ciphertext. A
+    /// claim made inside the plaintext about who wrote it (SPEC-166
+    /// §11.6, a session's signature) can then be held to this leaf
+    /// rather than to "some member of the group".
+    pub fn decrypt_with_sender(
+        &mut self,
+        group_id: &[u8],
+        message_bytes: &[u8],
+        from_airdress: &str,
+    ) -> Result<DecryptedMessage, EngineError> {
         let msg = MlsMessage::from_bytes(message_bytes)
             .map_err(|e| EngineError::Other(format!("bad message: {e}")))?;
         let message_epoch = msg.epoch();
@@ -849,13 +876,26 @@ impl MlsEngine {
                     ));
                 }
                 let plaintext = app.data().to_vec();
+                // An application message changes no membership, so the
+                // roster after processing still holds the sender's leaf.
+                let member = group.member_at_index(app.sender_index).ok_or_else(|| {
+                    EngineError::Other("the sending leaf is not in the group".to_owned())
+                })?;
+                let sender = GroupMember {
+                    index: member.index,
+                    identity: self
+                        .member_identity_bytes(member.signing_identity())
+                        .map_err(EngineError::Other)?,
+                    airdress: airdress_of(member.signing_identity())
+                        .map_err(|e| EngineError::Other(e.to_string()))?,
+                };
                 // The accepting arm, and the only one that persists:
                 // decryption ratchets the secret tree forward and that
                 // has to survive a restart.
                 group
                     .write_to_storage()
                     .map_err(|e| EngineError::Other(format!("persist group: {e}")))?;
-                Ok(plaintext)
+                Ok(DecryptedMessage { plaintext, sender })
             }
             // Rejection arm. Persists nothing and drops the group, so a
             // Commit misrouted onto this path cannot advance the epoch

@@ -1292,6 +1292,66 @@ pub unsafe extern "C" fn airdress_mls_decrypt_bound(
     })
 }
 
+/// [`airdress_mls_decrypt_bound`], and the leaf that sent the message.
+///
+/// Returns a list of exactly three items: the plaintext; the sending
+/// leaf's identity (`airdress ‖ 0x1F ‖ device_id` under v2, the same
+/// bytes `airdress_mls_group_members` gives); and its leaf index as four
+/// bytes, little-endian. The sender is the leaf MLS authenticated for
+/// this ciphertext, so a claim inside the plaintext about who wrote it
+/// can be held to that one leaf (SPEC-166 §11.6).
+///
+/// # Safety
+///
+/// As `airdress_mls_decrypt_bound`. The result is freed with
+/// `airdress_mls_free_bytes_list` (contract 3).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn airdress_mls_decrypt_bound_with_sender(
+    handle_id: u64,
+    group_id_ptr: *const u8,
+    group_id_len: usize,
+    message_ptr: *const u8,
+    message_len: usize,
+    from_airdress: *const c_char,
+) -> FfiBytesList {
+    guarded(FfiBytesList::err, || {
+        // SAFETY: two byte inputs (contract 1) and a string input
+        // (contract 2), per `# Safety`.
+        let inputs = unsafe {
+            group_and_payload(
+                group_id_ptr,
+                group_id_len,
+                message_ptr,
+                message_len,
+                "message",
+            )
+            .and_then(|(g, m)| Ok((g, m, required_str(from_airdress, "from_airdress")?)))
+        };
+        let (group_id, message, airdress) = match inputs {
+            Ok(inputs) => inputs,
+            Err(e) => return FfiBytesList::err(e),
+        };
+        with_engine(
+            handle_id,
+            || FfiBytesList::err(FfiError::invalid_handle()),
+            |engine| {
+                FfiBytesList::from_result(
+                    engine
+                        .decrypt_with_sender(group_id, message, airdress)
+                        .map(|d| {
+                            vec![
+                                d.plaintext,
+                                d.sender.identity,
+                                d.sender.index.to_le_bytes().to_vec(),
+                            ]
+                        })
+                        .map_err(FfiError::from),
+                )
+            },
+        )
+    })
+}
+
 /// The MLS group id carried in a message's framing, in the clear.
 ///
 /// ## Why the client needs this (design D-10, the second half)
@@ -2780,6 +2840,69 @@ mod tests {
             })
             .expect("the correctly bound decrypt still works"),
             b"hello bob"
+        );
+    }
+
+    /// SPEC-166 166-G.4: the sender-naming decrypt gives three items,
+    /// the plaintext, the sending leaf's identity and its index, freed
+    /// with the ordinary list free.
+    #[test]
+    fn decrypt_bound_with_sender_names_the_sending_leaf() {
+        let alice = engine(ALICE, 0x51, "alice-s", true);
+        let bob = engine(BOB, 0x52, "bob-s", true);
+        let c_alice = CString::new(ALICE).unwrap();
+
+        let bob_kp = key_package(&bob);
+        // SAFETY: live local buffers and C strings, each with its own
+        // length, outliving the call; the result is freed by a take_* helper.
+        let started = take_start(unsafe {
+            airdress_mls_start_group_bound(
+                alice.id,
+                bob_kp.as_ptr(),
+                bob_kp.len(),
+                b"hello bob".as_ptr(),
+                b"hello bob".len(),
+                c_alice.as_ptr(),
+            )
+        })
+        .expect("establish");
+        // SAFETY: as above.
+        take_bytes(unsafe {
+            airdress_mls_process_welcome(bob.id, started.welcome.as_ptr(), started.welcome.len())
+        })
+        .expect("bob joins");
+
+        // SAFETY: as above; the list is copied out and freed once, here.
+        let list = unsafe {
+            super::airdress_mls_decrypt_bound_with_sender(
+                bob.id,
+                started.group_id.as_ptr(),
+                started.group_id.len(),
+                started.first_application.as_ptr(),
+                started.first_application.len(),
+                c_alice.as_ptr(),
+            )
+        };
+        assert!(list.error.is_null(), "decrypt_bound_with_sender failed");
+        assert_eq!(list.len, 3);
+        // SAFETY: a successful list of `len` items this crate made.
+        let items: Vec<Vec<u8>> = unsafe { std::slice::from_raw_parts(list.items, list.len) }
+            .iter()
+            // SAFETY: each item's buffer is `len` initialised bytes.
+            .map(|b| unsafe { std::slice::from_raw_parts(b.ptr, b.len) }.to_vec())
+            .collect();
+        // SAFETY: the list, unchanged, freed once.
+        unsafe { super::airdress_mls_free_bytes_list(list) };
+
+        assert_eq!(items[0], b"hello bob");
+        let mut identity = ALICE.as_bytes().to_vec();
+        identity.push(0x1f);
+        identity.extend_from_slice(b"alice-s");
+        assert_eq!(items[1], identity, "alice's leaf identity");
+        assert_eq!(
+            items[2],
+            0u32.to_le_bytes(),
+            "alice founded the group at leaf 0"
         );
     }
 

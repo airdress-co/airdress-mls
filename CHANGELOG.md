@@ -35,6 +35,16 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 ### Added
 
 - `group_context::GROUP_LEAF_CAP` and the measurement that sets it.
+- **A decrypt can say which leaf sent the message.**
+  `MlsEngine::decrypt_with_sender` returns a `DecryptedMessage`: the
+  plaintext and the sending `GroupMember` (index, identity, airdress), by
+  the `sender_index` MLS authenticated. `decrypt` is unchanged and now
+  delegates to it. Across the C ABI it is the new export
+  `airdress_mls_decrypt_bound_with_sender`: a list of exactly three items
+  (plaintext, the leaf's identity as `airdress_mls_group_members` gives
+  it, the leaf index as four bytes little-endian), freed with
+  `airdress_mls_free_bytes_list`. It lets the phone hold an agent session's
+  signature to the leaf that sent the message (SPEC-166 166-G.4).
 
 ## v0.4.0 — 2026-10-09
 
