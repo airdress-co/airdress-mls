@@ -10,7 +10,8 @@ use airdress_mls::MlsEngine;
 use airdress_mls::credential::test_support::signed_delegation_json_v2;
 use airdress_mls_client::wire::b64_group_id;
 use airdress_mls_client::{
-    Client, Event, InboundEnvelope, LanePayload, OutboundEnvelope, commit_group_tag,
+    Client, Event, InboundEnvelope, LanePayload, OutboundEnvelope, ReplyTo, commit_group_tag,
+    mint_message_ref,
 };
 use base64::Engine as _;
 use ed25519_dalek::SigningKey;
@@ -359,6 +360,19 @@ fn the_shared_vectors_hold() {
         serde_json::from_str(airdress_mls_client::vectors::LANE_PAYLOAD).unwrap();
     let cases = v["vectors"].as_array().unwrap();
     assert!(cases.len() >= 6);
+    // The cases a reply depends on; a copy of the file that lost one
+    // fails here rather than passing on what is left.
+    for name in [
+        "object-with-ref",
+        "reply-with-ref",
+        "quote-only-reply",
+        "unknown-keys-ignored",
+    ] {
+        assert!(
+            cases.iter().any(|c| c["name"] == name),
+            "{name} is missing from the lane payload vectors"
+        );
+    }
     for case in cases {
         let got = LanePayload::decode(case["plaintext"].as_str().unwrap().as_bytes());
         match &case["decodes_to"] {
@@ -374,6 +388,67 @@ fn the_shared_vectors_hold() {
             }
         }
     }
+}
+
+/// A message's reference and a reply's `reply_to` reach the receiver's
+/// [`Event::Message`]; an old device's bare array arrives with neither.
+#[test]
+fn a_reply_names_the_message_it_answers() {
+    let a = Device::new("alice.example", 21);
+    let b = Device::new("bob.example", 22);
+    let mut alice = a.open();
+    let mut bob = b.open();
+
+    let original_ref = mint_message_ref();
+    let original = LanePayload::encode_message(
+        &serde_json::json!([{"type": "text", "text": "which one?"}]),
+        &original_ref,
+        None,
+    )
+    .unwrap();
+    let bob_kp = bob.key_packages(1).unwrap().remove(0);
+    let out = alice
+        .establish("conv-a", "bob.example", &bob_kp, &original, "alice.example")
+        .unwrap();
+    bob.process(&deliver(&out[0], "alice.example", "conv-b"));
+    let got = bob.process(&deliver(&out[1], "alice.example", "conv-b"));
+    let Event::Message(m) = got.event else {
+        panic!("expected a message, got {:?}", got.event)
+    };
+    assert_eq!(m.r#ref.as_deref(), Some(original_ref.as_str()));
+    assert_eq!(m.reply_to, None);
+
+    let answer = ReplyTo {
+        r#ref: m.r#ref,
+        from: m.from_airdress,
+        by_session: None,
+        kind: "text".to_owned(),
+        snippet: "which one?".to_owned(),
+    };
+    let reply_ref = mint_message_ref();
+    let reply = LanePayload::encode_message(
+        &serde_json::json!([{"type": "text", "text": "the second"}]),
+        &reply_ref,
+        Some(&answer),
+    )
+    .unwrap();
+    let sent = bob.encrypt("conv-b", &reply, "bob.example").unwrap();
+    let got = alice.process(&deliver(&sent, "bob.example", "conv-a"));
+    let Event::Message(m) = got.event else {
+        panic!("expected a message, got {:?}", got.event)
+    };
+    assert_eq!(m.r#ref.as_deref(), Some(reply_ref.as_str()));
+    assert_eq!(m.reply_to, Some(answer));
+    assert_eq!(m.blocks[0]["text"], "the second");
+
+    let old = bob
+        .encrypt("conv-b", &text("old form"), "bob.example")
+        .unwrap();
+    let got = alice.process(&deliver(&old, "bob.example", "conv-a"));
+    let Event::Message(m) = got.event else {
+        panic!("expected a message, got {:?}", got.event)
+    };
+    assert_eq!((m.r#ref, m.reply_to), (None, None));
 }
 
 /// The risk the n-device lanes carry (n ≥ 4 leaves), with an agent among

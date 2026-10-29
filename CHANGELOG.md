@@ -22,12 +22,36 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 
 ### Breaking
 
-- Nothing in this crate's API, the C ABI or the wire. A consumer that also
-  names `mls-rs` or `mls-rs-core` itself must move them with this pin, to
-  0.57 and 0.27. Moving the pin also needs `mls-rs-codec` 0.7.1 in the
+- **`LanePayload` and `Message` gain two public fields**, `r#ref:
+  Option<String>` and `reply_to: Option<ReplyTo>`. A consumer that builds
+  either with a struct literal adds them (`None` for both keeps today's
+  meaning); one that only reads them changes nothing.
+- The provider upgrade changes nothing in the C ABI or the wire. A
+  consumer that also names `mls-rs` or `mls-rs-core` itself must move them
+  with this pin, to 0.57 and 0.27. Moving the pin also needs `mls-rs-codec` 0.7.1 in the
   consumer's lockfile (`cargo update -p mls-rs-codec`): mls-rs 0.57 asks
   for `^0.7` but calls a function 0.7.1 added, so a lockfile still on
   0.7.0 does not build.
+
+### Added
+
+- **A message can carry its own reference, and a reply what it answers**
+  (SPEC-174 174-A.1). The lane payload's object form now reads
+  `{"blocks": [...], "ref": "...", "reply_to": {...}}`, and the two keys
+  reach the receiver's `Message`. `ReplyTo` holds `ref` (absent for a
+  quote-only reply to an old client's message), `from`, `by_session`,
+  `kind` and `snippet`, and serializes exactly as it travels, with absent
+  keys absent rather than `null`. A malformed `ref` or `reply_to` is read
+  as absent and never refuses the message; unknown keys stay ignored, at
+  the top level and inside `reply_to`. The C ABI is unchanged: the phone
+  decodes payloads in Dart.
+- `LanePayload::encode_message(blocks, ref, reply_to)`, the object form a
+  current device sends, and `mint_message_ref()`, sixteen random bytes as
+  base64url without padding. `encode_device` still sends the bare array.
+- Six lane payload vectors (174-A.2): `object-with-ref`, `reply-with-ref`,
+  `quote-only-reply`, `unknown-keys-ignored`,
+  `malformed-reply-to-is-no-reply` and `ref-not-a-string-is-no-ref`.
+- A fuzz target for `LanePayload::decode`, and its pure tests under Miri.
 
 ### Fixed
 

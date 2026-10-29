@@ -66,10 +66,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "airdress-mls-client"
+version = "0.5.0"
+dependencies = [
+ "airdress-mls",
+ "base64",
+ "chacha20poly1305",
+ "mls-rs",
+ "serde",
+ "serde_json",
+ "sha2",
+ "zeroize",
+]
+
+[[package]]
 name = "airdress-mls-fuzz"
 version = "0.0.0"
 dependencies = [
  "airdress-mls",
+ "airdress-mls-client",
  "libfuzzer-sys",
 ]
 

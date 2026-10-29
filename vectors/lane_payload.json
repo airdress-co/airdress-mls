@@ -1,5 +1,5 @@
 {
-  "description": "Lane payloads: the plaintext of an application message. Devices send a bare block array; the operator's agent sends an object with origin and blocks. Each `decodes_to` is what a client must read; `decodes_to: null` means the plaintext must be refused as not a chat payload.",
+  "description": "Lane payloads: the plaintext of an application message. Old devices send a bare block array; the operator's agent sends an object with origin and blocks; a current device sends an object with blocks, its own ref and, on a reply, reply_to. Each `decodes_to` is what a client must read; `decodes_to: null` means the plaintext must be refused as not a chat payload. Unknown keys are ignored, at the top level and inside reply_to. A malformed ref or reply_to never refuses the payload: it decodes as absent. Keys absent from `decodes_to` (ref, reply_to, and reply_to's ref and by_session) are absent from the decoded value, never null.",
   "vectors": [
     {
       "name": "bare-array",
@@ -67,6 +67,108 @@
       "name": "not-json",
       "plaintext": "hi there",
       "decodes_to": null
+    },
+    {
+      "name": "object-with-ref",
+      "plaintext": "{\"blocks\":[{\"type\":\"text\",\"text\":\"yes, the second one\"}],\"ref\":\"q3v1oV0wQ7i2b9u8h4mYxA\"}",
+      "decodes_to": {
+        "origin": null,
+        "blocks": [
+          {
+            "type": "text",
+            "text": "yes, the second one"
+          }
+        ],
+        "ref": "q3v1oV0wQ7i2b9u8h4mYxA"
+      }
+    },
+    {
+      "name": "reply-with-ref",
+      "plaintext": "{\"blocks\":[{\"type\":\"text\",\"text\":\"yes, the second one\"}],\"ref\":\"q3v1oV0wQ7i2b9u8h4mYxA\",\"reply_to\":{\"ref\":\"Jk2m0PZpQh6Q1wVf3n8sLg\",\"from\":\"b.example\",\"by_session\":\"bob\",\"kind\":\"text\",\"snippet\":\"Three options: 1) now, 2) after the soak, 3) …\"}}",
+      "decodes_to": {
+        "origin": null,
+        "blocks": [
+          {
+            "type": "text",
+            "text": "yes, the second one"
+          }
+        ],
+        "ref": "q3v1oV0wQ7i2b9u8h4mYxA",
+        "reply_to": {
+          "ref": "Jk2m0PZpQh6Q1wVf3n8sLg",
+          "from": "b.example",
+          "by_session": "bob",
+          "kind": "text",
+          "snippet": "Three options: 1) now, 2) after the soak, 3) …"
+        }
+      }
+    },
+    {
+      "name": "quote-only-reply",
+      "plaintext": "{\"blocks\":[{\"type\":\"text\",\"text\":\"yes, the second one\"}],\"ref\":\"q3v1oV0wQ7i2b9u8h4mYxA\",\"reply_to\":{\"from\":\"b.example\",\"kind\":\"image\",\"snippet\":\"\"}}",
+      "decodes_to": {
+        "origin": null,
+        "blocks": [
+          {
+            "type": "text",
+            "text": "yes, the second one"
+          }
+        ],
+        "ref": "q3v1oV0wQ7i2b9u8h4mYxA",
+        "reply_to": {
+          "from": "b.example",
+          "kind": "image",
+          "snippet": ""
+        }
+      }
+    },
+    {
+      "name": "unknown-keys-ignored",
+      "plaintext": "{\"blocks\":[{\"type\":\"text\",\"text\":\"yes, the second one\"}],\"ref\":\"q3v1oV0wQ7i2b9u8h4mYxA\",\"edited_at\":\"2026-10-29T00:00:00Z\",\"reply_to\":{\"ref\":\"Jk2m0PZpQh6Q1wVf3n8sLg\",\"from\":\"b.example\",\"by_session\":\"bob\",\"kind\":\"text\",\"snippet\":\"Three options: 1) now, 2) after the soak, 3) …\",\"quoted_at\":3}}",
+      "decodes_to": {
+        "origin": null,
+        "blocks": [
+          {
+            "type": "text",
+            "text": "yes, the second one"
+          }
+        ],
+        "ref": "q3v1oV0wQ7i2b9u8h4mYxA",
+        "reply_to": {
+          "ref": "Jk2m0PZpQh6Q1wVf3n8sLg",
+          "from": "b.example",
+          "by_session": "bob",
+          "kind": "text",
+          "snippet": "Three options: 1) now, 2) after the soak, 3) …"
+        }
+      }
+    },
+    {
+      "name": "malformed-reply-to-is-no-reply",
+      "plaintext": "{\"blocks\":[{\"type\":\"text\",\"text\":\"yes, the second one\"}],\"ref\":\"q3v1oV0wQ7i2b9u8h4mYxA\",\"reply_to\":{\"ref\":\"Jk2m0PZpQh6Q1wVf3n8sLg\",\"kind\":\"text\",\"snippet\":\"x\"}}",
+      "decodes_to": {
+        "origin": null,
+        "blocks": [
+          {
+            "type": "text",
+            "text": "yes, the second one"
+          }
+        ],
+        "ref": "q3v1oV0wQ7i2b9u8h4mYxA"
+      }
+    },
+    {
+      "name": "ref-not-a-string-is-no-ref",
+      "plaintext": "{\"blocks\":[{\"type\":\"text\",\"text\":\"yes, the second one\"}],\"ref\":12}",
+      "decodes_to": {
+        "origin": null,
+        "blocks": [
+          {
+            "type": "text",
+            "text": "yes, the second one"
+          }
+        ]
+      }
     }
   ]
 }

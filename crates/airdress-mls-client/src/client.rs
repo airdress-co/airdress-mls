@@ -18,7 +18,7 @@ use airdress_mls::{EngineError, MlsEngine};
 
 use crate::directory::Directory;
 use crate::wire::{
-    EnvelopeKind, InboundEnvelope, LanePayload, OutboundEnvelope, commit_group_tag,
+    EnvelopeKind, InboundEnvelope, LanePayload, OutboundEnvelope, ReplyTo, commit_group_tag,
     message_group_id,
 };
 
@@ -38,12 +38,22 @@ pub struct Message {
     pub origin: Option<String>,
     /// The chat blocks, uninterpreted.
     pub blocks: serde_json::Value,
+    /// The message's own reference, as its sender minted it; `None` from
+    /// an old client. With `from_airdress` and the conversation it is the
+    /// key a reply names this message by.
+    pub r#ref: Option<String>,
+    /// What this message replies to, when it is a reply.
+    pub reply_to: Option<ReplyTo>,
     /// When the operator accepted it, as it said.
     pub received_at: Option<String>,
 }
 
 /// What one envelope did.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one Event per envelope, consumed at once; boxing Message would change every consumer's match for no measurable gain"
+)]
 pub enum Event {
     /// A Welcome: this device is now a member of the group.
     Joined {
@@ -306,6 +316,8 @@ impl Client {
                     from_airdress: env.from_airdress.clone(),
                     origin: payload.origin,
                     blocks: payload.blocks,
+                    r#ref: payload.r#ref,
+                    reply_to: payload.reply_to,
                     received_at: env.received_at.clone(),
                 })),
                 Err(e) => Processed::ack(Event::Failed {
