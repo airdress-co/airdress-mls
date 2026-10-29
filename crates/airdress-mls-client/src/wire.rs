@@ -155,24 +155,116 @@ pub fn commit_group_tag(group_id: &[u8]) -> String {
 
 /// What an application message's plaintext holds.
 ///
-/// Devices send the bare block array. The operator's agent sends
-/// `{"origin": "agent", "blocks": [...]}` for its own replies and
-/// `"sibling"` for copies of another device's words; both forms decode.
+/// Devices used to send the bare block array, and an old device still
+/// does. The operator's agent sends `{"origin": "agent", "blocks": [...]}`
+/// for its own replies and `"sibling"` for copies of another device's
+/// words. A current device sends the object form too, with the message's
+/// own reference and, on a reply, what it answers:
+/// `{"blocks": [...], "ref": "...", "reply_to": {...}}`. Every form
+/// decodes.
+///
+/// Keys this crate does not know are ignored, at the top level and inside
+/// `reply_to`: that is what lets the next field arrive without breaking a
+/// decoder already in the field.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LanePayload {
     /// `agent`, `sibling`, or absent for a device's own words.
     pub origin: Option<String>,
     /// The chat blocks, as JSON; this crate does not interpret them.
     pub blocks: serde_json::Value,
+    /// The message's own reference, minted by its sender (see
+    /// [`mint_message_ref`]). Absent from an old client's messages, and
+    /// read as absent when it is not a non-empty string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#ref: Option<String>,
+    /// What this message replies to, when it is a reply. A `reply_to`
+    /// that is not a well-formed [`ReplyTo`] is read as absent: the
+    /// message still decodes, it is just not shown as a reply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<ReplyTo>,
+}
+
+/// The message a reply answers, as the replier saw it.
+///
+/// A receiver finds the original by `(conversation, from, ref)`; `from`
+/// is the sending airdress the receiver authenticated, so a sender cannot
+/// point a quote at another airdress's message. `snippet` is the
+/// replier's assertion of what the original said, to show only when the
+/// original itself cannot be found.
+///
+/// Serializes exactly as it travels: absent optional keys stay absent,
+/// never `null`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReplyTo {
+    /// The original's [`LanePayload::ref`]. Absent when the original
+    /// carried none (it came from an old client): a quote-only reply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#ref: Option<String>,
+    /// The original's sending airdress.
+    pub from: String,
+    /// The original's verified agent session name, when the replier had
+    /// verified one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by_session: Option<String>,
+    /// What the original was: `text`, `code`, `image`, `audio`, `place`,
+    /// `live` or `other`. Kept as sent, so a kind added later still
+    /// decodes.
+    pub kind: String,
+    /// Plain text from the original, possibly empty (non-text content).
+    pub snippet: String,
+}
+
+impl ReplyTo {
+    /// Read a `reply_to` object. `None` when it is not one: not an object,
+    /// `from` or `kind` missing or not a non-empty string, `snippet` not a
+    /// string, or `ref` or `by_session` present and not a string. An empty
+    /// `ref` or `by_session` is read as absent. Unknown keys are ignored.
+    #[must_use]
+    pub fn from_value(value: &serde_json::Value) -> Option<Self> {
+        let obj = value.as_object()?;
+        let required = |key: &str| {
+            obj.get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        let optional = |key: &str| match obj.get(key) {
+            None | Some(serde_json::Value::Null) => Some(None),
+            Some(serde_json::Value::String(s)) if s.is_empty() => Some(None),
+            Some(serde_json::Value::String(s)) => Some(Some(s.clone())),
+            Some(_) => None,
+        };
+        Some(Self {
+            r#ref: optional("ref")?,
+            from: required("from")?,
+            by_session: optional("by_session")?,
+            kind: required("kind")?,
+            snippet: obj.get("snippet")?.as_str()?.to_owned(),
+        })
+    }
+}
+
+/// A fresh message reference: sixteen random bytes, base64url without
+/// padding (22 characters). Mint it once per message, before the first
+/// send attempt, and keep it across retries.
+#[must_use]
+pub fn mint_message_ref() -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use chacha20poly1305::aead::{OsRng, rand_core::RngCore as _};
+    let mut b = [0u8; 16];
+    OsRng.fill_bytes(&mut b);
+    URL_SAFE_NO_PAD.encode(b)
 }
 
 impl LanePayload {
-    /// Decode either form. Anything else is not a chat payload.
+    /// Decode any form. Anything else is not a chat payload.
     ///
     /// # Errors
     ///
     /// The bytes are not JSON, or are neither an array nor an object with
-    /// an array under `blocks`.
+    /// an array under `blocks`, or `origin` is present and not a string.
+    /// A malformed `ref` or `reply_to` is never an error; it is read as
+    /// absent.
     pub fn decode(plaintext: &[u8]) -> Result<Self, String> {
         let value: serde_json::Value =
             serde_json::from_slice(plaintext).map_err(|e| format!("not JSON: {e}"))?;
@@ -180,6 +272,8 @@ impl LanePayload {
             serde_json::Value::Array(_) => Ok(Self {
                 origin: None,
                 blocks: value,
+                r#ref: None,
+                reply_to: None,
             }),
             serde_json::Value::Object(mut obj) => {
                 let blocks = obj
@@ -191,13 +285,25 @@ impl LanePayload {
                     Some(serde_json::Value::String(s)) => Some(s),
                     Some(_) => return Err("`origin` is not a string".to_owned()),
                 };
-                Ok(Self { origin, blocks })
+                let r#ref = match obj.remove("ref") {
+                    Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s),
+                    _ => None,
+                };
+                let reply_to = obj.get("reply_to").and_then(ReplyTo::from_value);
+                Ok(Self {
+                    origin,
+                    blocks,
+                    r#ref,
+                    reply_to,
+                })
             }
             _ => Err("a payload is a block array or an object with `blocks`".to_owned()),
         }
     }
 
-    /// What a device sends: the bare block array.
+    /// The bare block array, as an old device sent it. A current device
+    /// sends [`LanePayload::encode_message`] instead, so its messages can
+    /// be replied to.
     ///
     /// # Errors
     ///
@@ -207,6 +313,37 @@ impl LanePayload {
             return Err("blocks must be an array".to_owned());
         }
         serde_json::to_vec(blocks).map_err(|e| e.to_string())
+    }
+
+    /// What a current device sends: the object form
+    /// `{"blocks": [...], "ref": "...", "reply_to": {...}}`, with
+    /// `reply_to` only on a reply. An old decoder reads `blocks` and
+    /// ignores the rest.
+    ///
+    /// # Errors
+    ///
+    /// `blocks` is not an array, or `message_ref` is empty.
+    pub fn encode_message(
+        blocks: &serde_json::Value,
+        message_ref: &str,
+        reply_to: Option<&ReplyTo>,
+    ) -> Result<Vec<u8>, String> {
+        if !blocks.is_array() {
+            return Err("blocks must be an array".to_owned());
+        }
+        if message_ref.is_empty() {
+            return Err("a message reference is never empty".to_owned());
+        }
+        let mut obj = serde_json::Map::new();
+        obj.insert("blocks".to_owned(), blocks.clone());
+        obj.insert("ref".to_owned(), message_ref.into());
+        if let Some(reply_to) = reply_to {
+            obj.insert(
+                "reply_to".to_owned(),
+                serde_json::to_value(reply_to).map_err(|e| e.to_string())?,
+            );
+        }
+        serde_json::to_vec(&obj).map_err(|e| e.to_string())
     }
 }
 
@@ -291,5 +428,101 @@ mod tests {
             assert_eq!(EnvelopeKind::parse(k.as_str()), Some(k));
         }
         assert_eq!(EnvelopeKind::parse("mls_proposal"), None);
+    }
+
+    fn reply() -> ReplyTo {
+        ReplyTo {
+            r#ref: Some("Jk2m0PZpQh6Q1wVf3n8sLg".to_owned()),
+            from: "b.example".to_owned(),
+            by_session: Some("bob".to_owned()),
+            kind: "text".to_owned(),
+            snippet: "three options".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_minted_ref_is_sixteen_bytes_base64url_and_fresh() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let a = mint_message_ref();
+        let b = mint_message_ref();
+        assert_eq!(a.len(), 22);
+        assert_eq!(URL_SAFE_NO_PAD.decode(&a).unwrap().len(), 16);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn the_object_form_round_trips_with_ref_and_reply() {
+        let blocks = serde_json::json!([{"type": "text", "text": "yes"}]);
+        let bytes =
+            LanePayload::encode_message(&blocks, "q3v1oV0wQ7i2b9u8h4mYxA", Some(&reply())).unwrap();
+        let got = LanePayload::decode(&bytes).unwrap();
+        assert_eq!(got.origin, None);
+        assert_eq!(got.blocks, blocks);
+        assert_eq!(got.r#ref.as_deref(), Some("q3v1oV0wQ7i2b9u8h4mYxA"));
+        assert_eq!(got.reply_to, Some(reply()));
+        // Keys sort, so the bytes are the same on every encode.
+        assert!(bytes.starts_with(br#"{"blocks":"#));
+    }
+
+    #[test]
+    fn a_plain_message_carries_ref_and_no_reply() {
+        let blocks = serde_json::json!([]);
+        let bytes = LanePayload::encode_message(&blocks, "r", None).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v, serde_json::json!({"blocks": [], "ref": "r"}));
+    }
+
+    #[test]
+    fn encode_refuses_what_it_could_not_decode() {
+        let blocks = serde_json::json!([]);
+        assert!(LanePayload::encode_message(&serde_json::json!({}), "r", None).is_err());
+        assert!(LanePayload::encode_message(&blocks, "", None).is_err());
+    }
+
+    #[test]
+    fn reply_to_serializes_without_nulls() {
+        let quote_only = ReplyTo {
+            r#ref: None,
+            by_session: None,
+            ..reply()
+        };
+        assert_eq!(
+            serde_json::to_value(&quote_only).unwrap(),
+            serde_json::json!({"from": "b.example", "kind": "text", "snippet": "three options"})
+        );
+    }
+
+    #[test]
+    fn a_malformed_reply_to_is_absent_and_the_message_still_decodes() {
+        for bad in [
+            serde_json::json!("x"),
+            serde_json::json!({"kind": "text", "snippet": ""}),
+            serde_json::json!({"from": "", "kind": "text", "snippet": ""}),
+            serde_json::json!({"from": "b.example", "snippet": ""}),
+            serde_json::json!({"from": "b.example", "kind": "text"}),
+            serde_json::json!({"from": "b.example", "kind": "text", "snippet": 3}),
+            serde_json::json!({"from": "b.example", "kind": "text", "snippet": "", "ref": 1}),
+            serde_json::json!({"from": "b.example", "kind": "text", "snippet": "", "by_session": []}),
+        ] {
+            let plaintext = serde_json::to_vec(&serde_json::json!({
+                "blocks": [], "ref": "r", "reply_to": bad
+            }))
+            .unwrap();
+            let got = LanePayload::decode(&plaintext).unwrap();
+            assert_eq!(got.reply_to, None, "{bad}");
+            assert_eq!(got.r#ref.as_deref(), Some("r"));
+        }
+    }
+
+    #[test]
+    fn unknown_keys_inside_reply_to_are_ignored() {
+        let v = serde_json::json!({
+            "from": "b.example", "kind": "sticker", "snippet": "", "ref": "",
+            "by_session": null, "colour": "blue"
+        });
+        let got = ReplyTo::from_value(&v).unwrap();
+        assert_eq!(got.r#ref, None);
+        assert_eq!(got.by_session, None);
+        assert_eq!(got.kind, "sticker");
     }
 }

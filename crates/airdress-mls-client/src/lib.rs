@@ -31,4 +31,7 @@ pub mod wire;
 pub use client::{Client, Event, Message, PreparedCommit, Processed, SendError};
 pub use directory::Directory;
 pub use pins::{PinChange, PinObservation, PinStore};
-pub use wire::{EnvelopeKind, InboundEnvelope, LanePayload, OutboundEnvelope, commit_group_tag};
+pub use wire::{
+    EnvelopeKind, InboundEnvelope, LanePayload, OutboundEnvelope, ReplyTo, commit_group_tag,
+    mint_message_ref,
+};

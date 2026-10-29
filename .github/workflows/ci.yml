@@ -199,6 +199,15 @@ jobs:
             credential::tests::versioned_object_with_bad_fields_is_an_error_not_legacy \
             credential::tests::rfc3339 \
             group_context::tests
+      - name: airdress-mls-client lane payload codec
+        run: |
+          cargo +nightly miri test --locked -p airdress-mls-client --lib -- \
+            wire::tests::the_object_form_round_trips_with_ref_and_reply \
+            wire::tests::a_plain_message_carries_ref_and_no_reply \
+            wire::tests::encode_refuses_what_it_could_not_decode \
+            wire::tests::reply_to_serializes_without_nulls \
+            wire::tests::a_malformed_reply_to_is_absent_and_the_message_still_decodes \
+            wire::tests::unknown_keys_inside_reply_to_are_ignored
       - name: FFI argument checks and buffers
         run: |
           cargo +nightly miri test --locked -p airdress-mls-ffi --lib -- \
