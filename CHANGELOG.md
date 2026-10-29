@@ -22,6 +22,12 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 
 ### Breaking
 
+- Nothing.
+
+## v0.6.0 — 2026-10-29
+
+### Breaking
+
 - **`LanePayload` and `Message` gain two public fields**, `r#ref:
   Option<String>` and `reply_to: Option<ReplyTo>`. A consumer that builds
   either with a struct literal adds them (`None` for both keeps today's
