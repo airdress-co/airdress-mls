@@ -22,7 +22,35 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 
 ### Breaking
 
-- Nothing.
+- Nothing in this crate's API, the C ABI or the wire. A consumer that also
+  names `mls-rs` or `mls-rs-core` itself must move them with this pin, to
+  0.57 and 0.27. Moving the pin also needs `mls-rs-codec` 0.7.1 in the
+  consumer's lockfile (`cargo update -p mls-rs-codec`): mls-rs 0.57 asks
+  for `^0.7` but calls a function 0.7.1 added, so a lockfile still on
+  0.7.0 does not build.
+
+### Fixed
+
+- **RUSTSEC-2026-0387 (crypto-bigint 0.5: secret-dependent branches in
+  code meant to be constant time) is out of the tree.** It came in
+  through `mls-rs-crypto-rustcrypto` 0.21, whose P-256 and P-384 are not
+  optional. Moving to `mls-rs-crypto-rustcrypto` 0.23, `mls-rs` 0.57 and
+  `mls-rs-core` 0.27 brings p256/p384 0.14 and crypto-bigint 0.7.10.
+  Nothing here ever ran a secret through it (only `CURVE25519_CHACHA` is
+  configured), but the library is linked into apps and a CLI that run
+  `cargo deny`. Groups, Welcomes, commits, application messages and the
+  sealed state on disk are read both ways between this build and v0.5.0
+  (a cross-build run of all four, in both directions), and a Welcome
+  costs the same 854 bytes a leaf, so `GROUP_LEAF_CAP` stands. The
+  stricter decode in mls-rs 0.57 refuses a message with trailing bytes,
+  which no airdress-mls build has ever sent.
+
+### Changed
+
+- The MLS provider now brings its own ChaCha20 (0.10, beside the sealed
+  stores' 0.9). The workspace turns on its `zeroize` feature, which the
+  provider leaves off, so MLS message ciphers still wipe their keystream
+  state on drop; CI checks the feature on every chacha20 in the graph.
 
 ## v0.5.0 — 2026-10-24
 
