@@ -35,14 +35,21 @@ jobs:
       - name: The FFI crate's lint block is the workspace's
         run: scripts/check-lints-copy.sh
       - name: ChaCha20's keystream state is wiped on drop
-        # chacha20poly1305 0.10 always zeroizes its own key and always
-        # turns on chacha20's `zeroize` feature; this fails if a release
-        # makes that optional and nothing here asks for it.
+        # chacha20poly1305 0.10 (the sealed stores) always zeroizes its
+        # own key and always turns on chacha20's `zeroize` feature; the
+        # MLS provider's chacha20 gets it from the workspace's `chacha20`
+        # entry. Every chacha20 in the graph is checked, so a release
+        # that makes it optional, or a new copy, fails here.
         run: |
           set -euo pipefail
-          features=$(cargo tree --locked -e features -i chacha20 --prefix none)
-          echo "$features" | grep -q '^chacha20 feature "zeroize"' \
-            || { echo "$features"; echo "::error::chacha20 is built without zeroize"; exit 1; }
+          versions=$(cargo metadata --locked --format-version 1 \
+            | jq -r '.packages[] | select(.name == "chacha20") | .version')
+          [[ -n "$versions" ]] || { echo "::error::no chacha20 in the graph"; exit 1; }
+          for v in $versions; do
+            features=$(cargo tree --locked -e features -i "chacha20@$v" --prefix none)
+            echo "$features" | grep -q '^chacha20 feature "zeroize"' \
+              || { echo "$features"; echo "::error::chacha20 $v is built without zeroize"; exit 1; }
+          done
       - name: Tests (all three crates)
         run: cargo test --workspace --locked
       - name: Docs build without a warning (rust guide R-LNT-5)
