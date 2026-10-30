@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "airdress-mls"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "base64",
  "chacha20 0.10.2",
@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "airdress-mls-client"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "airdress-mls",
  "base64",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "airdress-mls-ffi"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "airdress-mls",
  "base64",
