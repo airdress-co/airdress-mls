@@ -24,6 +24,12 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 
 - Nothing.
 
+## v0.6.1 — 2026-10-31
+
+### Breaking
+
+- Nothing.
+
 ### Added
 
 - `airdress_mls::engine::WELCOME_KEY_PACKAGE_NOT_FOUND`: the exact error
