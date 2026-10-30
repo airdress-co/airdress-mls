@@ -27,6 +27,11 @@ pub use group::{RosterEntry, message_epoch};
 
 const CIPHER_SUITE: CipherSuite = CipherSuite::CURVE25519_CHACHA;
 
+/// What [`MlsEngine::process_welcome`] answers when the Welcome names a
+/// key package this engine does not hold: none of its own packages was
+/// used, so the device was never added and only a re-add brings it in.
+pub const WELCOME_KEY_PACKAGE_NOT_FOUND: &str = "join: key package not found, unable to process";
+
 /// Why an engine operation failed.
 ///
 /// Every arm but [`EngineError::EpochUnavailable`] is the historical
@@ -697,7 +702,12 @@ impl MlsEngine {
         let (mut group, _) = self
             .client
             .join_group(None, &msg, None)
-            .map_err(|e| format!("join: {e}"))?;
+            .map_err(|e| match e {
+                mls_rs::error::MlsError::WelcomeKeyPackageNotFound => {
+                    WELCOME_KEY_PACKAGE_NOT_FOUND.to_owned()
+                }
+                e => format!("join: {e}"),
+            })?;
         let group_id = group.group_id().to_vec();
         group
             .write_to_storage()
