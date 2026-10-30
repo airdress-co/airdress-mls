@@ -270,8 +270,23 @@ impl Client {
                     },
                 }
             }
-            // A Welcome this device cannot join (its key package is gone,
-            // or it was meant for another leaf) will not become joinable.
+            // A Welcome that names a key package this device does not hold,
+            // for a conversation it has no group in, means it was never
+            // added: the publisher's pool handed out a package this engine
+            // cannot open. Waiting changes nothing, so ask to be added
+            // again (SPEC-166 166-I.8); before, the Welcome was dropped and
+            // the conversation stayed unreadable for good.
+            Err(e)
+                if e == airdress_mls::engine::WELCOME_KEY_PACKAGE_NOT_FOUND
+                    && self.directory.group_for(&env.conversation_id).is_none() =>
+            {
+                Processed::ack(Event::RejoinNeeded {
+                    conversation_id: env.conversation_id.clone(),
+                    reason: format!("cannot join from this Welcome: {e}"),
+                })
+            }
+            // Any other Welcome this device cannot join (malformed, or one
+            // for a conversation it already holds) will not become joinable.
             Err(e) => Processed::ack(Event::Failed {
                 reason: format!("cannot join from this Welcome: {e}"),
                 retryable: false,

@@ -24,6 +24,21 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 
 - Nothing.
 
+### Added
+
+- `airdress_mls::engine::WELCOME_KEY_PACKAGE_NOT_FOUND`: the exact error
+  `MlsEngine::process_welcome` gives when a Welcome names a key package
+  the engine does not hold.
+
+### Changed
+
+- **`Client::process` asks to rejoin when a Welcome names a key package
+  this device does not hold**, in a conversation it has no group in: the
+  event is `RejoinNeeded` (acknowledged) instead of `Failed { retryable:
+  false }`, so a host posts its rejoin request instead of losing the
+  conversation for good. A Welcome for a conversation the device already
+  holds, or one that fails for any other reason, is still `Failed`.
+
 ## v0.6.0 — 2026-10-29
 
 ### Breaking
