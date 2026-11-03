@@ -37,7 +37,7 @@ build_target() {
   esac
 
   local src="target/$target/release/libairdress_mls_ffi.$ext"
-  if [ ! -f "$src" ]; then
+  if [[ ! -f "$src" ]]; then
     src="target/$target/release/airdress_mls_ffi.$ext"
   fi
   cp "$src" "$output_dir/"

@@ -1,0 +1,31 @@
+# Every `uses:` is pinned to a commit SHA, with the version in a trailing
+# comment. Dependabot moves both together. Monthly and grouped, so a
+# month's bumps cost one pull request and one CI run each, and a release
+# younger than a week is left to settle first.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: ci
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo-patch:
+        update-types:
+          - patch
+          - minor
+    commit-message:
+      prefix: build
