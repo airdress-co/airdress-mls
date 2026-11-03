@@ -437,6 +437,18 @@ impl SealedGroupStore {
             .and_then(|r| r.epochs.iter().map(|e| e.id).min()))
     }
 
+    /// Delete `group_id`'s record: its state and every past epoch.
+    ///
+    /// What joining a group does first. `write` merges into the record
+    /// it finds, which is right for a member moving through epochs and
+    /// wrong for a join: a device removed and later added back to the
+    /// same group id would otherwise keep the epochs of its earlier
+    /// membership, both on disk and in `max_epoch_id`, where `mls-rs`
+    /// reads the next epoch it expects to insert.
+    pub(crate) fn delete_group(&self, group_id: &[u8]) -> Result<(), StorageError> {
+        self.store.delete("groups", group_id)
+    }
+
     fn load(&self, group_id: &[u8]) -> Result<Option<GroupRecord>, StorageError> {
         self.store
             .open_read("groups", GROUP_AAD_LABEL, group_id)?

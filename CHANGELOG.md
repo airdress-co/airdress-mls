@@ -149,6 +149,15 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
   arrives, instead of failing on its spent key package. This holds within
   one process; after a restart such a Welcome asks to rejoin.
 
+### Fixed
+
+- A device removed from a group and added back to the same group id
+  joins it afresh: the Welcome replaces the group's stored record instead
+  of merging into it. Before, the epochs of its earlier membership stayed
+  on disk, and the first commit after its return was refused for an
+  unexpected epoch (`RejoinNeeded`).
+
+
 ## v0.6.1 — 2026-10-31
 
 ### Breaking

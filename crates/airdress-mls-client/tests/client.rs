@@ -728,6 +728,112 @@ fn removed_then_added_back_reads_the_new_epoch() {
     );
 }
 
+/// A device removed and added back to the same group joins it afresh:
+/// the commits after its return apply, and none of the epochs it held
+/// before it was removed are still stored.
+#[test]
+fn a_device_added_back_processes_the_commits_after_its_return() {
+    let a = Device::new("alice.example", 21);
+    let c = Device::new("alice.example", 23);
+    let d = Device::new("alice.example", 25);
+    let mut alice = a.open();
+    let mut carol = c.open();
+    let dave = d.open();
+
+    let carol_kp = carol.key_packages(1).unwrap().remove(0);
+    for env in &alice
+        .establish(
+            "conv-a",
+            "alice.example",
+            &carol_kp,
+            &text("one"),
+            "alice.example",
+        )
+        .unwrap()
+    {
+        carol.process(&deliver(env, "alice.example", "conv-a"));
+    }
+    let group = alice.directory().group_for("conv-a").unwrap();
+    // What carol's engine has on disk for the group, read through a
+    // second store over the same sealed directory.
+    let stored_epochs = || {
+        airdress_mls::storage::SealedGroupStore::new(
+            airdress_mls::storage::SealedStore::open(
+                c.dir.path().join("mls").to_str().unwrap(),
+                &c.key,
+            )
+            .unwrap(),
+        )
+        .retained_epoch_ids(&group)
+        .unwrap()
+    };
+
+    // Two commits while carol is a member, so she holds past epochs.
+    for n in [26, 27] {
+        let other_device = Device::new("alice.example", n);
+        let other = other_device.open();
+        let kp = other.key_packages(1).unwrap().remove(0);
+        let add = alice.prepare_add("conv-a", &[kp]).unwrap();
+        alice.confirm_commit("conv-a").unwrap();
+        carol.process(&deliver(&add.commit, "alice.example", "conv-a"));
+    }
+
+    let carol_identity = alice
+        .engine()
+        .group_members(&group)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.identity)
+        .find(|id| id.ends_with(b"device-23"))
+        .expect("carol's leaf");
+    let removal = alice.prepare_remove("conv-a", &[carol_identity]).unwrap();
+    alice.confirm_commit("conv-a").unwrap();
+    carol.process(&deliver(&removal.commit, "alice.example", "conv-a"));
+    let held_before = stored_epochs();
+
+    let carol_kp = carol.key_packages(1).unwrap().remove(0);
+    let add = alice.prepare_add("conv-a", &[carol_kp]).unwrap();
+    alice.confirm_commit("conv-a").unwrap();
+    for env in [&add.commit, add.welcome.as_ref().unwrap()] {
+        carol.process(&deliver(env, "alice.example", "conv-a"));
+    }
+    let joined_at = carol.engine().group_epoch(&group).expect("carol is back");
+    let stale: Vec<u64> = stored_epochs()
+        .into_iter()
+        .filter(|id| *id < joined_at)
+        .collect();
+    // A commit after the return: carol applies it and reads the epoch
+    // it opens.
+    let dave_kp = dave.key_packages(1).unwrap().remove(0);
+    let add_dave = alice.prepare_add("conv-a", &[dave_kp]).unwrap();
+    alice.confirm_commit("conv-a").unwrap();
+    let applied = carol.process(&deliver(&add_dave.commit, "alice.example", "conv-a"));
+    assert!(
+        !matches!(
+            applied.event,
+            Event::Failed { .. } | Event::RejoinNeeded { .. }
+        ),
+        "the commit after the return was refused: {:?}",
+        applied.event
+    );
+    let after = alice
+        .encrypt("conv-a", &text("after"), "alice.example")
+        .unwrap();
+    assert_eq!(
+        message(
+            &carol
+                .process(&deliver(&after, "alice.example", "conv-a"))
+                .event
+        )
+        .1,
+        "after"
+    );
+    assert!(
+        stale.is_empty(),
+        "epochs from before the removal are still stored: {stale:?} (held before: {held_before:?})"
+    );
+}
+
 /// A Welcome naming a key package this device does not hold, for a
 /// conversation it has no group in, asks to be added again instead of
 /// being dropped (SPEC-166 166-I.8).
