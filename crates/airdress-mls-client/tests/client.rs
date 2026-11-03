@@ -1116,3 +1116,60 @@ fn a_message_for_a_group_never_joined_is_given_up_after_a_bound() {
         }
     ));
 }
+
+/// More envelopes for unjoined groups than the client keeps counts for:
+/// the newcomer is given up at once, and an envelope already counted keeps
+/// its count and still reaches its bound.
+#[test]
+fn past_the_deferral_list_a_new_envelope_is_given_up_at_once() {
+    let a = Device::new("alice.example", 49);
+    let b = Device::new("bob.example", 50);
+    let mut alice = a.open();
+    let bob_kp = b.open().key_packages(1).unwrap().remove(0);
+    let out = alice
+        .establish(
+            "conv-a",
+            "bob.example",
+            &bob_kp,
+            &text("hello"),
+            "alice.example",
+        )
+        .unwrap();
+    let mut bob = b.open();
+    let first = deliver(&out[1], "alice.example", "conv-b");
+    assert!(!bob.process(&first).ack);
+    // The same ciphertext under other envelope ids fills the list.
+    let mut other = first.clone();
+    for i in 1..256 {
+        other.envelope_id = format!("other-{i}");
+        assert!(!bob.process(&other).ack, "the list holds 256 counts");
+    }
+    other.envelope_id = "newcomer".to_owned();
+    let newcomer = bob.process(&other);
+    assert!(newcomer.ack, "{:?}", newcomer.event);
+    assert!(matches!(
+        bob.process(&other).event,
+        Event::Failed {
+            retryable: false,
+            ..
+        }
+    ));
+
+    let mut last = None;
+    for attempt in 2..=airdress_mls_client::client::MAX_DEFERRALS {
+        let p = bob.process(&first);
+        if attempt < airdress_mls_client::client::MAX_DEFERRALS {
+            assert!(!p.ack, "attempt {attempt}: {:?}", p.event);
+        }
+        last = Some(p);
+    }
+    let last = last.unwrap();
+    assert!(last.ack, "{:?}", last.event);
+    assert!(matches!(
+        last.event,
+        Event::Failed {
+            retryable: false,
+            ..
+        }
+    ));
+}

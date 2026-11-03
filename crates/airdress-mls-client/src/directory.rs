@@ -35,15 +35,31 @@ pub fn scope_of(conversation_id: &str) -> String {
     format!("conv:{conversation_id}")
 }
 
-/// How many envelopes [`Directory::defer`] keeps a count for. Past it the
-/// oldest count is dropped: an envelope the operator stopped replaying
-/// leaves its count behind, and the list must not grow without limit.
+/// How many envelopes [`Directory::defer`] keeps a count for. When the
+/// list is full a count not delivered for [`STALE_DEFERRAL_SECS`] is
+/// dropped (the operator stopped replaying its envelope); when none is,
+/// the newcomer gets no count and is ended at once. An existing count is
+/// never dropped to make room: that would reset its bound.
 const MAX_DEFERRED: usize = 256;
+
+/// How long a count may go undelivered before it is taken for an envelope
+/// the operator no longer replays: a week.
+const STALE_DEFERRAL_SECS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Deferred {
     envelope_id: String,
     attempts: u32,
+    /// When it was last delivered, in Unix seconds; `0` for a count an
+    /// earlier version wrote.
+    #[serde(default)]
+    last_delivered: u64,
+}
+
+fn now_unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -213,12 +229,18 @@ impl Directory {
     }
 
     /// Count one more delivery of an envelope left for a replay, and
-    /// return the count including this one.
+    /// return the count including this one; `None` when the list has no
+    /// room for a new count ([`MAX_DEFERRED`]), and the caller ends the
+    /// envelope instead of leaving it for a replay.
     ///
     /// # Errors
     ///
     /// The sealed file could not be written; nothing was counted.
-    pub(crate) fn defer(&mut self, envelope_id: &str) -> Result<u32, String> {
+    pub(crate) fn defer(&mut self, envelope_id: &str) -> Result<Option<u32>, String> {
+        self.defer_at(envelope_id, now_unix_seconds())
+    }
+
+    fn defer_at(&mut self, envelope_id: &str, now: u64) -> Result<Option<u32>, String> {
         let mut next = self.doc.clone();
         let attempts = if let Some(d) = next
             .deferred
@@ -226,25 +248,31 @@ impl Directory {
             .find(|d| d.envelope_id == envelope_id)
         {
             d.attempts = d.attempts.saturating_add(1);
+            d.last_delivered = now;
             d.attempts
         } else {
+            if next.deferred.len() >= MAX_DEFERRED {
+                next.deferred
+                    .retain(|d| now.saturating_sub(d.last_delivered) < STALE_DEFERRAL_SECS);
+            }
+            if next.deferred.len() >= MAX_DEFERRED {
+                return Ok(None);
+            }
             next.deferred.push(Deferred {
                 envelope_id: envelope_id.to_owned(),
                 attempts: 1,
+                last_delivered: now,
             });
-            if next.deferred.len() > MAX_DEFERRED {
-                next.deferred.remove(0);
-            }
             1
         };
         self.commit(next)?;
-        Ok(attempts)
+        Ok(Some(attempts))
     }
 
     /// Drop the count of an envelope that is no longer left for a
     /// replay. Writes only when there was one. Returns whether no count
     /// remains; a count that could not be dropped is harmless, and is
-    /// pruned with the oldest ([`MAX_DEFERRED`]).
+    /// pruned once it goes undelivered ([`STALE_DEFERRAL_SECS`]).
     pub(crate) fn settle(&mut self, envelope_id: &str) -> bool {
         if !self
             .doc
@@ -324,7 +352,11 @@ mod tests {
         // the disk takes them.
         let reopened = Directory::open(dir.path(), &key).unwrap();
         assert_eq!(reopened.conversations(), d.conversations());
-        assert_eq!(d.defer("e1").unwrap(), 1, "the failed count was not kept");
+        assert_eq!(
+            d.defer("e1").unwrap(),
+            Some(1),
+            "the failed count was not kept"
+        );
         assert!(d.record("c2", b"g2").unwrap());
         d.forget("c1").unwrap();
         let reopened = Directory::open(dir.path(), &key).unwrap();
@@ -335,17 +367,36 @@ mod tests {
     fn deferral_counts_are_bounded_and_settled() {
         let dir = tempfile::tempdir().unwrap();
         let mut d = Directory::open(dir.path(), &[6u8; 32]).unwrap();
-        assert_eq!(d.defer("e1").unwrap(), 1);
-        assert_eq!(d.defer("e1").unwrap(), 2);
+        assert_eq!(d.defer("e1").unwrap(), Some(1));
+        assert_eq!(d.defer("e1").unwrap(), Some(2));
         let mut d = Directory::open(dir.path(), &[6u8; 32]).unwrap();
-        assert_eq!(d.defer("e1").unwrap(), 3, "counts survive a reopen");
+        assert_eq!(d.defer("e1").unwrap(), Some(3), "counts survive a reopen");
         assert!(d.settle("e1"));
-        assert_eq!(d.defer("e1").unwrap(), 1);
-        for i in 0..MAX_DEFERRED {
-            d.defer(&format!("x{i}")).unwrap();
+        assert_eq!(d.defer("e1").unwrap(), Some(1));
+    }
+
+    /// A full list keeps every count it holds, so each still reaches its
+    /// bound; a newcomer gets no count. A count nobody delivers for a week
+    /// makes room.
+    #[test]
+    fn a_full_deferral_list_ends_the_newcomer_and_keeps_every_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = Directory::open(dir.path(), &[6u8; 32]).unwrap();
+        let day = 24 * 60 * 60;
+        assert_eq!(d.defer_at("e1", 0).unwrap(), Some(1));
+        for i in 1..MAX_DEFERRED {
+            assert_eq!(d.defer_at(&format!("x{i}"), day).unwrap(), Some(1));
         }
         assert_eq!(d.doc.deferred.len(), MAX_DEFERRED);
-        assert_eq!(d.defer("e1").unwrap(), 1, "the oldest count was dropped");
+        assert_eq!(d.defer_at("new", day).unwrap(), None);
+        assert_eq!(d.defer_at("e1", day).unwrap(), Some(2), "e1 kept its count");
+        assert_eq!(d.doc.deferred.len(), MAX_DEFERRED);
+
+        // A week on, only the counts delivered in that week stay.
+        let later = day + STALE_DEFERRAL_SECS;
+        assert_eq!(d.defer_at("e1", later - 1).unwrap(), Some(3));
+        assert_eq!(d.defer_at("new", later).unwrap(), Some(1));
+        assert_eq!(d.doc.deferred.len(), 2);
     }
 
     #[test]
