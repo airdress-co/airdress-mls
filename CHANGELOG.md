@@ -85,6 +85,14 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 - The person and device caps refuse only a commit that grows the group
   past them. A group already past a cap still takes a removal, a key
   rotation or a settings change.
+### Changed
+
+- `MlsEngine::from_seed` deletes pooled key packages whose leaf does not
+  advertise the group extension types, both halves, and makes one
+  replacement for each, so `stored_key_packages` republishes only packages
+  a group conversation can add. A Welcome built from a deleted package
+  answers `WELCOME_KEY_PACKAGE_NOT_FOUND`, which the client turns into a
+  rejoin request.
 
 ## v0.6.1 — 2026-10-31
 
