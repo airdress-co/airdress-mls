@@ -1,11 +1,11 @@
 //! One small sealed JSON file: ChaCha20-Poly1305 under a host key,
-//! written to a temporary file and renamed into place.
+//! written to a temporary file and renamed into place, with the same
+//! helper and the same fsyncs as the engine's own sealed store.
 //!
 //! The layout is `nonce (12) ‖ ciphertext`, and the AEAD's associated
 //! data names what the file is, so a directory file renamed over a pin
 //! file fails to open rather than parsing as the wrong thing.
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng, Payload, rand_core::RngCore};
@@ -42,6 +42,7 @@ impl SealedFile {
         reason = "an AEAD failure is opaque by design; the message says what happened"
     )]
     pub(crate) fn read(&self) -> Result<Option<Vec<u8>>, String> {
+        self.remove_interrupted_writes()?;
         let bytes = match std::fs::read(&self.path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -91,32 +92,73 @@ impl SealedFile {
         let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        let tmp = self.path.with_extension("partial");
-        {
-            let mut f = open_private(&tmp)?;
-            f.write_all(&nonce)
-                .and_then(|()| f.write_all(&body))
-                .and_then(|()| f.sync_all())
-                .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-        }
-        std::fs::rename(&tmp, &self.path)
+        airdress_mls::storage::write_file_atomically(&self.path, &[&nonce, &body])
             .map_err(|e| format!("cannot replace {}: {e}", self.path.display()))
+    }
+
+    /// Remove what an interrupted write of this file left beside it: the
+    /// temp files of [`airdress_mls::storage::write_file_atomically`], and
+    /// the single `.partial` file earlier versions wrote. Each is a whole
+    /// sealed copy that nothing reads.
+    fn remove_interrupted_writes(&self) -> Result<(), String> {
+        let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let Some(name) = self.path.file_name().and_then(|n| n.to_str()) else {
+            return Ok(());
+        };
+        airdress_mls::storage::remove_interrupted_writes(dir, Some(name))
+            .map_err(|e| format!("cannot clean {}: {e}", dir.display()))?;
+        match std::fs::remove_file(self.path.with_extension("partial")) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("cannot clean {}: {e}", dir.display())),
+        }
     }
 }
 
-#[cfg(unix)]
-fn open_private(path: &Path) -> Result<std::fs::File, String> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| format!("cannot create {}: {e}", path.display()))
-}
+#[cfg(test)]
+mod tests {
+    use super::SealedFile;
 
-#[cfg(not(unix))]
-fn open_private(path: &Path) -> Result<std::fs::File, String> {
-    std::fs::File::create(path).map_err(|e| format!("cannot create {}: {e}", path.display()))
+    fn names_in(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.sealed");
+        // A directory where the file belongs: the rename into place
+        // fails after the temp file was written in full.
+        std::fs::create_dir(&path).unwrap();
+        let file = SealedFile::new(path, &[7u8; 32], b"test");
+        file.write(b"{}")
+            .expect_err("the rename onto a directory fails");
+        assert_eq!(names_in(dir.path()), vec!["pins.sealed".to_owned()]);
+    }
+
+    #[test]
+    fn opening_removes_what_an_interrupted_write_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.sealed");
+        let file = SealedFile::new(path, &[7u8; 32], b"test");
+        file.write(b"{\"a\":1}").unwrap();
+        for leftover in [
+            "pins.sealed.tmp-4242-0",
+            "pins.partial",
+            "other.sealed.tmp-1-0",
+        ] {
+            std::fs::write(dir.path().join(leftover), b"sealed").unwrap();
+        }
+        assert_eq!(file.read().unwrap().unwrap(), b"{\"a\":1}");
+        assert_eq!(
+            names_in(dir.path()),
+            vec!["other.sealed.tmp-1-0".to_owned(), "pins.sealed".to_owned()],
+            "only this file's leftovers are removed"
+        );
+    }
 }

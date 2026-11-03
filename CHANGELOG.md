@@ -166,6 +166,11 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
   and `stored_public_with_ids` (and so `stored_public_messages`) no longer
   returns a public half whose private half is gone, so an interrupted
   delete can no longer get a used package published again.
+- The client's sealed files (the directory and the pin store) are written
+  through the same helper: the directory is fsynced after the rename, a
+  failed write removes its temp file, and opening removes temp files an
+  interrupted write left (including the `.partial` file earlier versions
+  wrote).
 
 ## v0.6.1 — 2026-10-31
 
