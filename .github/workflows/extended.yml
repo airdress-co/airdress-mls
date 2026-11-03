@@ -2,7 +2,8 @@ name: Extended checks
 
 # The checks too heavy for every push (owner, 2026-11-03: "all extensive
 # checks cannot run on every commit"): Miri, AddressSanitizer, a brief run
-# of every fuzz target, and mutation testing. They run nightly on main, on
+# of every fuzz target, mutation testing, and the Android and iOS
+# cross-builds of the FFI library. They run nightly on main, on
 # workflow_dispatch, and on a pull request labelled `full-ci` (the
 # operator's convention: adding the label starts a run, a later push keeps
 # it). None of them is a required check: a required check that does not
@@ -118,6 +119,30 @@ jobs:
           for target in $(cargo +nightly fuzz list); do
             cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=30
           done
+
+  cross-build:
+    # build-native.sh, run as a person runs it, for the phone targets:
+    # every Android ABI linked with the runner's NDK (ANDROID_NDK_HOME is
+    # set on ubuntu runners), and the iOS static libraries, which need no
+    # Apple linker and so build here; linking them into an app needs
+    # Xcode, which this job does not attempt. The arm64 Android library
+    # is then held to symbols.txt like the host one in ci.yml.
+    name: Cross-build the FFI library for Android and iOS
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    timeout-minutes: 40
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Android, every ABI
+        run: crates/airdress-mls-ffi/build-native.sh android
+      - name: iOS device and simulator static libraries
+        run: crates/airdress-mls-ffi/build-native.sh ios
+      - name: nm over the arm64 Android library equals symbols.txt
+        run: scripts/check-symbols.sh crates/airdress-mls-ffi/build/android/jniLibs/arm64-v8a/libairdress_mls_ffi.so
 
   mutants:
     # Advisory: a surviving mutant is a test worth writing, not a merge
