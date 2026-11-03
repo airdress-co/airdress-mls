@@ -1,0 +1,5 @@
+# cargo-mutants: advisory on pull requests, scoped to the diff (ci.yml).
+# A mutant that breaks a decode or seal path can make a test wait out a
+# deadline; cap each test run rather than let one mutant hold the job.
+timeout_multiplier = 3.0
+minimum_test_timeout = 30

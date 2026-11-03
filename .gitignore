@@ -1,3 +1,12 @@
 /target
 /crates/airdress-mls-ffi/build/
 Cargo.lock.orig
+
+# Coverage and mutation-testing output
+lcov.info
+mutants.out/
+mutants.out.old/
+
+# Python bytecode from the commit hooks
+__pycache__/
+*.pyc
