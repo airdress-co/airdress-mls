@@ -147,6 +147,7 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 - `Directory::conversation_of_message()`.
 - `MlsEngine::discard_staged()`: drop what is staged for a group without
   committing.
+- `storage::INTERRUPTED_WRITE_AGE` (10 minutes).
 
 ### Changed
 
@@ -234,6 +235,12 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
   Before, the held commit was dropped first, and with it the only copy of
   the secrets of an epoch the operator had already accepted. A commit the
   group has moved past is still dropped.
+- Opening a store (`SealedStore::open`, the client's sealed files)
+  removes only temp files no write in progress can own: the process the
+  name records is not running (where `/proc` can say so, never this
+  process), or the file is older than `storage::INTERRUPTED_WRITE_AGE`.
+  Nothing locks a state directory, and removing every `*.tmp-*` file made
+  the rename of a second engine's write in progress fail.
 
 ## v0.6.1 — 2026-10-31
 
