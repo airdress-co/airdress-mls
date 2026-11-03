@@ -148,6 +148,9 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
   written, is filed when it is replayed, or when a message for its group
   arrives, instead of failing on its spent key package. This holds within
   one process; after a restart such a Welcome asks to rejoin.
+- `storage::write_file_atomically` and `storage::remove_interrupted_writes`:
+  the temp-file, fsync, rename and directory-fsync write both crates'
+  sealed files now use, and the cleanup of temp files a crash left.
 
 ### Fixed
 
@@ -156,7 +159,13 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
   of merging into it. Before, the epochs of its earlier membership stayed
   on disk, and the first commit after its return was refused for an
   unexpected epoch (`RejoinNeeded`).
-
+- A sealed write that fails after creating its temp file removes it, and
+  `SealedStore::open` removes temp files a crashed write left behind; each
+  held a whole sealed item. Sealed files are created mode 0600 on Unix.
+- A consumed key package loses its public half before its private half,
+  and `stored_public_with_ids` (and so `stored_public_messages`) no longer
+  returns a public half whose private half is gone, so an interrupted
+  delete can no longer get a used package published again.
 
 ## v0.6.1 — 2026-10-31
 
