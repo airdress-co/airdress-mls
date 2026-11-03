@@ -66,6 +66,10 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
   - `MlsEngine::confirm_commit` (and `airdress_mls_confirm_commit`)
     refuses, and drops the held commit, when the group has moved to
     another epoch since the commit was built.
+  - the client acknowledges an application or commit for a group this
+    device has not joined as `Failed` (not retryable) on its
+    `client::MAX_DEFERRALS`th delivery (8), counted across restarts,
+    where it used to leave it for a replay on every connection.
 
 ### Added
 
@@ -113,6 +117,28 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
   a group conversation can add. A Welcome built from a deleted package
   answers `WELCOME_KEY_PACKAGE_NOT_FOUND`, which the client turns into a
   rejoin request.
+- `client::MAX_DEFERRALS` and `pins::MAX_CHANGES_PER_PIN`.
+
+### Changed
+
+- `PinStore::changes()` keeps the newest `MAX_CHANGES_PER_PIN` (16)
+  changes recorded against each pinned key of an airdress; a newer one
+  drops the oldest.
+- `PinStore::observe` writes nothing on a match: `last_seen` reaches the
+  disk with the next write that changes something else.
+- The client calls `airdress_mls::engine::message_group_id` instead of a
+  copy of its own, and no longer depends on `mls-rs` directly.
+
+### Fixed
+
+- `Directory` and `PinStore` write a change before it takes effect, so a
+  failed write leaves memory as it was and the envelope behind it is
+  judged against the same state when it is replayed (a Welcome, a
+  self-removal, a first pin).
+- A Welcome the engine joined from, whose directory entry could not be
+  written, is filed when it is replayed, or when a message for its group
+  arrives, instead of failing on its spent key package. This holds within
+  one process; after a restart such a Welcome asks to rejoin.
 
 ## v0.6.1 — 2026-10-31
 

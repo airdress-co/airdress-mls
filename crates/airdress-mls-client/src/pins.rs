@@ -9,6 +9,12 @@
 //!
 //! Times are the caller's (RFC 3339 strings): this crate keeps no clock.
 //!
+//! A change is written before it takes effect, so a failed write leaves
+//! the store as it was. A plain match writes nothing: the pin's
+//! `last_seen` moves in memory and reaches the disk with the next write
+//! that changes something else. The history keeps the newest
+//! [`MAX_CHANGES_PER_PIN`] changes recorded against each pinned key.
+//!
 //! Pins are keyed by **pin subject**
 //! ([`airdress_mls::credential::AirdressIdentity::pin_subject`]), which is
 //! the bare airdress for an owner's root — so every pin written before
@@ -27,6 +33,11 @@ use crate::sealed::SealedFile;
 
 const FILE: &str = "root-pins.sealed";
 const LABEL: &[u8] = b"airdress-mls-client root pins v1";
+
+/// How many recorded changes are kept per pinned key of an airdress. A
+/// new one past it drops the oldest for that key: whoever presents root
+/// keys must not be able to grow the store without limit.
+pub const MAX_CHANGES_PER_PIN: usize = 16;
 
 /// What observing a root key did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,53 +149,63 @@ impl PinStore {
 
     /// Observe `root` for `airdress` at `now`.
     ///
+    /// A first key is pinned and a new change recorded, each written
+    /// before it is answered; a match writes nothing.
+    ///
     /// # Errors
     ///
-    /// The store could not be written.
+    /// The store could not be written; nothing changed.
     pub fn observe(
         &mut self,
         airdress: &str,
         root: &[u8; 32],
         now: &str,
     ) -> Result<PinObservation, String> {
-        let outcome = match self.doc.pins.get_mut(airdress) {
-            None => {
-                self.doc.pins.insert(
-                    airdress.to_owned(),
-                    Pin {
-                        root: enc(root),
-                        pinned_at: now.to_owned(),
-                        last_seen: now.to_owned(),
-                    },
-                );
-                PinObservation::Pinned
-            }
-            Some(pin) => {
-                let pinned = dec(&pin.root).ok_or("a stored pin is malformed")?;
-                if pinned == *root {
-                    now.clone_into(&mut pin.last_seen);
-                    PinObservation::Matched
-                } else {
-                    let already = self.doc.changes.iter().any(|c| {
-                        c.airdress == airdress && c.pinned == pin.root && c.observed == enc(root)
-                    });
-                    if !already {
-                        self.doc.changes.push(PinChange {
-                            airdress: airdress.to_owned(),
-                            pinned: pin.root.clone(),
-                            observed: enc(root),
-                            at: now.to_owned(),
-                        });
-                    }
-                    PinObservation::Changed {
-                        pinned,
-                        observed: *root,
-                    }
-                }
-            }
+        let Some(pin) = self.doc.pins.get_mut(airdress) else {
+            let mut next = self.doc.clone();
+            next.pins.insert(
+                airdress.to_owned(),
+                Pin {
+                    root: enc(root),
+                    pinned_at: now.to_owned(),
+                    last_seen: now.to_owned(),
+                },
+            );
+            self.commit(next)?;
+            return Ok(PinObservation::Pinned);
         };
-        self.save()?;
-        Ok(outcome)
+        let pinned = dec(&pin.root).ok_or("a stored pin is malformed")?;
+        if pinned == *root {
+            now.clone_into(&mut pin.last_seen);
+            return Ok(PinObservation::Matched);
+        }
+        let current = pin.root.clone();
+        let observed = enc(root);
+        let already = self
+            .doc
+            .changes
+            .iter()
+            .any(|c| c.airdress == airdress && c.pinned == current && c.observed == observed);
+        if !already {
+            let mut next = self.doc.clone();
+            let same_pin = |c: &PinChange| c.airdress == airdress && c.pinned == current;
+            if next.changes.iter().filter(|c| same_pin(c)).count() >= MAX_CHANGES_PER_PIN
+                && let Some(oldest) = next.changes.iter().position(same_pin)
+            {
+                next.changes.remove(oldest);
+            }
+            next.changes.push(PinChange {
+                airdress: airdress.to_owned(),
+                pinned: current,
+                observed,
+                at: now.to_owned(),
+            });
+            self.commit(next)?;
+        }
+        Ok(PinObservation::Changed {
+            pinned,
+            observed: *root,
+        })
     }
 
     /// Pin a key a person verified another way, replacing any pin.
@@ -211,9 +232,7 @@ impl PinStore {
                 last_seen: now.to_owned(),
             },
         );
-        self.write(&next)?;
-        self.doc = next;
-        Ok(())
+        self.commit(next)
     }
 
     /// Adopt `observed` for `airdress`: the key a person was shown as a
@@ -249,19 +268,112 @@ impl PinStore {
         Ok(true)
     }
 
-    fn save(&self) -> Result<(), String> {
-        self.write(&self.doc)
-    }
-
-    fn write(&self, doc: &Doc) -> Result<(), String> {
-        let bytes = serde_json::to_vec(doc).map_err(|e| e.to_string())?;
-        self.file.write(&bytes)
+    /// Write `next`, then make it the document: a failed write leaves
+    /// memory as it was, in step with the disk.
+    fn commit(&mut self, next: Doc) -> Result<(), String> {
+        let bytes = serde_json::to_vec(&next).map_err(|e| e.to_string())?;
+        self.file.write(&bytes)?;
+        self.doc = next;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Make every write to `path` fail until the guard is dropped: a
+    /// directory stands where the file is renamed to. The file that was
+    /// there, if any, is put back afterwards.
+    struct Unwritable {
+        path: std::path::PathBuf,
+        aside: std::path::PathBuf,
+    }
+
+    impl Unwritable {
+        fn at(path: std::path::PathBuf) -> Self {
+            let aside = path.with_extension("aside");
+            if path.exists() {
+                std::fs::rename(&path, &aside).unwrap();
+            }
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("occupied"), b"").unwrap();
+            Self { path, aside }
+        }
+    }
+
+    impl Drop for Unwritable {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.path).unwrap();
+            if self.aside.exists() {
+                std::fs::rename(&self.aside, &self.path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_save_leaves_the_pins_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [4u8; 32];
+        let mut s = PinStore::open(dir.path(), &key).unwrap();
+        s.observe("b.example", &[9; 32], "t0").unwrap();
+        {
+            let _blocked = Unwritable::at(dir.path().join(FILE));
+            assert!(s.observe("a.example", &[1; 32], "t1").is_err());
+            assert_eq!(s.pinned("a.example"), None, "an unsaved pin is no pin");
+            assert!(s.observe("b.example", &[8; 32], "t2").is_err());
+            assert!(s.changes().is_empty(), "an unsaved change is no change");
+        }
+        assert_eq!(
+            s.observe("a.example", &[1; 32], "t3").unwrap(),
+            PinObservation::Pinned
+        );
+        s.observe("b.example", &[8; 32], "t4").unwrap();
+        let s = PinStore::open(dir.path(), &key).unwrap();
+        assert_eq!(s.pinned("a.example"), Some([1; 32]));
+        assert_eq!(s.changes().len(), 1);
+    }
+
+    #[test]
+    fn a_plain_match_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = PinStore::open(dir.path(), &[4u8; 32]).unwrap();
+        s.observe("a.example", &[1; 32], "t1").unwrap();
+        let _blocked = Unwritable::at(dir.path().join(FILE));
+        assert_eq!(
+            s.observe("a.example", &[1; 32], "t2").unwrap(),
+            PinObservation::Matched
+        );
+        assert_eq!(s.doc.pins["a.example"].last_seen, "t2");
+    }
+
+    #[test]
+    fn the_history_keeps_the_newest_changes_per_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = PinStore::open(dir.path(), &[4u8; 32]).unwrap();
+        s.observe("a.example", &[0; 32], "t").unwrap();
+        s.observe("b.example", &[0; 32], "t").unwrap();
+        s.observe("b.example", &[200; 32], "t").unwrap();
+        let extra = u8::try_from(MAX_CHANGES_PER_PIN).unwrap() + 24;
+        for n in 1..=extra {
+            s.observe("a.example", &[n; 32], &format!("t{n}")).unwrap();
+        }
+        let of_a = |s: &PinStore| {
+            s.changes()
+                .iter()
+                .filter(|c| c.airdress == "a.example")
+                .count()
+        };
+        assert_eq!(of_a(&s), MAX_CHANGES_PER_PIN);
+        assert_eq!(s.changes().len(), MAX_CHANGES_PER_PIN + 1, "b's stays");
+        assert_eq!(s.pending_changes().len(), MAX_CHANGES_PER_PIN + 1);
+        // The oldest went; the newest can still be accepted.
+        assert!(!s.acknowledge("a.example", &[1; 32], "t").unwrap());
+        assert!(s.acknowledge("a.example", &[extra; 32], "t").unwrap());
+        let s = PinStore::open(dir.path(), &[4u8; 32]).unwrap();
+        assert_eq!(of_a(&s), MAX_CHANGES_PER_PIN);
+        assert_eq!(s.pinned("a.example"), Some([extra; 32]));
+    }
 
     #[test]
     fn accepting_one_change_keeps_the_history_and_leaves_nothing_pending() {
