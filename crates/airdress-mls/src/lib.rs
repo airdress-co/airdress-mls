@@ -427,7 +427,7 @@ mod tests {
                 );
                 assert!(oldest_retained.unwrap() > requested);
             }
-            other @ EngineError::Other(_) => panic!("expected EpochUnavailable, got {other:?}"),
+            other => panic!("expected EpochUnavailable, got {other:?}"),
         }
     }
 

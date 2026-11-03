@@ -49,9 +49,11 @@
 //! - **A receiver whose view is stale refuses, and can retry.** The
 //!   operator records the revocation before it announces
 //!   `sibling_revoked`, and every device of the airdress reads its
-//!   revocation state from that same operator. A device that refuses a
-//!   commit with [`MlsRulesError::CrossPersonRemoval`] refreshes its
-//!   revocation state and processes the same commit again: a refused
+//!   revocation state from that same operator. A received commit refused
+//!   with [`MlsRulesError::CrossPersonRemoval`] reaches the host as
+//!   [`crate::EngineError::RevocationViewStale`] (code
+//!   [`crate::ErrorCode::RevocationViewStale`]): the device refreshes its
+//!   revocation state and processes the same commit again. A refused
 //!   commit persists nothing, so the retry starts from the same epoch.
 //!   A device that still answers `Active` after a refresh is right to
 //!   stay behind — that commit removed a live person.
@@ -970,9 +972,14 @@ mod tests {
         let err = a1
             .engine
             .process_commit(&group_id, &commit)
-            .expect_err("a live person's device must not be removable on one device's say-so")
-            .to_string();
-        assert!(err.contains(CROSS_PERSON), "{err}");
+            .expect_err("a live person's device must not be removable on one device's say-so");
+        // Its own error: the host refreshes its revocation state and
+        // processes the same commit again.
+        assert!(
+            matches!(err, crate::engine::EngineError::RevocationViewStale(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains(CROSS_PERSON), "{err}");
         assert_eq!(a1.engine.group_epoch(&group_id), Some(epoch));
 
         // The receiver's host refreshes its revocation state: the

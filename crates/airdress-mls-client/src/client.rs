@@ -27,6 +27,15 @@
 //! [`MAX_DEFERRALS`] times, counted in the directory: after that it is
 //! acknowledged as failed, so one whose Welcome never comes is not
 //! replayed on every connection for good.
+//!
+//! An envelope whose effect the engine could not write (a full disk, an
+//! I/O error: [`EngineError::Storage`]) is left for a replay, whatever
+//! its kind: nothing of it was kept, so the same envelope succeeds once
+//! storage does. A commit refused because it removes a device this
+//! device does not yet hold revoked ([`EngineError::RevocationViewStale`])
+//! is left for a replay too, so the host can refresh its revocation
+//! state first; after [`MAX_DEFERRALS`] deliveries the device stays
+//! behind and asks to rejoin.
 
 use std::path::Path;
 
@@ -142,6 +151,18 @@ pub struct Processed {
 impl Processed {
     const fn ack(event: Event) -> Self {
         Self { ack: true, event }
+    }
+}
+
+/// The engine could not write its state: nothing of the envelope was
+/// kept, so it is left for a replay.
+const fn storage_failed(reason: String) -> Processed {
+    Processed {
+        ack: false,
+        event: Event::Failed {
+            reason,
+            retryable: true,
+        },
     }
 }
 
@@ -292,7 +313,7 @@ impl Client {
             // cannot open. Waiting changes nothing, so ask to be added
             // again (SPEC-166 166-I.8); before, the Welcome was dropped and
             // the conversation stayed unreadable for good.
-            Err(e)
+            Err(EngineError::Other(e))
                 if e == airdress_mls::engine::WELCOME_KEY_PACKAGE_NOT_FOUND
                     && self.directory.group_for(&env.conversation_id).is_none() =>
             {
@@ -301,6 +322,9 @@ impl Client {
                     reason: format!("cannot join from this Welcome: {e}"),
                 })
             }
+            // The join could not be written: its key package is still
+            // held, so the same Welcome joins once storage takes it.
+            Err(EngineError::Storage(e)) => storage_failed(e),
             // Any other Welcome this device cannot join (malformed, or one
             // for a conversation it already holds) will not become joinable.
             Err(e) => Processed::ack(Event::Failed {
@@ -473,14 +497,29 @@ impl Client {
             Err(EngineError::EpochUnavailable { .. }) => Processed::ack(Event::Ignored {
                 reason: "this message is older than the keys still on this device".to_owned(),
             }),
-            Err(EngineError::Other(e)) => Processed::ack(Event::Failed {
-                reason: e,
-                retryable: false,
-            }),
+            // Decrypted and not kept: the group on disk is where it was,
+            // so the same ciphertext decrypts once storage takes it.
+            Err(EngineError::Storage(e)) => storage_failed(e),
+            Err(e @ (EngineError::RevocationViewStale(_) | EngineError::Other(_))) => {
+                Processed::ack(Event::Failed {
+                    reason: e.to_string(),
+                    retryable: false,
+                })
+            }
         }
     }
 
     fn process_commit(&mut self, env: &InboundEnvelope) -> Processed {
+        let processed = self.apply_commit(env);
+        // An acknowledged commit is no longer left for a replay; a count
+        // kept for an unacknowledged one bounds its replays.
+        if processed.ack {
+            self.directory.settle(&env.envelope_id);
+        }
+        processed
+    }
+
+    fn apply_commit(&mut self, env: &InboundEnvelope) -> Processed {
         let Ok(group_id) = message_group_id(&env.ciphertext) else {
             return Processed::ack(Event::Failed {
                 reason: "the commit carries no group id".to_owned(),
@@ -490,7 +529,6 @@ impl Client {
         let Some(current) = self.engine.group_epoch(&group_id) else {
             return self.defer_unjoined(env, "a commit for a group this device has not joined");
         };
-        self.directory.settle(&env.envelope_id);
         let conversation_id = match self.directory.conversation_for(&group_id) {
             Some(c) => Some(c),
             None => match self.file_unfiled_group(&group_id) {
@@ -549,12 +587,47 @@ impl Client {
             Err(EngineError::EpochUnavailable { .. }) => Processed::ack(Event::Ignored {
                 reason: "a commit older than the keys still on this device".to_owned(),
             }),
+            // Not applied and not kept: the group on disk is at the
+            // epoch before, so the same commit applies once storage
+            // takes it.
+            Err(EngineError::Storage(e)) => storage_failed(e),
+            // It removes a device this device holds live. The commit
+            // persisted nothing: the host refreshes its revocation state
+            // and the replay processes the same commit again. Bounded
+            // like an unjoined group's envelope, after which this device
+            // stays behind and asks to rejoin.
+            Err(EngineError::RevocationViewStale(e)) => {
+                self.defer_for_revocation(env, conversation_id, e)
+            }
             // A commit this device should be able to apply and cannot:
             // it has fallen behind, and only a re-add brings it back.
             Err(EngineError::Other(e)) => Processed::ack(Event::RejoinNeeded {
                 conversation_id,
                 reason: e,
             }),
+        }
+    }
+
+    /// Leave a commit refused for this device's revocation view for a
+    /// replay, at most [`MAX_DEFERRALS`] times; after that, ask to rejoin.
+    fn defer_for_revocation(
+        &mut self,
+        env: &InboundEnvelope,
+        conversation_id: String,
+        reason: String,
+    ) -> Processed {
+        match self.directory.defer(&env.envelope_id) {
+            Ok(attempts) if attempts >= MAX_DEFERRALS => Processed::ack(Event::RejoinNeeded {
+                conversation_id,
+                reason,
+            }),
+            Ok(_) | Err(_) => Processed {
+                ack: false,
+                event: Event::Failed {
+                    reason,
+                    retryable: true,
+                },
+            },
         }
     }
 

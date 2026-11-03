@@ -58,6 +58,17 @@ pub enum EngineError {
         /// The oldest epoch this device still holds, if it holds any.
         oldest_retained: Option<u64>,
     },
+    /// A commit was refused because it removes another person's device
+    /// that this device's revocation lookup does not answer `Revoked`
+    /// for ([`crate::rules::MlsRulesError::CrossPersonRemoval`], on
+    /// receipt). The commit persisted nothing. Refresh the revocation
+    /// state and process the same commit again; a device whose lookup
+    /// still answers `Active` after the refresh is right to refuse it.
+    RevocationViewStale(String),
+    /// The engine could not write its sealed state (a full disk, an I/O
+    /// error). Nothing of the operation was kept: retry it once storage
+    /// is writable again. The message names the failure.
+    Storage(String),
     /// Anything else, rendered exactly as it always was.
     Other(String),
 }
@@ -72,7 +83,9 @@ impl core::fmt::Display for EngineError {
                     "this message is older than the keys still on this device"
                 )
             }
-            Self::Other(msg) => f.write_str(msg),
+            Self::RevocationViewStale(msg) | Self::Storage(msg) | Self::Other(msg) => {
+                f.write_str(msg)
+            }
         }
     }
 }
@@ -87,6 +100,8 @@ impl EngineError {
     pub const fn code(&self) -> ErrorCode {
         match self {
             Self::EpochUnavailable { .. } => ErrorCode::EpochUnavailable,
+            Self::RevocationViewStale(_) => ErrorCode::RevocationViewStale,
+            Self::Storage(_) => ErrorCode::Storage,
             Self::Other(_) => ErrorCode::Engine,
         }
     }
@@ -124,6 +139,16 @@ pub enum ErrorCode {
     /// An unbound send or establishment past the v2 credential cutover.
     /// Call the `_bound` form with the sender's airdress.
     BindingRequired = 6,
+    /// A commit removing another person's device was refused because
+    /// this device does not hold that device revoked
+    /// ([`EngineError::RevocationViewStale`]). Refresh the revocation
+    /// state and process the same commit again; leave it for a replay
+    /// meanwhile.
+    RevocationViewStale = 7,
+    /// The engine's sealed state could not be written
+    /// ([`EngineError::Storage`]). Nothing was kept; retry the same input
+    /// once storage is writable, and leave it for a replay meanwhile.
+    Storage = 8,
 }
 
 impl ErrorCode {
@@ -791,16 +816,26 @@ impl MlsEngine {
 
     /// Join the group a Welcome invites this device into. Returns the
     /// group id.
-    pub fn process_welcome(&mut self, welcome_bytes: &[u8]) -> Result<Vec<u8>, String> {
-        let msg = MlsMessage::from_bytes(welcome_bytes).map_err(|e| format!("bad welcome: {e}"))?;
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Storage`] when the joined group could not be
+    /// written (the Welcome's key package is then still held, so the
+    /// same Welcome joins on a retry);
+    /// `EngineError::Other(WELCOME_KEY_PACKAGE_NOT_FOUND)` when the
+    /// Welcome names no key package this engine holds; any other refusal
+    /// as [`EngineError::Other`].
+    pub fn process_welcome(&mut self, welcome_bytes: &[u8]) -> Result<Vec<u8>, EngineError> {
+        let msg = MlsMessage::from_bytes(welcome_bytes)
+            .map_err(|e| EngineError::Other(format!("bad welcome: {e}")))?;
         let (mut group, _) = self
             .client
             .join_group(None, &msg, None)
             .map_err(|e| match e {
                 mls_rs::error::MlsError::WelcomeKeyPackageNotFound => {
-                    WELCOME_KEY_PACKAGE_NOT_FOUND.to_owned()
+                    EngineError::Other(WELCOME_KEY_PACKAGE_NOT_FOUND.to_owned())
                 }
-                e => format!("join: {e}"),
+                e => EngineError::Other(format!("join: {e}")),
             })?;
         let group_id = group.group_id().to_vec();
         // A join replaces whatever this device held for the group id
@@ -809,10 +844,10 @@ impl MlsEngine {
         // refused Welcome changes nothing on disk.
         self.groups
             .delete_group(&group_id)
-            .map_err(|e| format!("persist group: {e}"))?;
+            .map_err(|e| EngineError::Storage(format!("persist group: {e}")))?;
         group
             .write_to_storage()
-            .map_err(|e| format!("persist group: {e}"))?;
+            .map_err(|e| EngineError::Storage(format!("persist group: {e}")))?;
         Ok(group_id)
     }
 
@@ -1015,7 +1050,7 @@ impl MlsEngine {
                 // has to survive a restart.
                 group
                     .write_to_storage()
-                    .map_err(|e| EngineError::Other(format!("persist group: {e}")))?;
+                    .map_err(|e| EngineError::Storage(format!("persist group: {e}")))?;
                 Ok(DecryptedMessage { plaintext, sender })
             }
             // Rejection arm. Persists nothing and drops the group, so a
@@ -1465,8 +1500,10 @@ impl MlsEngine {
     /// # Errors
     ///
     /// The group is unknown, the message is not a commit, its epoch
-    /// has been trimmed ([`EngineError::EpochUnavailable`]), or
-    /// `mls-rs` refuses it.
+    /// has been trimmed ([`EngineError::EpochUnavailable`]), it removes
+    /// another person's device this device does not hold revoked
+    /// ([`EngineError::RevocationViewStale`]), the new state could not be
+    /// written ([`EngineError::Storage`]), or `mls-rs` refuses it.
     pub fn process_commit(
         &mut self,
         group_id: &[u8],
@@ -1485,6 +1522,9 @@ impl MlsEngine {
                     self.epoch_unavailable(group_id, message_epoch, current_epoch)
                 {
                     return Err(trimmed);
+                }
+                if refused_for_revocation_view(&e) {
+                    return Err(EngineError::RevocationViewStale(format!("process: {e}")));
                 }
                 return Err(EngineError::Other(format!("process: {e}")));
             }
@@ -1513,7 +1553,7 @@ impl MlsEngine {
         // what stops the next start-up believing it is still a member.
         group
             .write_to_storage()
-            .map_err(|e| EngineError::Other(format!("persist group: {e}")))?;
+            .map_err(|e| EngineError::Storage(format!("persist group: {e}")))?;
         Ok(CommitOutcome {
             commit: Vec::new(),
             welcome: None,
@@ -1533,6 +1573,21 @@ impl MlsEngine {
         out.sort_unstable();
         Ok(IdentitySet(out))
     }
+}
+
+/// Whether `mls-rs` refused a received commit with the removal rule's
+/// [`crate::rules::MlsRulesError::CrossPersonRemoval`]: the refusal a
+/// fresher revocation view may lift (see [`crate::rules`]).
+fn refused_for_revocation_view(error: &mls_rs::error::MlsError) -> bool {
+    let mls_rs::error::MlsError::MlsRulesError(inner) = error else {
+        return false;
+    };
+    matches!(
+        inner
+            .inner_dyn_error()
+            .downcast_ref::<crate::rules::MlsRulesError>(),
+        Some(crate::rules::MlsRulesError::CrossPersonRemoval { .. })
+    )
 }
 
 /// Sorted member identities, for computing a membership delta by
