@@ -2,6 +2,10 @@
 # comment. Dependabot moves both together. Monthly and grouped, so a
 # month's bumps cost one pull request and one CI run each, and a release
 # younger than a week is left to settle first.
+#
+# Actions only. Cargo bumps stay a person's change: every lockfile move
+# regenerates THIRD-PARTY.md (scripts/third-party.sh, checked in CI), and
+# the mls-rs 0.x crates move together or not at all.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -16,16 +20,3 @@ updates:
           - "*"
     commit-message:
       prefix: ci
-  - package-ecosystem: cargo
-    directory: /
-    schedule:
-      interval: monthly
-    cooldown:
-      default-days: 7
-    groups:
-      cargo-patch:
-        update-types:
-          - patch
-          - minor
-    commit-message:
-      prefix: build

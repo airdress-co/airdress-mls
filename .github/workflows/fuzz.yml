@@ -21,26 +21,41 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  targets:
+    # The matrix is what fuzz/Cargo.toml declares, so a new target is
+    # fuzzed nightly without anyone editing this file.
+    name: List the targets
+    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: list
+        run: |
+          set -euo pipefail
+          targets=$(sed -n 's/^name = "\(.*\)"$/\1/p' fuzz/Cargo.toml | grep -vx 'airdress-mls-fuzz' | jq -Rsc 'split("\n") | map(select(length > 0))')
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
   fuzz:
     name: Fuzz (${{ matrix.target }})
+    needs: targets
     timeout-minutes: 20
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - group_extensions_decode
-          - group_record_decode
-          - lane_payload_decode
-          - message_group_id
-          - parse_identity
-          - parse_rfc3339_seconds
+        target: ${{ fromJSON(needs.targets.outputs.targets) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - run: rustup toolchain install nightly --profile minimal
-      - run: cargo +nightly install cargo-fuzz --version 0.13.2 --locked
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: cargo-fuzz@0.13.2
       # The fuzz crate is its own workspace. Its lock is the root lock, so
       # the fuzzer tests the dependency versions that ship.
       - name: Use the workspace lock
@@ -58,7 +73,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "corpus/$TARGET"
-          cargo +nightly fuzz run -O -a "$TARGET" "corpus/$TARGET" -- \
+          # --target: the prebuilt cargo-fuzz is a musl binary and would
+          # otherwise build for musl, where the sanitizer cannot link.
+          cargo +nightly fuzz run -O -a --target x86_64-unknown-linux-gnu "$TARGET" "corpus/$TARGET" -- \
             -max_total_time=240 -timeout=5 -rss_limit_mb=2048 -print_final_stats=1
       - name: Save the corpus
         if: always()
