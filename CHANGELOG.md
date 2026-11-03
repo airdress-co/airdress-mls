@@ -53,6 +53,17 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 - `PinStore::pending_changes()`.
 - `Directory::conversation_of_message()`.
 
+### Fixed
+
+- `crates/airdress-mls-ffi/build-native.sh` builds the phone targets:
+  - `ios` produces the static library (`libairdress_mls_ffi.a`) the app
+    links, for the device and the simulator, and no longer a `.dylib`;
+  - `android` links with the NDK's clang wrapper (`ANDROID_NDK_HOME` or
+    `ANDROID_NDK_ROOT`, API level `ANDROID_API_LEVEL`, default 21) and
+    says so when no NDK is found;
+  - each target is added to the pinned toolchain before it is built, and
+    a build that produced no library fails instead of reporting success.
+
 ## v0.6.1 — 2026-10-31
 
 ### Breaking
