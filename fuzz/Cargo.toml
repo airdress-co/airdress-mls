@@ -14,7 +14,11 @@ cargo-fuzz = true
 
 [dependencies]
 # The libFuzzer driver cargo-fuzz links against.
-libfuzzer-sys = "0.4"
+# Exact: the fuzz crate's lock is the root lock, copied in CI, which does
+# not hold the fuzz-only crates. Pinned here, they cannot float to a new
+# release that nobody chose. Bump them by hand.
+libfuzzer-sys = "=0.4.13"
+arbitrary = "=1.5.0"
 # The parsers under test.
 airdress-mls = { path = "../crates/airdress-mls" }
 airdress-mls-client = { path = "../crates/airdress-mls-client" }
