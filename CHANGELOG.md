@@ -22,6 +22,23 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 
 ### Breaking
 
+- **C ABI change, in place: `AirdressRevocationLookupFn`** (the callback
+  `airdress_mls_set_revocation_lookup` takes) is now
+  `int32_t (*)(const char *subject, const char *device_id)`. This breaks
+  the additive-only rule for the C ABI on purpose: the app must change
+  its callback together with the pin. `subject` is the leaf's pin
+  subject, the same string `AirdressRootKeyLookupFn` receives for that
+  leaf (the bare airdress for an owner's device,
+  `airdress ‖ 0x1F ‖ person_id` for another person's); the return values
+  are unchanged (`1` active, `0` revoked, anything else cannot answer).
+  A `device_id` is unique only under one pin subject, so the host keys
+  its revocation state by the pair.
+- `airdress_mls::credential::RevocationLookup::device_status` takes the
+  pin subject too: `device_status(subject, device_id)`, and the closure
+  form is `Fn(&str, &str) -> Option<DeviceStatus>`. Check 5 and the
+  removal rule's revocation witness both ask for the pair, so revoking
+  one person's device no longer answers for another person's device of
+  the same `device_id`.
 - `airdress_mls_client::pins::PinStore::acknowledge` takes the key the
   person accepted: `acknowledge(airdress, observed, now)`. It adopts that
   key only if a change from the current pin to it was recorded. Recorded

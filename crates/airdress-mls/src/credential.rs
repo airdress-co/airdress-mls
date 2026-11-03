@@ -461,7 +461,7 @@ pub enum CredentialVerifyError {
     /// Check 4 failed (SPEC-061 FR-18): `expires_at` is in the past.
     DelegationExpired,
     /// Check 5 failed (SPEC-061 FR-19): the host's revocation lookup
-    /// says this `device_id` is revoked.
+    /// says this device (its pin subject and `device_id`) is revoked.
     DeviceRevoked,
     /// Check 5 could not run: the host's revocation lookup returned
     /// nothing. A reject, exactly like [`Self::RootKeyUnavailable`] —
@@ -563,18 +563,28 @@ pub enum DeviceStatus {
 /// it is the same posture check 2 takes, so that a host which has not
 /// wired the socket is in the pre-cutover state rather than in a
 /// state where nothing validates.
+///
+/// A `device_id` is unique only under one root: the owner and each
+/// person of an airdress name their devices independently, so two of
+/// them can both hold a `phone-1`. Revocation is therefore asked for a
+/// **pin subject and a `device_id` together** — the subject is the one
+/// [`RootKeyLookup`] receives for the same leaf
+/// ([`AirdressIdentity::pin_subject`]) — and a host keys its answer by
+/// both. Revoking one person's device never answers for another
+/// person's device of the same `device_id`.
 pub trait RevocationLookup: Send + Sync {
-    /// Whether `device_id` is active or revoked, or `None` when the
-    /// answer is unknown, which rejects.
-    fn device_status(&self, device_id: &str) -> Option<DeviceStatus>;
+    /// Whether the device `device_id` of the pin subject `subject` is
+    /// active or revoked, or `None` when the answer is unknown, which
+    /// rejects.
+    fn device_status(&self, subject: &str, device_id: &str) -> Option<DeviceStatus>;
 }
 
 impl<F> RevocationLookup for F
 where
-    F: Fn(&str) -> Option<DeviceStatus> + Send + Sync,
+    F: Fn(&str, &str) -> Option<DeviceStatus> + Send + Sync,
 {
-    fn device_status(&self, device_id: &str) -> Option<DeviceStatus> {
-        self(device_id)
+    fn device_status(&self, subject: &str, device_id: &str) -> Option<DeviceStatus> {
+        self(subject, device_id)
     }
 }
 
@@ -844,15 +854,17 @@ fn verify_chain(
         (IdentityVersion::V1, None) => {}
     }
 
-    // Check 5 (FR-19) — revocation, keyed on the stable `device_id`,
-    // for every version: a person's device is revoked like any other.
+    // Check 5 (FR-19) — revocation, keyed on the pin subject and the
+    // stable `device_id` together, for every version: a person's device
+    // is revoked like any other, and a `device_id` names a device only
+    // under its own root.
     // A `v: 2` or `v: 3` delegation must carry one; a `v: 1` delegation that
     // happens to carry one is checked too, for the same reason as
     // check 4.
     match (identity.version, identity.device_id()) {
         (_, Some(device_id)) if !device_id.is_empty() => {
             if let Some(revocation) = revocation {
-                match revocation.device_status(device_id) {
+                match revocation.device_status(&identity.pin_subject()?, device_id) {
                     Some(DeviceStatus::Active) => {}
                     Some(DeviceStatus::Revoked) => {
                         return Err(CredentialVerifyError::DeviceRevoked);
@@ -1972,7 +1984,7 @@ mod tests {
             v2_identity(&root, "alice.test", 22, "device-phone", FAR_FUTURE);
         identity.airdress = "bob.test".to_owned();
         let lookup = move |_: &str| Some(root_pub);
-        let active = |_: &str| Some(DeviceStatus::Active);
+        let active = |_: &str, _: &str| Some(DeviceStatus::Active);
         assert!(matches!(
             verify_identity_at(&identity, &session_pub, &lookup, Some(&active), NOW),
             Err(CredentialVerifyError::Malformed(_))
@@ -2359,11 +2371,11 @@ mod tests {
         );
         let lookup = move |_: &str| Some(root_pub);
 
-        let fresh = |_: &str| Some(DeviceStatus::Active);
+        let fresh = |_: &str, _: &str| Some(DeviceStatus::Active);
         verify_identity_at(&identity, &session_pub, &lookup, Some(&fresh), NOW)
             .expect("an active device passes");
 
-        let revoked = |_: &str| Some(DeviceStatus::Revoked);
+        let revoked = |_: &str, _: &str| Some(DeviceStatus::Revoked);
         assert_eq!(
             verify_identity_at(&identity, &session_pub, &lookup, Some(&revoked), NOW),
             Err(CredentialVerifyError::DeviceRevoked)
@@ -2371,7 +2383,7 @@ mod tests {
 
         // Fail closed, exactly like RootKeyUnavailable: a revocation
         // check that warns is not a revocation check.
-        let unavailable = |_: &str| None;
+        let unavailable = |_: &str, _: &str| None;
         assert_eq!(
             verify_identity_at(&identity, &session_pub, &lookup, Some(&unavailable), NOW),
             Err(CredentialVerifyError::RevocationUnavailable)
@@ -2379,7 +2391,7 @@ mod tests {
     }
 
     #[test]
-    fn revocation_is_keyed_on_the_device_id() {
+    fn revocation_is_asked_for_the_pin_subject_and_the_device_id() {
         let root = SigningKey::from_bytes(&[11u8; 32]);
         let root_pub = root.verifying_key().to_bytes();
         let (identity, session_pub) = v2_identity(
@@ -2392,8 +2404,8 @@ mod tests {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let recorder = {
             let seen = seen.clone();
-            move |device_id: &str| {
-                seen.lock().unwrap().push(device_id.to_owned());
+            move |subject: &str, device_id: &str| {
+                seen.lock().unwrap().push(format!("{subject} {device_id}"));
                 Some(DeviceStatus::Active)
             }
         };
@@ -2405,7 +2417,10 @@ mod tests {
             NOW,
         )
         .unwrap();
-        assert_eq!(seen.lock().unwrap().as_slice(), ["device-phone"]);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["alice.humans.airdress.co device-phone"]
+        );
     }
 
     #[test]
@@ -2519,7 +2534,9 @@ mod tests {
             provider.validate_external_sender(&v2_leaf, None, None),
             Err(CredentialVerifyError::RevocationUnavailable)
         );
-        provider.set_revocation_lookup(std::sync::Arc::new(|_: &str| Some(DeviceStatus::Active)));
+        provider.set_revocation_lookup(std::sync::Arc::new(|_: &str, _: &str| {
+            Some(DeviceStatus::Active)
+        }));
         provider
             .validate_external_sender(&v2_leaf, None, None)
             .expect("v2 is the live form after the cutover");
@@ -2548,7 +2565,9 @@ mod tests {
 
         let provider = AirdressIdentityProvider::new();
         provider.set_clock(std::sync::Arc::new(FixedClock(NOW)));
-        provider.set_revocation_lookup(std::sync::Arc::new(|_: &str| Some(DeviceStatus::Active)));
+        provider.set_revocation_lookup(std::sync::Arc::new(|_: &str, _: &str| {
+            Some(DeviceStatus::Active)
+        }));
         // Before the cutover, compatibility mode still accepts the leaf
         // without check 2.
         provider
@@ -2641,7 +2660,7 @@ mod tests {
         let subject = super::pin_subject_for_person(AIRDRESS, SAM);
         let (lookup, asked) =
             one_subject_lookup(subject.clone(), sam_root.verifying_key().to_bytes());
-        let active = |_: &str| Some(DeviceStatus::Active);
+        let active = |_: &str, _: &str| Some(DeviceStatus::Active);
         verify_identity_at(&identity, &session_pub, &lookup, Some(&active), NOW)
             .expect("a member's device chains to the member's own root");
         assert_eq!(*asked.lock().unwrap(), vec![subject]);
@@ -2657,7 +2676,7 @@ mod tests {
         let (identity, session_pub) = v3_identity(&sam_root, SAM, 0x61, "sam-phone");
         let (lookup, _) =
             one_subject_lookup(AIRDRESS.to_owned(), sam_root.verifying_key().to_bytes());
-        let active = |_: &str| Some(DeviceStatus::Active);
+        let active = |_: &str, _: &str| Some(DeviceStatus::Active);
         assert_eq!(
             verify_identity_at(&identity, &session_pub, &lookup, Some(&active), NOW),
             Err(CredentialVerifyError::RootKeyUnavailable)
@@ -2675,7 +2694,7 @@ mod tests {
             super::pin_subject_for_person(AIRDRESS, SAM),
             owner_root.verifying_key().to_bytes(),
         );
-        let active = |_: &str| Some(DeviceStatus::Active);
+        let active = |_: &str, _: &str| Some(DeviceStatus::Active);
         assert_eq!(
             verify_identity_at(&identity, &session_pub, &lookup, Some(&active), NOW),
             Err(CredentialVerifyError::RootKeyMismatch)
@@ -2689,7 +2708,7 @@ mod tests {
             v2_identity(&owner_root, AIRDRESS, 22, "owner-phone", FAR_FUTURE);
         let (lookup, asked) =
             one_subject_lookup(AIRDRESS.to_owned(), owner_root.verifying_key().to_bytes());
-        let active = |_: &str| Some(DeviceStatus::Active);
+        let active = |_: &str, _: &str| Some(DeviceStatus::Active);
         verify_identity_at(&identity, &session_pub, &lookup, Some(&active), NOW)
             .expect("v2 verification is unchanged");
         assert_eq!(*asked.lock().unwrap(), vec![AIRDRESS.to_owned()]);
@@ -2708,7 +2727,7 @@ mod tests {
             Err(CredentialVerifyError::Malformed(_))
         ));
         let lookup = |_: &str| Some(sam_root.verifying_key().to_bytes());
-        let active = |_: &str| Some(DeviceStatus::Active);
+        let active = |_: &str, _: &str| Some(DeviceStatus::Active);
         assert!(matches!(
             verify_identity_at(&identity, &session_pub, &lookup, Some(&active), NOW),
             Err(CredentialVerifyError::Malformed(_))
@@ -2719,7 +2738,7 @@ mod tests {
     fn a_v3_without_its_fields_is_refused() {
         let sam_root = SigningKey::from_bytes(&[0x51; 32]);
         let lookup = |_: &str| Some(sam_root.verifying_key().to_bytes());
-        let active = |_: &str| Some(DeviceStatus::Active);
+        let active = |_: &str, _: &str| Some(DeviceStatus::Active);
         let (identity, session_pub) = v3_identity(&sam_root, SAM, 0x61, "sam-phone");
 
         // An empty person_id: no subject to pin under. (The field is
@@ -2770,21 +2789,71 @@ mod tests {
     }
 
     #[test]
-    fn a_revoked_member_device_is_refused_by_device_id() {
+    fn a_revoked_member_device_is_refused_by_its_subject_and_device_id() {
         let sam_root = SigningKey::from_bytes(&[0x51; 32]);
         let (identity, session_pub) = v3_identity(&sam_root, SAM, 0x61, "sam-phone");
         let lookup = |_: &str| Some(sam_root.verifying_key().to_bytes());
         let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let seen = asked.clone();
-        let revoked = move |d: &str| {
-            seen.lock().unwrap().push(d.to_owned());
+        let revoked = move |s: &str, d: &str| {
+            seen.lock().unwrap().push(format!("{s} {d}"));
             Some(DeviceStatus::Revoked)
         };
         assert_eq!(
             verify_identity_at(&identity, &session_pub, &lookup, Some(&revoked), NOW),
             Err(CredentialVerifyError::DeviceRevoked)
         );
-        assert_eq!(*asked.lock().unwrap(), vec!["sam-phone".to_owned()]);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![format!(
+                "{} sam-phone",
+                super::pin_subject_for_person(AIRDRESS, SAM)
+            )]
+        );
+    }
+
+    /// A `device_id` names a device only under its own root: the owner,
+    /// Sam and Robin may each hold a `phone-1`. A host that revoked
+    /// Sam's `phone-1` answers for Sam's alone.
+    #[test]
+    fn a_device_id_is_revoked_only_under_its_own_pin_subject() {
+        let owner_root = SigningKey::from_bytes(&[11u8; 32]);
+        let sam_root = SigningKey::from_bytes(&[0x51; 32]);
+        let robin_root = SigningKey::from_bytes(&[0x52; 32]);
+        let (owner, owner_pub) = v2_identity(&owner_root, AIRDRESS, 22, "phone-1", FAR_FUTURE);
+        let (sam, sam_pub) = v3_identity(&sam_root, SAM, 0x61, "phone-1");
+        let (robin, robin_pub) = v3_identity(&robin_root, ROBIN, 0x62, "phone-1");
+        let sam_subject = super::pin_subject_for_person(AIRDRESS, SAM);
+        let roots = {
+            let sam_subject = sam_subject.clone();
+            let robin_subject = super::pin_subject_for_person(AIRDRESS, ROBIN);
+            move |s: &str| {
+                if s == AIRDRESS {
+                    Some(owner_root.verifying_key().to_bytes())
+                } else if s == sam_subject {
+                    Some(sam_root.verifying_key().to_bytes())
+                } else if s == robin_subject {
+                    Some(robin_root.verifying_key().to_bytes())
+                } else {
+                    None
+                }
+            }
+        };
+        let sams_phone_revoked = move |s: &str, d: &str| {
+            Some(if s == sam_subject && d == "phone-1" {
+                DeviceStatus::Revoked
+            } else {
+                DeviceStatus::Active
+            })
+        };
+        assert_eq!(
+            verify_identity_at(&sam, &sam_pub, &roots, Some(&sams_phone_revoked), NOW),
+            Err(CredentialVerifyError::DeviceRevoked)
+        );
+        verify_identity_at(&robin, &robin_pub, &roots, Some(&sams_phone_revoked), NOW)
+            .expect("Robin's phone-1 is not Sam's");
+        verify_identity_at(&owner, &owner_pub, &roots, Some(&sams_phone_revoked), NOW)
+            .expect("the owner's phone-1 is not Sam's");
     }
 
     #[test]
@@ -2889,7 +2958,9 @@ mod tests {
             (s == subject).then_some(sam_root_pub)
         }));
         provider.set_clock(std::sync::Arc::new(FixedClock(NOW)));
-        provider.set_revocation_lookup(std::sync::Arc::new(|_: &str| Some(DeviceStatus::Active)));
+        provider.set_revocation_lookup(std::sync::Arc::new(|_: &str, _: &str| {
+            Some(DeviceStatus::Active)
+        }));
         provider.set_v2_cutover();
         provider
             .validate_external_sender(&leaf_for(&sam, &sam_pub), None, None)

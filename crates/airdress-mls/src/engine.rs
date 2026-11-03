@@ -1139,8 +1139,8 @@ impl MlsEngine {
     /// - another airdress's leaf is refused (FR-25);
     /// - inside one airdress, once a `v: 3` leaf is on either side,
     ///   another person's leaf is refused unless it is a `v: 3` leaf
-    ///   whose `device_id` the registered revocation lookup answers
-    ///   `Revoked` for (SPEC-144 F-7, FR-53).
+    ///   whose pin subject and `device_id` the registered revocation
+    ///   lookup answers `Revoked` for (SPEC-144 F-7, FR-53).
     ///
     /// # Errors
     ///
