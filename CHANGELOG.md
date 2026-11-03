@@ -241,6 +241,13 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
   process), or the file is older than `storage::INTERRUPTED_WRITE_AGE`.
   Nothing locks a state directory, and removing every `*.tmp-*` file made
   the rename of a second engine's write in progress fail.
+- The client's count of envelopes left for a replay never drops a count
+  to make room. When its 256 places are full, a count not delivered for a
+  week is dropped; when none is, the new envelope is ended at once
+  (`Failed { retryable: false }` for a group this device has not joined,
+  `RejoinNeeded` for a commit refused for the revocation view). Before,
+  the oldest count was dropped, so a stream of envelopes for groups never
+  joined kept every count below `MAX_DEFERRALS` and no bound ever fired.
 
 ## v0.6.1 — 2026-10-31
 

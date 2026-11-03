@@ -412,7 +412,7 @@ impl Client {
     /// replay, at most [`MAX_DEFERRALS`] times.
     fn defer_unjoined(&mut self, env: &InboundEnvelope, what: &str) -> Processed {
         match self.directory.defer(&env.envelope_id) {
-            Ok(attempts) if attempts >= MAX_DEFERRALS => {
+            Ok(Some(attempts)) if attempts >= MAX_DEFERRALS => {
                 self.directory.settle(&env.envelope_id);
                 Processed::ack(Event::Failed {
                     reason: format!(
@@ -421,9 +421,15 @@ impl Client {
                     retryable: false,
                 })
             }
+            // No room to count it: ended now, so the envelopes already
+            // counted keep their bound.
+            Ok(None) => Processed::ack(Event::Failed {
+                reason: format!("{what}, with too many others left for a replay"),
+                retryable: false,
+            }),
             // Counted, or not countable now: either way it may yet be
             // joined, so leave it for the replay.
-            Ok(_) | Err(_) => Processed {
+            Ok(Some(_)) | Err(_) => Processed {
                 ack: false,
                 event: Event::Failed {
                     reason: what.to_owned(),
@@ -617,11 +623,19 @@ impl Client {
         reason: String,
     ) -> Processed {
         match self.directory.defer(&env.envelope_id) {
-            Ok(attempts) if attempts >= MAX_DEFERRALS => Processed::ack(Event::RejoinNeeded {
+            Ok(Some(attempts)) if attempts >= MAX_DEFERRALS => {
+                Processed::ack(Event::RejoinNeeded {
+                    conversation_id,
+                    reason,
+                })
+            }
+            // No room to count it: asks to rejoin now, so the envelopes
+            // already counted keep their bound.
+            Ok(None) => Processed::ack(Event::RejoinNeeded {
                 conversation_id,
                 reason,
             }),
-            Ok(_) | Err(_) => Processed {
+            Ok(Some(_)) | Err(_) => Processed {
                 ack: false,
                 event: Event::Failed {
                     reason,
