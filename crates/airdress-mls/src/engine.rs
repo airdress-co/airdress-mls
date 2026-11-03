@@ -803,6 +803,13 @@ impl MlsEngine {
                 e => format!("join: {e}"),
             })?;
         let group_id = group.group_id().to_vec();
+        // A join replaces whatever this device held for the group id
+        // before (an earlier membership it was removed from); it never
+        // merges into it. Only after the Welcome was accepted, so a
+        // refused Welcome changes nothing on disk.
+        self.groups
+            .delete_group(&group_id)
+            .map_err(|e| format!("persist group: {e}"))?;
         group
             .write_to_storage()
             .map_err(|e| format!("persist group: {e}"))?;
