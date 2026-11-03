@@ -780,3 +780,218 @@ fn a_welcome_for_a_key_package_this_device_lacks_asks_to_rejoin() {
         }
     ));
 }
+
+/// Make every write to `path` fail until the guard is dropped: a
+/// directory stands where the file is renamed to. The file that was
+/// there, if any, is put back afterwards.
+struct Unwritable {
+    path: std::path::PathBuf,
+    aside: std::path::PathBuf,
+}
+
+impl Unwritable {
+    fn directory_of(device: &Device) -> Self {
+        let path = device.dir.path().join("client").join("directory.sealed");
+        let aside = path.with_extension("aside");
+        if path.exists() {
+            std::fs::rename(&path, &aside).unwrap();
+        }
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("occupied"), b"").unwrap();
+        Self { path, aside }
+    }
+}
+
+impl Drop for Unwritable {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).unwrap();
+        if self.aside.exists() {
+            std::fs::rename(&self.aside, &self.path).unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_join_that_could_not_be_filed_is_filed_on_replay() {
+    let a = Device::new("alice.example", 41);
+    let b = Device::new("bob.example", 42);
+    let mut alice = a.open();
+    let mut bob = b.open();
+    let bob_kp = bob.key_packages(1).unwrap().remove(0);
+    let out = alice
+        .establish(
+            "conv-a",
+            "bob.example",
+            &bob_kp,
+            &text("hello bob"),
+            "alice.example",
+        )
+        .unwrap();
+    {
+        let _blocked = Unwritable::directory_of(&b);
+        for env in &out {
+            let p = bob.process(&deliver(env, "alice.example", "conv-b"));
+            assert!(!p.ack, "{:?}", p.event);
+            assert!(
+                matches!(
+                    p.event,
+                    Event::Failed {
+                        retryable: true,
+                        ..
+                    }
+                ),
+                "{:?}",
+                p.event
+            );
+        }
+        assert!(bob.directory().group_for("conv-b").is_none());
+    }
+    // The operator replays both, in order.
+    let joined = bob.process(&deliver(&out[0], "alice.example", "conv-b"));
+    assert!(joined.ack);
+    assert!(
+        matches!(joined.event, Event::Joined { ref conversation_id, .. } if conversation_id == "conv-b"),
+        "{:?}",
+        joined.event
+    );
+    let first = bob.process(&deliver(&out[1], "alice.example", "conv-b"));
+    assert!(first.ack);
+    assert_eq!(
+        message(&first.event),
+        ("conv-b".to_owned(), "hello bob".to_owned())
+    );
+    drop(bob);
+    let mut bob = b.open();
+    let later = alice
+        .encrypt("conv-a", &text("later"), "alice.example")
+        .unwrap();
+    assert_eq!(
+        message(
+            &bob.process(&deliver(&later, "alice.example", "conv-b"))
+                .event
+        )
+        .1,
+        "later"
+    );
+}
+
+#[test]
+fn a_message_after_an_unfiled_join_waits_and_files_it() {
+    let a = Device::new("alice.example", 43);
+    let b = Device::new("bob.example", 44);
+    let mut alice = a.open();
+    let mut bob = b.open();
+    let bob_kp = bob.key_packages(1).unwrap().remove(0);
+    let out = alice
+        .establish(
+            "conv-a",
+            "bob.example",
+            &bob_kp,
+            &text("hello bob"),
+            "alice.example",
+        )
+        .unwrap();
+    {
+        let _blocked = Unwritable::directory_of(&b);
+        assert!(
+            !bob.process(&deliver(&out[0], "alice.example", "conv-b"))
+                .ack
+        );
+    }
+    // The message comes back first this time: it files the join.
+    let first = bob.process(&deliver(&out[1], "alice.example", "conv-b"));
+    assert!(first.ack);
+    assert_eq!(message(&first.event).1, "hello bob");
+    let joined = bob.process(&deliver(&out[0], "alice.example", "conv-b"));
+    assert!(joined.ack);
+    assert!(
+        matches!(joined.event, Event::Joined { .. }),
+        "{:?}",
+        joined.event
+    );
+}
+
+#[test]
+fn a_removal_that_could_not_be_filed_is_finished_on_replay() {
+    let a = Device::new("alice.example", 45);
+    let c = Device::new("alice.example", 46);
+    let mut alice = a.open();
+    let mut carol = c.open();
+    let carol_kp = carol.key_packages(1).unwrap().remove(0);
+    let out = alice
+        .establish(
+            "conv-a",
+            "alice.example",
+            &carol_kp,
+            &text("one"),
+            "alice.example",
+        )
+        .unwrap();
+    for env in &out {
+        carol.process(&deliver(env, "alice.example", "conv-a"));
+    }
+    let group = alice.directory().group_for("conv-a").unwrap();
+    let carol_identity = alice
+        .engine()
+        .group_members(&group)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.identity)
+        .find(|id| id.ends_with(b"device-46"))
+        .expect("carol's leaf");
+    let removal = alice.prepare_remove("conv-a", &[carol_identity]).unwrap();
+    alice.confirm_commit("conv-a").unwrap();
+    {
+        let _blocked = Unwritable::directory_of(&c);
+        let p = carol.process(&deliver(&removal.commit, "alice.example", "conv-a"));
+        assert!(!p.ack, "{:?}", p.event);
+        assert!(carol.directory().group_for("conv-a").is_some());
+    }
+    let p = carol.process(&deliver(&removal.commit, "alice.example", "conv-a"));
+    assert!(p.ack);
+    assert_eq!(
+        p.event,
+        Event::Removed {
+            conversation_id: "conv-a".to_owned()
+        }
+    );
+    assert!(carol.directory().group_for("conv-a").is_none());
+}
+
+#[test]
+fn a_message_for_a_group_never_joined_is_given_up_after_a_bound() {
+    let a = Device::new("alice.example", 47);
+    let b = Device::new("bob.example", 48);
+    let mut alice = a.open();
+    let bob_kp = b.open().key_packages(1).unwrap().remove(0);
+    let out = alice
+        .establish(
+            "conv-a",
+            "bob.example",
+            &bob_kp,
+            &text("hello"),
+            "alice.example",
+        )
+        .unwrap();
+    // Bob never sees the Welcome; the message is replayed on every
+    // connection, some of them after a restart.
+    let env = deliver(&out[1], "alice.example", "conv-b");
+    let mut last = None;
+    for attempt in 1..=airdress_mls_client::client::MAX_DEFERRALS {
+        let mut bob = b.open();
+        let p = bob.process(&env);
+        if attempt < airdress_mls_client::client::MAX_DEFERRALS {
+            assert!(!p.ack, "attempt {attempt}: {:?}", p.event);
+        }
+        last = Some(p);
+    }
+    let last = last.unwrap();
+    assert!(last.ack, "{:?}", last.event);
+    assert!(matches!(
+        last.event,
+        Event::Failed {
+            retryable: false,
+            ..
+        }
+    ));
+}

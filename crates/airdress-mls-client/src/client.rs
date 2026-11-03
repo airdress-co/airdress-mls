@@ -11,16 +11,38 @@
 //! The host must store a [`Event::Message`] before it acknowledges it:
 //! decryption ratchets the group forward, so the same ciphertext will not
 //! decrypt a second time.
+//!
+//! The engine's state and the directory are two files, and the engine
+//! writes first. A removal replays cleanly: the engine stays at the
+//! epoch it was removed from, so the replayed commit removes it again and
+//! the directory forgets then. A join does not: the Welcome's key package
+//! is spent. When the directory write after a join fails, the client
+//! keeps the join in memory and files it when the Welcome, or a message
+//! for that group, comes back. That memory does not survive a restart: a
+//! Welcome replayed after one finds its key package spent and asks to
+//! rejoin, the existing way back for a Welcome this device cannot use.
+//!
+//! An application or commit for a group this device has not joined is
+//! left for a replay, since its Welcome may still be on the way, but only
+//! [`MAX_DEFERRALS`] times, counted in the directory: after that it is
+//! acknowledged as failed, so one whose Welcome never comes is not
+//! replayed on every connection for good.
 
 use std::path::Path;
 
+use airdress_mls::engine::message_group_id;
 use airdress_mls::{EngineError, MlsEngine};
+use sha2::{Digest as _, Sha256};
 
 use crate::directory::Directory;
 use crate::wire::{
     EnvelopeKind, InboundEnvelope, LanePayload, OutboundEnvelope, ReplyTo, commit_group_tag,
-    message_group_id,
 };
+
+/// How many deliveries of an application or commit for a group this
+/// device has not joined are left for a replay before it is
+/// acknowledged as failed.
+pub const MAX_DEFERRALS: u32 = 8;
 
 /// One decrypted chat message.
 #[derive(Debug, Clone, PartialEq)]
@@ -166,10 +188,19 @@ pub struct PreparedCommit {
     pub epoch_after: u64,
 }
 
+/// A join the engine made whose directory entry could not be written.
+struct UnfiledJoin {
+    /// SHA-256 of the Welcome, so its replay is recognised.
+    welcome: [u8; 32],
+    conversation_id: String,
+    group_id: Vec<u8>,
+}
+
 /// One device's client: an engine, and the directory beside it.
 pub struct Client {
     engine: MlsEngine,
     directory: Directory,
+    unfiled_joins: Vec<UnfiledJoin>,
 }
 
 impl core::fmt::Debug for Client {
@@ -190,6 +221,7 @@ impl Client {
         Ok(Self {
             engine,
             directory: Directory::open(state_dir, state_key)?,
+            unfiled_joins: Vec::new(),
         })
     }
 
@@ -241,39 +273,19 @@ impl Client {
     }
 
     fn process_welcome(&mut self, env: &InboundEnvelope) -> Processed {
+        let digest: [u8; 32] = Sha256::digest(&env.ciphertext).into();
+        // The replay of a Welcome this device joined from and could not
+        // file: its key package is spent, so file what the join gave.
+        if let Some(unfiled) = self
+            .unfiled_joins
+            .iter()
+            .find(|u| u.welcome == digest && u.conversation_id == env.conversation_id)
+        {
+            let group_id = unfiled.group_id.clone();
+            return self.file_join(env, digest, group_id);
+        }
         match self.engine.process_welcome(&env.ciphertext) {
-            Ok(group_id) => {
-                // A Welcome is filed by the conversation it was sent for:
-                // it carries no group id to file it by. If the
-                // conversation already had a group, this Welcome is the
-                // one that re-seats this device (a rejoin answered), and
-                // it replaces the old one.
-                let result = if self.directory.group_for(&env.conversation_id).is_some() {
-                    self.directory
-                        .record_replacing(&env.conversation_id, &group_id)
-                } else {
-                    self.directory.record(&env.conversation_id, &group_id)
-                };
-                match result {
-                    Ok(true) => Processed::ack(Event::Joined {
-                        conversation_id: env.conversation_id.clone(),
-                        group_id,
-                    }),
-                    // The group is already another conversation's: filing it
-                    // under this one too would let one group speak for two.
-                    Ok(false) => Processed::ack(Event::Failed {
-                        reason: "this Welcome is for a group another conversation holds".to_owned(),
-                        retryable: false,
-                    }),
-                    Err(e) => Processed {
-                        ack: false,
-                        event: Event::Failed {
-                            reason: e,
-                            retryable: true,
-                        },
-                    },
-                }
-            }
+            Ok(group_id) => self.file_join(env, digest, group_id),
             // A Welcome that names a key package this device does not hold,
             // for a conversation it has no group in, means it was never
             // added: the publisher's pool handed out a package this engine
@@ -298,8 +310,107 @@ impl Client {
         }
     }
 
+    /// File a group the engine joined from the Welcome in `env`. A failed
+    /// write keeps the join in memory for the replay and leaves the
+    /// Welcome unacknowledged.
+    fn file_join(
+        &mut self,
+        env: &InboundEnvelope,
+        digest: [u8; 32],
+        group_id: Vec<u8>,
+    ) -> Processed {
+        let result = self.file_group(&env.conversation_id, &group_id);
+        let event = match result {
+            Ok(true) => Event::Joined {
+                conversation_id: env.conversation_id.clone(),
+                group_id,
+            },
+            // The group is already another conversation's: filing it
+            // under this one too would let one group speak for two.
+            Ok(false) => Event::Failed {
+                reason: "this Welcome is for a group another conversation holds".to_owned(),
+                retryable: false,
+            },
+            Err(e) => {
+                if !self.unfiled_joins.iter().any(|u| u.welcome == digest) {
+                    self.unfiled_joins.push(UnfiledJoin {
+                        welcome: digest,
+                        conversation_id: env.conversation_id.clone(),
+                        group_id,
+                    });
+                }
+                return Processed {
+                    ack: false,
+                    event: Event::Failed {
+                        reason: e,
+                        retryable: true,
+                    },
+                };
+            }
+        };
+        self.unfiled_joins.retain(|u| u.welcome != digest);
+        Processed::ack(event)
+    }
+
+    /// A Welcome is filed by the conversation it was sent for: it carries
+    /// no group id to file it by. If the conversation already had a
+    /// group, the Welcome is the one that re-seats this device (a rejoin
+    /// answered), and it replaces the old one.
+    fn file_group(&mut self, conversation_id: &str, group_id: &[u8]) -> Result<bool, String> {
+        if self.directory.group_for(conversation_id).is_some() {
+            self.directory.record_replacing(conversation_id, group_id)
+        } else {
+            self.directory.record(conversation_id, group_id)
+        }
+    }
+
+    /// The conversation of a joined group whose filing failed, filed now.
+    /// `Ok(None)` when no such join is held. The entry stays until its
+    /// Welcome is replayed, so that replay is answered as joined.
+    fn file_unfiled_group(&mut self, group_id: &[u8]) -> Result<Option<String>, String> {
+        let Some(conversation_id) = self
+            .unfiled_joins
+            .iter()
+            .find(|u| u.group_id == group_id)
+            .map(|u| u.conversation_id.clone())
+        else {
+            return Ok(None);
+        };
+        if self.file_group(&conversation_id, group_id)? {
+            Ok(Some(conversation_id))
+        } else {
+            self.unfiled_joins.retain(|u| u.group_id != group_id);
+            Ok(None)
+        }
+    }
+
+    /// Leave an envelope for a group this device has not joined for a
+    /// replay, at most [`MAX_DEFERRALS`] times.
+    fn defer_unjoined(&mut self, env: &InboundEnvelope, what: &str) -> Processed {
+        match self.directory.defer(&env.envelope_id) {
+            Ok(attempts) if attempts >= MAX_DEFERRALS => {
+                self.directory.settle(&env.envelope_id);
+                Processed::ack(Event::Failed {
+                    reason: format!(
+                        "{what} after {attempts} deliveries; its Welcome never arrived"
+                    ),
+                    retryable: false,
+                })
+            }
+            // Counted, or not countable now: either way it may yet be
+            // joined, so leave it for the replay.
+            Ok(_) | Err(_) => Processed {
+                ack: false,
+                event: Event::Failed {
+                    reason: what.to_owned(),
+                    retryable: true,
+                },
+            },
+        }
+    }
+
     fn process_application(&mut self, env: &InboundEnvelope) -> Processed {
-        let Some(group_id) = message_group_id(&env.ciphertext) else {
+        let Ok(group_id) = message_group_id(&env.ciphertext) else {
             return Processed::ack(Event::Failed {
                 reason: "the message carries no group id".to_owned(),
                 retryable: false,
@@ -308,22 +419,32 @@ impl Client {
         if self.engine.group_epoch(&group_id).is_none() {
             // Most likely its Welcome is still on the way; leave it for
             // the replay rather than lose it.
-            return Processed {
-                ack: false,
-                event: Event::Failed {
-                    reason: "a message for a group this device has not joined".to_owned(),
-                    retryable: true,
-                },
-            };
+            return self.defer_unjoined(env, "a message for a group this device has not joined");
         }
+        self.directory.settle(&env.envelope_id);
         // Filed by this device's own record, never the envelope's: the
         // conversation the group is (or was, before a rejoin superseded
         // it). A group no conversation holds has no conversation to show
         // a message in, whatever the envelope says.
-        let Some(conversation_id) = self.directory.conversation_of_message(&group_id) else {
-            return Processed::ack(Event::Ignored {
-                reason: "a message for a group no conversation holds".to_owned(),
-            });
+        let conversation_id = match self.directory.conversation_of_message(&group_id) {
+            Some(c) => c,
+            None => match self.file_unfiled_group(&group_id) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    return Processed::ack(Event::Ignored {
+                        reason: "a message for a group no conversation holds".to_owned(),
+                    });
+                }
+                Err(e) => {
+                    return Processed {
+                        ack: false,
+                        event: Event::Failed {
+                            reason: e,
+                            retryable: true,
+                        },
+                    };
+                }
+            },
         };
         // Past the cutover the engine refuses a message whose authenticated
         // sending leaf is not of `from_airdress`, so the name below is the
@@ -360,20 +481,30 @@ impl Client {
     }
 
     fn process_commit(&mut self, env: &InboundEnvelope) -> Processed {
-        let Some(group_id) = message_group_id(&env.ciphertext) else {
+        let Ok(group_id) = message_group_id(&env.ciphertext) else {
             return Processed::ack(Event::Failed {
                 reason: "the commit carries no group id".to_owned(),
                 retryable: false,
             });
         };
         let Some(current) = self.engine.group_epoch(&group_id) else {
-            return Processed {
-                ack: false,
-                event: Event::Failed {
-                    reason: "a commit for a group this device has not joined".to_owned(),
-                    retryable: true,
-                },
-            };
+            return self.defer_unjoined(env, "a commit for a group this device has not joined");
+        };
+        self.directory.settle(&env.envelope_id);
+        let conversation_id = match self.directory.conversation_for(&group_id) {
+            Some(c) => Some(c),
+            None => match self.file_unfiled_group(&group_id) {
+                Ok(c) => c,
+                Err(e) => {
+                    return Processed {
+                        ack: false,
+                        event: Event::Failed {
+                            reason: e,
+                            retryable: true,
+                        },
+                    };
+                }
+            },
         };
         // A group this device was removed from: its state lingers in the
         // engine, but no commit can apply to it any more, and the one most
@@ -381,7 +512,7 @@ impl Client {
         // whose Welcome follows. Asking to rejoin here would be answered
         // with a second Remove and Add (SPEC-166 166-B.14, measured on
         // VM2).
-        let Some(conversation_id) = self.directory.conversation_for(&group_id) else {
+        let Some(conversation_id) = conversation_id else {
             return Processed::ack(Event::Ignored {
                 reason: "a commit for a group this device was removed from".to_owned(),
             });

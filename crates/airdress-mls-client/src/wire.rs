@@ -369,15 +369,6 @@ pub(crate) fn random_uuid() -> String {
     )
 }
 
-/// The group id a message carries in its framing, in the clear (RFC
-/// 9420). A Welcome has none.
-pub(crate) fn message_group_id(message: &[u8]) -> Option<Vec<u8>> {
-    mls_rs::MlsMessage::from_bytes(message)
-        .ok()?
-        .group_id()
-        .map(<[u8]>::to_vec)
-}
-
 /// Standard base64, for callers that log or key by a group id.
 #[must_use]
 pub fn b64_group_id(group_id: &[u8]) -> String {

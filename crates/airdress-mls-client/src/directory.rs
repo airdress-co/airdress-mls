@@ -11,6 +11,11 @@
 //! founding two groups for one conversation is how a third device goes
 //! deaf. [`Directory::record_replacing`] is the deliberate exception, for
 //! a rejoin, where the old group is the one that stopped working.
+//!
+//! Every change is written before it takes effect: the next document is
+//! built, sealed to disk, and only then becomes the one in memory, so a
+//! failed write changes nothing and the envelope behind it can be
+//! replayed against the state it first met.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -30,7 +35,18 @@ pub fn scope_of(conversation_id: &str) -> String {
     format!("conv:{conversation_id}")
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// How many envelopes [`Directory::defer`] keeps a count for. Past it the
+/// oldest count is dropped: an envelope the operator stopped replaying
+/// leaves its count behind, and the list must not grow without limit.
+const MAX_DEFERRED: usize = 256;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Deferred {
+    envelope_id: String,
+    attempts: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Doc {
     /// scope → base64 group id
     groups: BTreeMap<String, String>,
@@ -41,6 +57,10 @@ struct Doc {
     /// it is no longer the conversation's group.
     #[serde(default)]
     retired: BTreeMap<String, String>,
+    /// Envelopes left for a replay because their group was not joined
+    /// yet, with how often, oldest first.
+    #[serde(default)]
+    deferred: Vec<Deferred>,
 }
 
 /// The conversation ↔ group map, sealed under the host's state key.
@@ -132,9 +152,10 @@ impl Directory {
             (None, None) => {}
             _ => return Ok(false),
         }
-        self.doc.groups.insert(scope.clone(), gid.clone());
-        self.doc.scopes.insert(gid, scope);
-        self.save()?;
+        let mut next = self.doc.clone();
+        next.groups.insert(scope.clone(), gid.clone());
+        next.scopes.insert(gid, scope);
+        self.commit(next)?;
         Ok(true)
     }
 
@@ -158,16 +179,17 @@ impl Directory {
         if self.doc.scopes.get(&gid).is_some_and(|s| *s != scope) {
             return Ok(false);
         }
-        if let Some(old) = self.doc.groups.remove(&scope) {
-            self.doc.scopes.remove(&old);
+        let mut next = self.doc.clone();
+        if let Some(old) = next.groups.remove(&scope) {
+            next.scopes.remove(&old);
             if old != gid {
-                self.doc.retired.insert(old, scope.clone());
+                next.retired.insert(old, scope.clone());
             }
         }
-        self.doc.retired.remove(&gid);
-        self.doc.groups.insert(scope.clone(), gid.clone());
-        self.doc.scopes.insert(gid, scope);
-        self.save()?;
+        next.retired.remove(&gid);
+        next.groups.insert(scope.clone(), gid.clone());
+        next.scopes.insert(gid, scope);
+        self.commit(next)?;
         Ok(true)
     }
 
@@ -178,27 +200,153 @@ impl Directory {
     /// The sealed file could not be written.
     pub fn forget(&mut self, conversation_id: &str) -> Result<(), String> {
         let scope = scope_of(conversation_id);
-        let before = self.doc.retired.len();
-        self.doc.retired.retain(|_, s| *s != scope);
-        let had = self.doc.groups.remove(&scope);
+        let mut next = self.doc.clone();
+        next.retired.retain(|_, s| *s != scope);
+        let had = next.groups.remove(&scope);
         if let Some(old) = &had {
-            self.doc.scopes.remove(old);
+            next.scopes.remove(old);
         }
-        if had.is_some() || self.doc.retired.len() != before {
-            self.save()?;
+        if had.is_some() || next.retired.len() != self.doc.retired.len() {
+            self.commit(next)?;
         }
         Ok(())
     }
 
-    fn save(&self) -> Result<(), String> {
-        let bytes = serde_json::to_vec(&self.doc).map_err(|e| e.to_string())?;
-        self.file.write(&bytes)
+    /// Count one more delivery of an envelope left for a replay, and
+    /// return the count including this one.
+    ///
+    /// # Errors
+    ///
+    /// The sealed file could not be written; nothing was counted.
+    pub(crate) fn defer(&mut self, envelope_id: &str) -> Result<u32, String> {
+        let mut next = self.doc.clone();
+        let attempts = if let Some(d) = next
+            .deferred
+            .iter_mut()
+            .find(|d| d.envelope_id == envelope_id)
+        {
+            d.attempts = d.attempts.saturating_add(1);
+            d.attempts
+        } else {
+            next.deferred.push(Deferred {
+                envelope_id: envelope_id.to_owned(),
+                attempts: 1,
+            });
+            if next.deferred.len() > MAX_DEFERRED {
+                next.deferred.remove(0);
+            }
+            1
+        };
+        self.commit(next)?;
+        Ok(attempts)
+    }
+
+    /// Drop the count of an envelope that is no longer left for a
+    /// replay. Writes only when there was one. Returns whether no count
+    /// remains; a count that could not be dropped is harmless, and is
+    /// pruned with the oldest ([`MAX_DEFERRED`]).
+    pub(crate) fn settle(&mut self, envelope_id: &str) -> bool {
+        if !self
+            .doc
+            .deferred
+            .iter()
+            .any(|d| d.envelope_id == envelope_id)
+        {
+            return true;
+        }
+        let mut next = self.doc.clone();
+        next.deferred.retain(|d| d.envelope_id != envelope_id);
+        self.commit(next).is_ok()
+    }
+
+    /// Write `next`, then make it the document: a failed write leaves
+    /// memory as it was, in step with the disk.
+    fn commit(&mut self, next: Doc) -> Result<(), String> {
+        let bytes = serde_json::to_vec(&next).map_err(|e| e.to_string())?;
+        self.file.write(&bytes)?;
+        self.doc = next;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Make every write to `path` fail until the guard is dropped: a
+    /// directory stands where the file is renamed to. The file that was
+    /// there, if any, is put back afterwards.
+    struct Unwritable {
+        path: std::path::PathBuf,
+        aside: std::path::PathBuf,
+    }
+
+    impl Unwritable {
+        fn at(path: std::path::PathBuf) -> Self {
+            let aside = path.with_extension("aside");
+            if path.exists() {
+                std::fs::rename(&path, &aside).unwrap();
+            }
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("occupied"), b"").unwrap();
+            Self { path, aside }
+        }
+    }
+
+    impl Drop for Unwritable {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.path).unwrap();
+            if self.aside.exists() {
+                std::fs::rename(&self.aside, &self.path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_save_leaves_the_directory_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [5u8; 32];
+        let mut d = Directory::open(dir.path(), &key).unwrap();
+        d.record("c1", b"g1").unwrap();
+        {
+            let _blocked = Unwritable::at(dir.path().join(FILE));
+            assert!(d.record("c2", b"g2").is_err());
+            assert!(d.group_for("c2").is_none());
+            assert!(d.conversation_for(b"g2").is_none());
+            assert!(d.record_replacing("c1", b"g3").is_err());
+            assert_eq!(d.group_for("c1").unwrap(), b"g1");
+            assert!(d.conversation_of_message(b"g3").is_none());
+            assert!(d.forget("c1").is_err());
+            assert_eq!(d.group_for("c1").unwrap(), b"g1");
+            assert!(d.defer("e1").is_err());
+        }
+        // Memory and disk agree, and the same changes go through once
+        // the disk takes them.
+        let reopened = Directory::open(dir.path(), &key).unwrap();
+        assert_eq!(reopened.conversations(), d.conversations());
+        assert_eq!(d.defer("e1").unwrap(), 1, "the failed count was not kept");
+        assert!(d.record("c2", b"g2").unwrap());
+        d.forget("c1").unwrap();
+        let reopened = Directory::open(dir.path(), &key).unwrap();
+        assert_eq!(reopened.conversations(), vec!["c2".to_owned()]);
+    }
+
+    #[test]
+    fn deferral_counts_are_bounded_and_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = Directory::open(dir.path(), &[6u8; 32]).unwrap();
+        assert_eq!(d.defer("e1").unwrap(), 1);
+        assert_eq!(d.defer("e1").unwrap(), 2);
+        let mut d = Directory::open(dir.path(), &[6u8; 32]).unwrap();
+        assert_eq!(d.defer("e1").unwrap(), 3, "counts survive a reopen");
+        assert!(d.settle("e1"));
+        assert_eq!(d.defer("e1").unwrap(), 1);
+        for i in 0..MAX_DEFERRED {
+            d.defer(&format!("x{i}")).unwrap();
+        }
+        assert_eq!(d.doc.deferred.len(), MAX_DEFERRED);
+        assert_eq!(d.defer("e1").unwrap(), 1, "the oldest count was dropped");
+    }
 
     #[test]
     fn first_write_wins_and_survives_reopen() {
