@@ -265,6 +265,34 @@ fn uuid_like() -> String {
     )
 }
 
+/// Whether an encoded `KeyPackage`'s leaf lists every group extension
+/// type among its capabilities.
+///
+/// `mls-rs` keeps the leaf node crate-private, so the capabilities are
+/// read off the RFC 9420 encoding (§10): version, cipher suite, init key,
+/// then the leaf node's encryption key, signing identity and capabilities.
+/// Bytes that do not decode that far count as not advertising them.
+fn leaf_advertises_group_extensions(key_package: &[u8]) -> bool {
+    use mls_rs::mls_rs_codec::MlsDecode as _;
+    use mls_rs_core::crypto::HpkePublicKey;
+    use mls_rs_core::group::Capabilities;
+    use mls_rs_core::protocol_version::ProtocolVersion;
+    let mut rest = key_package;
+    let capabilities = (|| {
+        ProtocolVersion::mls_decode(&mut rest)?;
+        CipherSuite::mls_decode(&mut rest)?;
+        HpkePublicKey::mls_decode(&mut rest)?;
+        HpkePublicKey::mls_decode(&mut rest)?;
+        SigningIdentity::mls_decode(&mut rest)?;
+        Capabilities::mls_decode(&mut rest)
+    })();
+    capabilities.is_ok_and(|c| {
+        GROUP_EXTENSION_TYPES
+            .iter()
+            .all(|t| c.extensions.contains(t))
+    })
+}
+
 /// One device's MLS client: its signing identity, its sealed state and
 /// the credential rules it enforces.
 pub struct MlsEngine {
@@ -457,12 +485,20 @@ impl MlsEngine {
             staged: std::collections::HashMap::new(),
         };
 
+        // A pool made by an engine that did not yet advertise the group
+        // extension types holds packages no group conversation can add:
+        // RFC 9420 refuses a leaf that lacks a context extension. Replace
+        // them one for one, so the host republishes only usable ones.
+        let retired = engine.retire_key_packages_without_group_extensions()?;
+
         // First init on this state dir: establish the pool. The
         // publishable public messages persist alongside the private
         // halves, so the host can publish (or re-publish) them at any
         // point after this call — including after a restart.
         if engine.key_package_pool_count()? == 0 {
-            engine.generate_key_packages(INITIAL_KEY_PACKAGE_POOL)?;
+            engine.generate_key_packages(INITIAL_KEY_PACKAGE_POOL.max(retired))?;
+        } else if retired > 0 {
+            engine.generate_key_packages(retired)?;
         }
 
         Ok(engine)
@@ -553,6 +589,24 @@ impl MlsEngine {
             out.push(bytes);
         }
         Ok(out)
+    }
+
+    /// Delete every pooled key package whose leaf does not advertise all
+    /// of [`GROUP_EXTENSION_TYPES`], both halves, and say how many went.
+    fn retire_key_packages_without_group_extensions(&self) -> Result<usize, String> {
+        use mls_rs_core::key_package::KeyPackageStorage as _;
+        let mut store = self.key_packages.clone();
+        let mut retired = 0;
+        for id in self.key_packages.pool_ids().map_err(|e| e.to_string())? {
+            let Some(data) = store.get(&id).map_err(|e| e.to_string())? else {
+                continue;
+            };
+            if !leaf_advertises_group_extensions(&data.key_package_bytes) {
+                store.delete(&id).map_err(|e| e.to_string())?;
+                retired += 1;
+            }
+        }
+        Ok(retired)
     }
 
     /// Number of unconsumed KeyPackage private halves in the pool.
@@ -1385,3 +1439,7 @@ impl IdentitySet {
 #[cfg(test)]
 #[path = "receive_tests.rs"]
 mod receive_tests;
+
+#[cfg(test)]
+#[path = "engine_tests.rs"]
+mod engine_tests;
