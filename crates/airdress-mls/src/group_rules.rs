@@ -17,11 +17,19 @@
 //! | a change to `sequencer` | is an admin, or the commit removes a whole person (D-12's move) |
 //! | a change to `roles` | is an admin, or the change is exactly [`forced_roles`] |
 //!
-//! And after every commit: at least one admin is still in the group (FR-16).
-//! A commit that removes the last admin therefore has to carry the forced
-//! promotion, whoever commits it. A committing device also refuses to take
-//! the group past [`GROUP_MAX_PERSONS`] persons or [`GROUP_LEAF_CAP`]
-//! devices (D-11).
+//! | a change to any other context extension | is an admin |
+//! | `Update` | — (a leaf's own key rotation, as MLS defines it) |
+//! | anything else (`ReInit`, `PreSharedKey`, `ExternalInit`, custom) | is refused: nothing in a group conversation uses them |
+//!
+//! And after every commit: at least one admin is still in the group (FR-16),
+//! and every admin the roles name is in the group. A commit that removes an
+//! admin therefore has to carry the roles without them, and one that removes
+//! the last admin the forced promotion, whoever commits it. An honest
+//! committing device adds that change itself when its commit needs it
+//! ([`forced_roles`]), so a leave or a removal never wedges the group. A
+//! committing device also refuses to grow the group past
+//! [`GROUP_MAX_PERSONS`] persons or [`GROUP_LEAF_CAP`] devices (D-11); a
+//! group already past a cap still takes every commit that does not grow it.
 //!
 //! Authority is read from the roster leaf a proposal's `Sender` points at,
 //! never from anything the proposer wrote. As in [`crate::rules`], a refused
@@ -39,12 +47,14 @@
 use std::collections::BTreeSet;
 
 use mls_rs::ExtensionList;
-use mls_rs::group::proposal::{AddProposal, RemoveProposal};
+use mls_rs::group::proposal::{AddProposal, BorrowedProposal, Proposal, RemoveProposal};
 use mls_rs::group::{Roster, Sender};
 use mls_rs::mls_rules::{CommitDirection, CommitSource, ProposalBundle, ProposalSource};
 
 use crate::credential::RevocationLookup;
-use crate::group_context::{GROUP_LEAF_CAP, GROUP_MAX_PERSONS, GroupExtensions, forced_roles};
+use crate::group_context::{
+    GROUP_EXTENSION_TYPES, GROUP_LEAF_CAP, GROUP_MAX_PERSONS, GroupExtensions, forced_roles,
+};
 use crate::rules::{Leaf, MlsRulesError, authorise_removal, leaf_at, proposer_leaf};
 
 /// Which group rule a proposal set broke. The sentence is for a journal;
@@ -75,6 +85,14 @@ pub enum GroupRule {
     TooManyPersons,
     /// The proposed group extensions do not parse, or drop the group.
     MalformedExtensions,
+    /// The roles would name an admin who is not in the group.
+    AdminNotInGroup,
+    /// A member who is not an admin changed a context extension outside
+    /// the four group extensions.
+    ChangeOtherExtensions,
+    /// A kind of proposal this conversation does not take (`ReInit`,
+    /// `PreSharedKey`, `ExternalInit`, a custom proposal).
+    UnsupportedProposal,
     /// A conversation founded without the group extensions (one-to-one,
     /// self, household) was given some. Only a group founded as one is a
     /// group conversation; nothing turns another conversation into one.
@@ -94,6 +112,9 @@ impl core::fmt::Display for GroupRule {
             Self::NoAdminLeft => "a group must keep at least one admin",
             Self::TooManyPersons => "that would make the group too big",
             Self::MalformedExtensions => "the group's settings in this change are unreadable",
+            Self::AdminNotInGroup => "a group's admins must all be in the group",
+            Self::ChangeOtherExtensions => "only an admin may change a group's other settings",
+            Self::UnsupportedProposal => "this conversation does not take that kind of change",
             Self::NotAGroup => "this conversation is not a group and cannot take on group settings",
         })
     }
@@ -142,6 +163,8 @@ fn leaf_cap() -> usize {
 /// One group's rules, read from the context the commit is made in.
 pub(crate) struct GroupView<'a> {
     current: GroupExtensions,
+    /// The whole context extension list, group extensions included.
+    context: &'a ExtensionList,
     roster: &'a Roster<'a>,
     /// The persons in the group before the commit, by pin subject.
     before: BTreeSet<String>,
@@ -151,7 +174,7 @@ impl<'a> GroupView<'a> {
     /// `None` for a context that is not a group conversation.
     pub(crate) fn of(
         roster: &'a Roster<'a>,
-        context_extensions: &ExtensionList,
+        context_extensions: &'a ExtensionList,
     ) -> Result<Option<Self>, MlsRulesError> {
         let Some(current) = GroupExtensions::from_list(context_extensions)
             .map_err(|_unreadable| MlsRulesError::Group(GroupRule::MalformedExtensions))?
@@ -168,6 +191,7 @@ impl<'a> GroupView<'a> {
         }
         Ok(Some(Self {
             current,
+            context: context_extensions,
             roster,
             before,
         }))
@@ -220,6 +244,9 @@ pub(crate) fn filter(
         return Ok(());
     }
     let roster = view.roster;
+
+    // Proposal kinds the group rules do not name.
+    refuse_unsupported(direction, proposals)?;
 
     // Removes.
     proposals.retain_by_type::<RemoveProposal, _, MlsRulesError>(|info| {
@@ -282,16 +309,26 @@ pub(crate) fn filter(
     // The context change, if any.
     let mut roles_after = view.current.roles.clone();
     proposals.retain_by_type::<ExtensionList, _, MlsRulesError>(|info| {
-        let proposed = GroupExtensions::from_list(&info.proposal)
-            .ok()
-            .flatten()
-            .ok_or(MlsRulesError::Group(GroupRule::MalformedExtensions))?;
-        let by = proposer_leaf(*info.sender(), source, roster)?;
-        let admin = match &by {
-            Some(by) => view.is_admin(by)?,
+        let Some(proposed) = GroupExtensions::from_list(&info.proposal).ok().flatten() else {
+            return keep_or_refuse(
+                false,
+                direction,
+                info.source(),
+                GroupRule::MalformedExtensions,
+            );
+        };
+        let admin = match proposer_leaf(*info.sender(), source, roster)? {
+            Some(by) => view.is_admin(&by)?,
             None => false,
         };
-        let verdict = context_change(view, &proposed, admin, &after, removes_a_person);
+        let verdict =
+            context_change(view, &proposed, admin, &after, removes_a_person).and_then(|()| {
+                if admin || others_unchanged(view.context, &info.proposal) {
+                    Ok(())
+                } else {
+                    Err(GroupRule::ChangeOtherExtensions)
+                }
+            });
         match verdict {
             Ok(()) => {
                 roles_after = proposed.roles;
@@ -301,21 +338,131 @@ pub(crate) fn filter(
         }
     })?;
 
-    // FR-16: an admin stays.
+    // A commit this device builds that leaves the roles naming someone who
+    // is gone carries the roles without them, promoting when no admin is
+    // left (FR-16): the change every honest committer is allowed to make.
+    if direction == CommitDirection::Send && !roles_hold(&roles_after, &after) {
+        roles_after = add_forced_roles(view, source, proposals, &after, removes_a_person)?;
+    }
+
+    // FR-16: an admin stays, and every admin named is in the group.
     if !roles_after.admins.iter().any(|a| after.contains(a)) {
         return Err(MlsRulesError::Group(GroupRule::NoAdminLeft));
     }
-    // D-11: the committing device holds the cap.
-    if direction == CommitDirection::Send && after.len() > person_cap() {
-        return Err(MlsRulesError::Group(GroupRule::TooManyPersons));
+    if !roles_hold(&roles_after, &after) {
+        return Err(MlsRulesError::Group(GroupRule::AdminNotInGroup));
     }
-    // D-11: and the leaf cap, so the Welcome fits one envelope.
-    let leaves_after =
-        roster.members_iter().count() - removed.len() + proposals.add_proposals().len();
-    if direction == CommitDirection::Send && leaves_after > leaf_cap() {
-        return Err(MlsRulesError::Group(GroupRule::TooManyPersons));
+    // D-11: the committing device holds the caps, on a commit that grows
+    // the group past them. A group already past a cap still takes a
+    // removal, a key rotation or a settings change.
+    if direction == CommitDirection::Send {
+        let persons_grow = after.len() > view.before.len();
+        if persons_grow && after.len() > person_cap() {
+            return Err(MlsRulesError::Group(GroupRule::TooManyPersons));
+        }
+        // And the leaf cap, so the Welcome fits one envelope.
+        let leaves_before = roster.members_iter().count();
+        let leaves_after = leaves_before - removed.len() + proposals.add_proposals().len();
+        if leaves_after > leaves_before && leaves_after > leaf_cap() {
+            return Err(MlsRulesError::Group(GroupRule::TooManyPersons));
+        }
     }
     Ok(())
+}
+
+/// Refuse every proposal kind the group rules do not name. `Update` is a
+/// leaf's own key rotation and stays.
+fn refuse_unsupported(
+    direction: CommitDirection,
+    proposals: &mut ProposalBundle,
+) -> Result<(), MlsRulesError> {
+    proposals.retain::<_, MlsRulesError>(|info| {
+        let supported = !matches!(
+            info.proposal,
+            BorrowedProposal::ReInit(_)
+                | BorrowedProposal::Psk(_)
+                | BorrowedProposal::ExternalInit(_)
+        );
+        keep_or_refuse(
+            supported,
+            direction,
+            info.source(),
+            GroupRule::UnsupportedProposal,
+        )
+    })?;
+    proposals.retain_custom::<_, MlsRulesError>(|info| {
+        keep_or_refuse(
+            false,
+            direction,
+            info.source(),
+            GroupRule::UnsupportedProposal,
+        )
+    })
+}
+
+/// Whether every admin the roles name is among `after`, and there is one.
+fn roles_hold(roles: &crate::group_context::GroupRoles, after: &[String]) -> bool {
+    !roles.admins.is_empty() && roles.admins.iter().all(|a| after.contains(a))
+}
+
+/// Replace the commit's context change, if any, with one whose roles are
+/// [`forced_roles`] for `after`, proposed by value by the committer.
+///
+/// The base is the committer's own by-value change when it made one (its
+/// title or picture edit stays), otherwise the current context; a
+/// by-reference change from someone else is dropped, as any refused
+/// by-reference proposal is on send. The result is held to the same rules
+/// as any other context change.
+fn add_forced_roles(
+    view: &GroupView<'_>,
+    source: &CommitSource,
+    proposals: &mut ProposalBundle,
+    after: &[String],
+    removes_a_person: bool,
+) -> Result<crate::group_context::GroupRoles, MlsRulesError> {
+    let malformed = || MlsRulesError::Group(GroupRule::MalformedExtensions);
+    let CommitSource::ExistingMember(committer) = source else {
+        return Err(MlsRulesError::Group(GroupRule::NoAdminLeft));
+    };
+    let own = proposals
+        .group_context_ext_proposals()
+        .iter()
+        .find(|p| p.is_by_value())
+        .map(|p| p.proposal.clone());
+    let base_list = own.unwrap_or_else(|| view.context.clone());
+    let mut base = GroupExtensions::from_list(&base_list)
+        .ok()
+        .flatten()
+        .ok_or_else(malformed)?;
+    base.roles = forced_roles(&base.roles, after);
+    let admin = view.is_admin(&Leaf::of(committer.signing_identity())?)?;
+    context_change(view, &base, admin, after, removes_a_person).map_err(MlsRulesError::Group)?;
+    let mut list = base_list;
+    for extension in base.to_list().map_err(|_unreadable| malformed())?.iter() {
+        list.set(extension.clone());
+    }
+    proposals.retain_by_type::<ExtensionList, _, MlsRulesError>(|_| Ok(false))?;
+    proposals.add(
+        Proposal::GroupContextExtensions(list),
+        Sender::Member(committer.index),
+        ProposalSource::ByValue,
+    );
+    Ok(base.roles)
+}
+
+/// Whether `proposed` keeps every context extension outside the group set
+/// exactly as `current` has it.
+fn others_unchanged(current: &ExtensionList, proposed: &ExtensionList) -> bool {
+    let others = |list: &ExtensionList| {
+        let mut v: Vec<_> = list
+            .iter()
+            .filter(|e| !GROUP_EXTENSION_TYPES.contains(&e.extension_type))
+            .map(|e| (e.extension_type, e.extension_data.clone()))
+            .collect();
+        v.sort();
+        v
+    };
+    others(current) == others(proposed)
 }
 
 /// Whether a proposed set of group extensions is a change this proposer
@@ -379,4 +526,4 @@ fn push_unique(list: &mut Vec<String>, item: &str) {
 
 #[cfg(test)]
 #[path = "group_rules_tests.rs"]
-mod tests;
+pub(crate) mod tests;

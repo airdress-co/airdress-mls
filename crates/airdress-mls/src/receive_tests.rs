@@ -18,7 +18,8 @@ use crate::credential::{DeviceStatus, test_support::signed_delegation_json_v2};
 use crate::group_context::{
     GroupExtensions, GroupPolicy, GroupProfile, GroupRoles, GroupSequencer,
 };
-use crate::group_rules::SEND_UNCHECKED;
+use crate::group_rules::tests::{Group, rule_error, three};
+use crate::group_rules::{GroupRule, SEND_UNCHECKED};
 
 const ALICE: &str = "alice.test";
 const BOB: &str = "bob.test";
@@ -206,4 +207,139 @@ fn a_member_cannot_send_under_another_members_airdress() {
         .unwrap();
     assert_eq!(got.plaintext, b"hi from bob");
     assert_eq!(got.sender.airdress, BOB);
+}
+
+// ---------------------------------------------------------------------
+// Group conversations: what the group rules do not name
+// ---------------------------------------------------------------------
+
+/// `by` builds a commit holding only a `ReInit`, with or without its rules.
+fn reinit_commit(engine: &MlsEngine, group: &[u8], unchecked: bool) -> Result<Vec<u8>, String> {
+    let mut g = engine.load_group(group)?;
+    let suite = g.cipher_suite();
+    SEND_UNCHECKED.with(|c| c.set(unchecked));
+    let built = g
+        .commit_builder()
+        .reinit(
+            None,
+            mls_rs::ProtocolVersion::MLS_10,
+            suite,
+            ExtensionList::new(),
+        )
+        .map_err(|e| e.to_string())
+        .and_then(|b| b.build().map_err(|e| e.to_string()));
+    SEND_UNCHECKED.with(|c| c.set(false));
+    built?.commit_message.to_bytes().map_err(|e| e.to_string())
+}
+
+#[test]
+fn a_group_member_cannot_reinitialise_the_group() {
+    let mut g = three();
+    let id = g.id.clone();
+    let honest = reinit_commit(&g.get("ben").engine, &id, false);
+    let err = honest.expect_err("the honest committer cannot build a ReInit");
+    assert!(
+        err.contains(&GroupRule::UnsupportedProposal.to_string()),
+        "{err}"
+    );
+
+    let commit = reinit_commit(&g.get("ben").engine, &id, true).unwrap();
+    for who in ["ana", "cleo"] {
+        let before = g.get(who).engine.group_epoch(&id);
+        let err = g
+            .get(who)
+            .engine
+            .process_commit(&id, &commit)
+            .expect_err("a ReInit is refused")
+            .to_string();
+        assert!(
+            err.contains(&GroupRule::UnsupportedProposal.to_string()),
+            "{who}: {err}"
+        );
+        assert_eq!(g.get(who).engine.group_epoch(&id), before);
+    }
+}
+
+#[test]
+fn a_one_to_one_cannot_be_reinitialised() {
+    let mut t = one_to_one();
+    let honest = reinit_commit(&t.bob, &t.group, false);
+    assert!(
+        honest.is_err(),
+        "the honest committer cannot build a ReInit"
+    );
+    let commit = reinit_commit(&t.bob, &t.group, true).unwrap();
+    let before = t.phone.group_epoch(&t.group);
+    let err = t
+        .phone
+        .process_commit(&t.group, &commit)
+        .expect_err("a ReInit is refused")
+        .to_string();
+    assert!(
+        err.contains(&GroupRule::UnsupportedProposal.to_string()),
+        "{err}"
+    );
+    assert_eq!(t.phone.group_epoch(&t.group), before);
+}
+
+/// The group's own four extensions, unchanged, plus one more.
+fn with_an_extra_extension(g: &Group) -> ExtensionList {
+    let mut list = g.extensions().to_list().unwrap();
+    list.set_from(mls_rs::extension::built_in::RequiredCapabilitiesExt::default())
+        .unwrap();
+    list
+}
+
+#[test]
+fn only_an_admin_changes_the_groups_other_extensions() {
+    let mut g = three();
+    let id = g.id.clone();
+    let extra = with_an_extra_extension(&g);
+    let stage = |g: &mut Group, who: &str, list: &ExtensionList| {
+        g.get(who)
+            .engine
+            .staged
+            .entry(id.clone())
+            .or_default()
+            .push(StagedProposal::RawExtensions(list.clone()));
+    };
+    stage(&mut g, "ben", &extra);
+    rule_error(g.commit("ben"), GroupRule::ChangeOtherExtensions);
+    stage(&mut g, "ben", &extra);
+    g.refused_everywhere("ben", GroupRule::ChangeOtherExtensions);
+
+    let mut g = three();
+    let extra = with_an_extra_extension(&g);
+    stage(&mut g, "ana", &extra);
+    assert!(g.commit("ana").is_ok(), "an admin may");
+}
+
+#[test]
+fn an_unreadable_proposed_change_does_not_hold_up_the_next_commit() {
+    let mut g = three();
+    let id = g.id.clone();
+    // Ben proposes, by reference, one group extension of the four.
+    let full = g.extensions().to_list().unwrap();
+    let mut partial = ExtensionList::new();
+    partial.set(
+        full.get(crate::group_context::GROUP_EXTENSION_TYPES[0])
+            .unwrap(),
+    );
+    let proposal = {
+        let mut group = g.get("ben").engine.load_group(&id).unwrap();
+        group
+            .propose_group_context_extensions(partial, Vec::new())
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+    };
+    g.get("ana")
+        .engine
+        .process_proposal(&id, &proposal)
+        .unwrap();
+
+    // Ana's next commit builds, without it, and Cleo applies it.
+    let before = g.get("cleo").engine.group_epoch(&id).unwrap();
+    g.commit("ana").expect("an unrelated commit still builds");
+    assert_eq!(g.get("cleo").engine.group_epoch(&id), Some(before + 1));
 }

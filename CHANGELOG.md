@@ -30,7 +30,8 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 - `airdress_mls_client::directory::Directory::record_replacing` returns
   `Result<bool, _>`: `false`, changing nothing, when the group belongs to
   another conversation.
-- `GroupRule` has a new variant, `NotAGroup`.
+- `GroupRule` has new variants: `NotAGroup`, `AdminNotInGroup`,
+  `ChangeOtherExtensions` and `UnsupportedProposal`.
 - New refusals, where there used to be an answer:
   - a one-to-one, self or household group refuses a commit that adds the
     group conversation extensions, in full or in part (`NotAGroup`);
@@ -47,6 +48,16 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
   - `airdress_mls_generate_key_packages` refuses a `count` above 256 with
     `InvalidArgument`, before the engine is locked. A larger count used to
     be attempted, and a huge one aborted the process.
+  - in a group conversation, a commit is refused when its roles name an
+    admin who is not in the group (`AdminNotInGroup`): a commit that
+    removes an admin carries the roles without them. A person removed as
+    an admin and added back is a member, not an admin;
+  - in a group conversation, a commit carrying a `ReInit`, `PreSharedKey`,
+    `ExternalInit` or custom proposal is refused (`UnsupportedProposal`),
+    and so is a `ReInit` in a one-to-one, self or household group;
+  - in a group conversation, a member who is not an admin may not change a
+    context extension outside the four group extensions
+    (`ChangeOtherExtensions`).
 
 ### Added
 
@@ -63,6 +74,17 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
     says so when no NDK is found;
   - each target is added to the pinned toolchain before it is built, and
     a build that produced no library fails instead of reporting success.
+- A device committing in a group conversation adds the roles change its
+  commit needs: the roles without an admin it removes, or the forced
+  promotion when the last admin leaves. Before, every commit after the
+  last admin's leave failed with `NoAdminLeft` until somebody staged the
+  promotion by hand.
+- An unreadable proposed change to the group extensions, held by
+  reference, is left out of this device's next commit instead of failing
+  it, as every other refused by-reference proposal already was.
+- The person and device caps refuse only a commit that grows the group
+  past them. A group already past a cap still takes a removal, a key
+  rotation or a settings change.
 
 ## v0.6.1 — 2026-10-31
 
