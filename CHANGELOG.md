@@ -87,6 +87,33 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 - `MlsEngine::discard_staged()`: drop what is staged for a group without
   committing.
 
+### Changed
+
+- **A held commit is confirmed onto the group as it is on disk then.**
+  `commit_pending` keeps the new epoch's secrets rather than a copy of the
+  group, so a message decrypted while the commit waits leaves its
+  key used after `confirm_commit`, instead of the copy taken at build time
+  restoring it. Messages of the old epoch keep decrypting meanwhile.
+- `MlsEngine::abort_commit` drops what is staged for the group even when
+  no commit is pending (it still answers that nothing was pending).
+- `Client::prepare_add` and `Client::prepare_remove` stage a batch all or
+  nothing: when one item is refused, none of the batch is left for the
+  next commit.
+- `MlsEngine::from_seed` deletes pooled key packages whose leaf does not
+  advertise the group extension types, both halves, and makes one
+  replacement for each, so `stored_key_packages` republishes only packages
+  a group conversation can add. A Welcome built from a deleted package
+  answers `WELCOME_KEY_PACKAGE_NOT_FOUND`, which the client turns into a
+  rejoin request.
+- `client::MAX_DEFERRALS` and `pins::MAX_CHANGES_PER_PIN`.
+- `PinStore::changes()` keeps the newest `MAX_CHANGES_PER_PIN` (16)
+  changes recorded against each pinned key of an airdress; a newer one
+  drops the oldest.
+- `PinStore::observe` writes nothing on a match: `last_seen` reaches the
+  disk with the next write that changes something else.
+- The client calls `airdress_mls::engine::message_group_id` instead of a
+  copy of its own, and no longer depends on `mls-rs` directly.
+
 ### Fixed
 
 - `crates/airdress-mls-ffi/build-native.sh` builds the phone targets:
@@ -108,38 +135,6 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 - The person and device caps refuse only a commit that grows the group
   past them. A group already past a cap still takes a removal, a key
   rotation or a settings change.
-### Changed
-
-- **A held commit is confirmed onto the group as it is on disk then.**
-  `commit_pending` keeps the new epoch's secrets rather than a copy of the
-  group, so a message decrypted while the commit waits leaves its
-  key used after `confirm_commit`, instead of the copy taken at build time
-  restoring it. Messages of the old epoch keep decrypting meanwhile.
-- `MlsEngine::abort_commit` drops what is staged for the group even when
-  no commit is pending (it still answers that nothing was pending).
-- `Client::prepare_add` and `Client::prepare_remove` stage a batch all or
-  nothing: when one item is refused, none of the batch is left for the
-  next commit.
-- `MlsEngine::from_seed` deletes pooled key packages whose leaf does not
-  advertise the group extension types, both halves, and makes one
-  replacement for each, so `stored_key_packages` republishes only packages
-  a group conversation can add. A Welcome built from a deleted package
-  answers `WELCOME_KEY_PACKAGE_NOT_FOUND`, which the client turns into a
-  rejoin request.
-- `client::MAX_DEFERRALS` and `pins::MAX_CHANGES_PER_PIN`.
-
-### Changed
-
-- `PinStore::changes()` keeps the newest `MAX_CHANGES_PER_PIN` (16)
-  changes recorded against each pinned key of an airdress; a newer one
-  drops the oldest.
-- `PinStore::observe` writes nothing on a match: `last_seen` reaches the
-  disk with the next write that changes something else.
-- The client calls `airdress_mls::engine::message_group_id` instead of a
-  copy of its own, and no longer depends on `mls-rs` directly.
-
-### Fixed
-
 - `Directory` and `PinStore` write a change before it takes effect, so a
   failed write leaves memory as it was and the envelope behind it is
   judged against the same state when it is replayed (a Welcome, a
@@ -151,9 +146,6 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 - `storage::write_file_atomically` and `storage::remove_interrupted_writes`:
   the temp-file, fsync, rename and directory-fsync write both crates'
   sealed files now use, and the cleanup of temp files a crash left.
-
-### Fixed
-
 - A device removed from a group and added back to the same group id
   joins it afresh: the Welcome replaces the group's stored record instead
   of merging into it. Before, the epochs of its earlier membership stayed
