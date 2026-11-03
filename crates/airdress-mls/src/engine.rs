@@ -364,6 +364,15 @@ struct HeldCommit {
     secrets: mls_rs::group::CommitSecrets,
 }
 
+/// Why a held commit was not applied, and whether it is still held.
+enum Unapplied {
+    /// The group moved on since the commit was built: it can never apply,
+    /// and is dropped.
+    Moved(EngineError),
+    /// Any other failure: the commit stays held for another attempt.
+    Kept(EngineError),
+}
+
 /// The proposals staged for one group, and the epoch they were staged
 /// at: the oldest, when more than one.
 ///
@@ -1430,30 +1439,49 @@ impl MlsEngine {
     ///
     /// # Errors
     ///
-    /// No commit is awaiting confirmation for this group, the group has
+    /// No commit is awaiting confirmation for this group, or the group has
     /// moved past the epoch the commit was built from (the held commit is
-    /// dropped), or the sealed store refuses the write.
-    pub fn confirm_commit(&mut self, group_id: &[u8]) -> Result<u64, String> {
-        let held = self
-            .pending
-            .remove(group_id)
-            .ok_or("no commit is awaiting confirmation for this group")?;
-        let mut group = self.load_group(group_id)?;
+    /// dropped): [`EngineError::Other`]. The sealed store refused the
+    /// write: [`EngineError::Storage`]. On any failure but the moved
+    /// epoch the commit stays held, so the same call succeeds once storage
+    /// does; the operator has already accepted it, and the held commit is
+    /// the only copy of the new epoch's secrets.
+    pub fn confirm_commit(&mut self, group_id: &[u8]) -> Result<u64, EngineError> {
+        let held = self.pending.remove(group_id).ok_or_else(|| {
+            EngineError::Other("no commit is awaiting confirmation for this group".to_owned())
+        })?;
+        match self.apply_held(group_id, &held) {
+            Ok(epoch) => {
+                self.staged.remove(group_id);
+                Ok(epoch)
+            }
+            Err(Unapplied::Moved(e)) => Err(e),
+            Err(Unapplied::Kept(e)) => {
+                self.pending.insert(group_id.to_vec(), held);
+                Err(e)
+            }
+        }
+    }
+
+    /// Apply a held commit to the group on disk and write the result.
+    fn apply_held(&self, group_id: &[u8], held: &HeldCommit) -> Result<u64, Unapplied> {
+        let mut group = self
+            .load_group(group_id)
+            .map_err(|e| Unapplied::Kept(EngineError::Other(e)))?;
         if group.current_epoch() != held.from_epoch {
-            return Err(format!(
+            return Err(Unapplied::Moved(EngineError::Other(format!(
                 "the group moved to epoch {} after this commit was built from epoch {}; it \
                  was dropped",
                 group.current_epoch(),
                 held.from_epoch
-            ));
+            ))));
         }
         group
-            .apply_detached_commit(held.secrets)
-            .map_err(|e| format!("apply: {e}"))?;
+            .apply_detached_commit(held.secrets.clone())
+            .map_err(|e| Unapplied::Kept(EngineError::Other(format!("apply: {e}"))))?;
         group
             .write_to_storage()
-            .map_err(|e| format!("persist group: {e}"))?;
-        self.staged.remove(group_id);
+            .map_err(|e| Unapplied::Kept(EngineError::Storage(format!("persist group: {e}"))))?;
         Ok(group.current_epoch())
     }
 

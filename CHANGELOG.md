@@ -128,6 +128,12 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
   `true`; a removal no revocation state admits (an owner device, by a
   household member's device) stays the general engine error, and the
   client asks to rejoin at once.
+- `MlsEngine::confirm_commit` returns `Result<u64, EngineError>` instead
+  of `Result<u64, String>`: a failed write is `EngineError::Storage`.
+  `Client::confirm_commit` reports it as `SendError::Storage`, whose
+  message now says the device's state could not be written (the
+  directory's or the engine's). `airdress_mls_confirm_commit` is
+  unchanged (`-2`).
 
 ### Added
 
@@ -218,6 +224,12 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
   identity separator (`0x1F`), as `Malformed`, as it already did for the
   airdress and `person_id`, instead of relying on the member identity
   being computed afterwards.
+- `MlsEngine::confirm_commit` (and `airdress_mls_confirm_commit`) keeps
+  the held commit when loading the group, applying the commit or writing
+  the new state fails, so the same call succeeds once storage does.
+  Before, the held commit was dropped first, and with it the only copy of
+  the secrets of an epoch the operator had already accepted. A commit the
+  group has moved past is still dropped.
 
 ## v0.6.1 — 2026-10-31
 
