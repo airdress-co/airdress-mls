@@ -863,6 +863,14 @@ fn verify_chain(
     // check 4.
     match (identity.version, identity.device_id()) {
         (_, Some(device_id)) if !device_id.is_empty() => {
+            // The member identity joins the components with the
+            // separator, so none of them may carry it: the chain says
+            // so itself rather than leaving it to the member identity.
+            if device_id.as_bytes().contains(&IDENTITY_SEPARATOR) {
+                return Err(CredentialVerifyError::Malformed(
+                    "device_id contains the identity separator".into(),
+                ));
+            }
             if let Some(revocation) = revocation {
                 match revocation.device_status(&identity.pin_subject()?, device_id) {
                     Some(DeviceStatus::Active) => {}
@@ -1971,6 +1979,28 @@ mod tests {
         assert_eq!(
             verify_identity_without_revocation(&identity, &session_pub, &lookup),
             Err(CredentialVerifyError::DelegationSignatureInvalid)
+        );
+    }
+
+    #[test]
+    fn the_chain_refuses_a_device_id_carrying_the_separator() {
+        let root = SigningKey::from_bytes(&[11u8; 32]);
+        let root_pub = root.verifying_key().to_bytes();
+        let (identity, session_pub) =
+            v2_identity(&root, "alice.test", 22, "device\u{1f}laptop", FAR_FUTURE);
+        let lookup = move |_: &str| Some(root_pub);
+        let active = |_: &str, _: &str| Some(DeviceStatus::Active);
+        assert_eq!(
+            verify_identity_at(&identity, &session_pub, &lookup, Some(&active), NOW),
+            Err(CredentialVerifyError::Malformed(
+                "device_id contains the identity separator".into()
+            ))
+        );
+        assert_eq!(
+            verify_identity_without_revocation(&identity, &session_pub, &lookup),
+            Err(CredentialVerifyError::Malformed(
+                "device_id contains the identity separator".into()
+            ))
         );
     }
 
