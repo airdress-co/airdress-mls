@@ -308,6 +308,10 @@ enum StagedProposal {
     /// The group conversation's extensions as they should read after the
     /// commit (SPEC-145 design D-5).
     Extensions(GroupExtensions),
+    /// A raw context extension list, for the tests: what a modified client
+    /// could send that [`GroupExtensions`] cannot express (a partial set).
+    #[cfg(test)]
+    RawExtensions(ExtensionList),
 }
 
 impl core::fmt::Debug for MlsEngine {
@@ -899,6 +903,16 @@ impl MlsEngine {
                     airdress: airdress_of(member.signing_identity())
                         .map_err(|e| EngineError::Other(e.to_string()))?,
                 };
+                // The AAD names the sender the SENDER chose, so on its own
+                // it proves only "the sender claimed this". The leaf MLS
+                // authenticated must be that airdress too, or a member
+                // could send under another member's name. Same error as a
+                // mismatched AAD, and before anything is persisted.
+                if self.identity_provider.is_v2_cutover() && sender.airdress != from_airdress {
+                    return Err(EngineError::Other(
+                        "this message does not belong to this group or sender".to_owned(),
+                    ));
+                }
                 // The accepting arm, and the only one that persists:
                 // decryption ratchets the secret tree forward and that
                 // has to survive a restart.
@@ -1188,6 +1202,10 @@ impl MlsEngine {
                 StagedProposal::Extensions(ext) => builder
                     .set_group_context_ext(ext.to_list()?)
                     .map_err(|e| format!("group extensions: {e}"))?,
+                #[cfg(test)]
+                StagedProposal::RawExtensions(list) => builder
+                    .set_group_context_ext(list.clone())
+                    .map_err(|e| format!("group extensions: {e}"))?,
             };
         }
         let output = builder.build().map_err(|e| format!("commit: {e}"))?;
@@ -1363,3 +1381,7 @@ impl IdentitySet {
             .collect()
     }
 }
+
+#[cfg(test)]
+#[path = "receive_tests.rs"]
+mod receive_tests;

@@ -64,7 +64,7 @@ struct Pin {
     last_seen: String,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Doc {
     pins: BTreeMap<String, Pin>,
     changes: Vec<PinChange>,
@@ -113,10 +113,27 @@ impl PinStore {
         self.doc.pins.get(airdress).and_then(|p| dec(&p.root))
     }
 
-    /// Every change recorded, oldest first.
+    /// Every change recorded, oldest first: the history, kept as
+    /// evidence, including changes accepted or superseded since.
     #[must_use]
     pub fn changes(&self) -> &[PinChange] {
         &self.doc.changes
+    }
+
+    /// The changes a person can still act on: recorded against the
+    /// airdress's current pin. What a review screen offers to accept.
+    #[must_use]
+    pub fn pending_changes(&self) -> Vec<&PinChange> {
+        self.doc
+            .changes
+            .iter()
+            .filter(|c| {
+                self.doc
+                    .pins
+                    .get(&c.airdress)
+                    .is_some_and(|p| p.root == c.pinned)
+            })
+            .collect()
     }
 
     /// Observe `root` for `airdress` at `now`.
@@ -172,6 +189,10 @@ impl PinStore {
 
     /// Pin a key a person verified another way, replacing any pin.
     ///
+    /// Recorded changes are kept as evidence; none recorded against an
+    /// earlier pin can be adopted over this one ([`Self::acknowledge`]).
+    /// Written before it takes effect: a failed write changes nothing.
+    ///
     /// # Errors
     ///
     /// The store could not be written.
@@ -181,7 +202,8 @@ impl PinStore {
         root: &[u8; 32],
         now: &str,
     ) -> Result<(), String> {
-        self.doc.pins.insert(
+        let mut next = self.doc.clone();
+        next.pins.insert(
             airdress.to_owned(),
             Pin {
                 root: enc(root),
@@ -189,33 +211,50 @@ impl PinStore {
                 last_seen: now.to_owned(),
             },
         );
-        self.save()
+        self.write(&next)?;
+        self.doc = next;
+        Ok(())
     }
 
-    /// Adopt the most recent observed change for `airdress`, which a
-    /// person has looked at and accepted. Returns whether there was one.
+    /// Adopt `observed` for `airdress`: the key a person was shown as a
+    /// change and accepted. Adopted only if a change from the current pin
+    /// to exactly that key was recorded, so a key that arrived while the
+    /// person was looking, or a change a later pin already resolved, is
+    /// never what "accept" pins. Returns whether it was adopted.
     ///
     /// # Errors
     ///
     /// The store could not be written.
-    pub fn acknowledge(&mut self, airdress: &str, now: &str) -> Result<bool, String> {
-        let Some(latest) = self
+    pub fn acknowledge(
+        &mut self,
+        airdress: &str,
+        observed: &[u8; 32],
+        now: &str,
+    ) -> Result<bool, String> {
+        let Some(current) = self.doc.pins.get(airdress).map(|p| p.root.clone()) else {
+            return Ok(false);
+        };
+        let wanted = enc(observed);
+        let recorded = self
             .doc
             .changes
             .iter()
-            .rev()
-            .find(|c| c.airdress == airdress)
-            .cloned()
-        else {
+            .any(|c| c.airdress == airdress && c.pinned == current && c.observed == wanted);
+        if !recorded {
             return Ok(false);
-        };
-        let root = dec(&latest.observed).ok_or("a recorded change is malformed")?;
-        self.pin_out_of_band(airdress, &root, now)?;
+        }
+        // The accepted change and any other key seen in the meantime stay
+        // in the history; neither is pending once the pin has moved.
+        self.pin_out_of_band(airdress, observed, now)?;
         Ok(true)
     }
 
     fn save(&self) -> Result<(), String> {
-        let bytes = serde_json::to_vec(&self.doc).map_err(|e| e.to_string())?;
+        self.write(&self.doc)
+    }
+
+    fn write(&self, doc: &Doc) -> Result<(), String> {
+        let bytes = serde_json::to_vec(doc).map_err(|e| e.to_string())?;
         self.file.write(&bytes)
     }
 }
@@ -223,6 +262,23 @@ impl PinStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepting_one_change_keeps_the_history_and_leaves_nothing_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = PinStore::open(dir.path(), &[3u8; 32]).unwrap();
+        s.observe("a.example", &[1; 32], "t1").unwrap();
+        s.observe("a.example", &[2; 32], "t2").unwrap();
+        s.observe("a.example", &[3; 32], "t3").unwrap();
+        assert_eq!(s.pending_changes().len(), 2);
+        assert!(s.acknowledge("a.example", &[2; 32], "t4").unwrap());
+        assert_eq!(s.pinned("a.example"), Some([2; 32]));
+        // Both observations stay as evidence; neither can be accepted now.
+        assert_eq!(s.changes().len(), 2);
+        assert!(s.pending_changes().is_empty());
+        assert!(!s.acknowledge("a.example", &[3; 32], "t5").unwrap());
+        assert_eq!(s.pinned("a.example"), Some([2; 32]));
+    }
 
     #[test]
     fn first_use_pins_and_a_change_fails_closed_until_acknowledged() {
@@ -249,8 +305,8 @@ mod tests {
         assert_eq!(s.pinned("a.example"), Some([1; 32]), "the pin stands");
 
         let mut s = PinStore::open(dir.path(), &key).unwrap();
-        assert!(s.acknowledge("a.example", "t5").unwrap());
+        assert!(s.acknowledge("a.example", &[2; 32], "t5").unwrap());
         assert_eq!(s.pinned("a.example"), Some([2; 32]));
-        assert!(!s.acknowledge("b.example", "t5").unwrap());
+        assert!(!s.acknowledge("b.example", &[2; 32], "t5").unwrap());
     }
 }

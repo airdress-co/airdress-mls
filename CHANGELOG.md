@@ -22,7 +22,33 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 
 ### Breaking
 
-- Nothing.
+- `airdress_mls_client::pins::PinStore::acknowledge` takes the key the
+  person accepted: `acknowledge(airdress, observed, now)`. It adopts that
+  key only if a change from the current pin to it was recorded. Recorded
+  changes stay as history (`changes()`); what can still be accepted is
+  `pending_changes()`.
+- `airdress_mls_client::directory::Directory::record_replacing` returns
+  `Result<bool, _>`: `false`, changing nothing, when the group belongs to
+  another conversation.
+- `GroupRule` has a new variant, `NotAGroup`.
+- New refusals, where there used to be an answer:
+  - a one-to-one, self or household group refuses a commit that adds the
+    group conversation extensions, in full or in part (`NotAGroup`);
+  - past the cutover, `decrypt`, `decrypt_with_sender` and the bound C
+    exports refuse a message whose authenticated sending leaf does not
+    belong to the `from_airdress` it is bound to, with the binding error;
+  - the client reports a Welcome as `Failed` when its group already
+    belongs to another conversation;
+  - the client files an application message by its own record of the
+    group, never by the envelope's conversation id: a group a rejoin
+    superseded still belongs to its conversation
+    (`Directory::conversation_of_message`), and a message for a group no
+    conversation holds is ignored.
+
+### Added
+
+- `PinStore::pending_changes()`.
+- `Directory::conversation_of_message()`.
 
 ## v0.6.1 — 2026-10-31
 
