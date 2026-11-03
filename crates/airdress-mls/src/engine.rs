@@ -459,6 +459,11 @@ impl MlsEngine {
         if state_dir.is_empty() {
             return Err("state_dir is empty".to_owned());
         }
+        // The airdress this engine calls itself must be the one its
+        // delegation names: peers verify the leaf against the signed
+        // copy and refuse it otherwise.
+        crate::credential::check_signed_airdress(airdress, &delegation)
+            .map_err(|e| e.to_string())?;
         let signing_key = SigningKey::from_bytes(seed);
         let public_key = signing_key.verifying_key().to_bytes().to_vec();
 
@@ -560,6 +565,10 @@ impl MlsEngine {
 
     /// Enter the SPEC-061 v2 cutover (FR-20): `v: 1` identities stop
     /// being accepted. One-way, per NFR-15.
+    ///
+    /// Past the cutover no leaf verifies until both a root-key lookup
+    /// ([`Self::set_root_key_lookup`]) and a revocation lookup
+    /// ([`Self::set_revocation_lookup`]) are registered, in any order.
     pub fn set_v2_cutover(&self) {
         self.identity_provider.set_v2_cutover();
     }

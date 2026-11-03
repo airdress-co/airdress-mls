@@ -70,6 +70,15 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
     device has not joined as `Failed` (not retryable) on its
     `client::MAX_DEFERRALS`th delivery (8), counted across restarts,
     where it used to leave it for a replay on every connection.
+  - an identity whose `airdress` is not the `airdress` inside its signed
+    delegation, or whose delegation names none, is refused
+    (`CredentialVerifyError::Malformed`); `MlsEngine::from_seed` and
+    `airdress_mls_create_engine_from_seed` refuse such a delegation for
+    the engine's own identity;
+  - past the v2 cutover, a leaf is refused with `RootKeyUnavailable`
+    until a root-key lookup is registered (`set_root_key_lookup`,
+    `airdress_mls_set_root_key_lookup`), as it already was for the
+    revocation lookup. A host that enters the cutover registers both.
 
 ### Added
 

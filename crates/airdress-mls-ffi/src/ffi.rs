@@ -584,10 +584,12 @@ pub unsafe extern "C" fn airdress_mls_set_revocation_lookup(
 /// becomes the only form in the tree. One-way within the process, per
 /// NFR-15 — there is no symmetric "unset" export, deliberately.
 ///
-/// **Couples to `airdress_mls_set_revocation_lookup`.** Past the cutover
-/// no leaf verifies until a revocation lookup is registered on this
-/// engine — before or after this call — so a host that enters the
-/// cutover must register one (fail closed, since 0.3.0).
+/// **Couples to `airdress_mls_set_revocation_lookup` and
+/// `airdress_mls_set_root_key_lookup`.** Past the cutover no leaf
+/// verifies until both are registered on this engine — before or after
+/// this call — so a host that enters the cutover must register both
+/// (fail closed: the revocation lookup since 0.3.0, the root-key lookup
+/// since 0.7.0).
 ///
 /// Returns 0 on success, -1 for an invalid handle, -3 on an internal
 /// error.
@@ -2231,12 +2233,39 @@ mod tests {
         1
     }
 
+    /// One root per airdress, as a real deployment has: every device of
+    /// an airdress is delegated by the same root.
+    fn root_for(airdress: &str) -> SigningKey {
+        let mut seed = [0x5au8; 32];
+        for (i, byte) in airdress.bytes().enumerate() {
+            seed[i % 32] ^= byte.wrapping_add(u8::try_from(i % 251).unwrap_or(0));
+        }
+        SigningKey::from_bytes(&seed)
+    }
+
+    /// The root-key lookup the test engines register: the root of the
+    /// bare airdress named, nothing for a person subject.
+    extern "C" fn airdress_root_lookup(
+        subject: *const std::os::raw::c_char,
+        out_root_public_key: *mut u8,
+    ) -> i32 {
+        // SAFETY: the library passes a live NUL-terminated string.
+        let subject = unsafe { CStr::from_ptr(subject) }.to_string_lossy();
+        if subject.contains('\u{1f}') {
+            return 0;
+        }
+        let root = root_for(&subject).verifying_key().to_bytes();
+        // SAFETY: the library passes a 32-byte output buffer.
+        unsafe { std::ptr::copy_nonoverlapping(root.as_ptr(), out_root_public_key, 32) };
+        1
+    }
+
     /// Build an engine through the export a host actually calls, and
     /// put it past the v2 cutover when asked.
     fn engine(airdress: &str, seed_byte: u8, device_id: &str, cutover: bool) -> Handle {
         let dir = tempfile::tempdir().expect("state dir");
         let seed = [seed_byte; 32];
-        let root = SigningKey::from_bytes(&[seed_byte.wrapping_add(0x40); 32]);
+        let root = root_for(airdress);
         let session_pub = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
         let delegation = airdress_mls::credential::test_support::signed_delegation_json_v2(
             &root,
@@ -2283,6 +2312,18 @@ mod tests {
                     super::airdress_mls_set_revocation_lookup(
                         result.handle_id,
                         Some(every_device_active),
+                    )
+                },
+                0
+            );
+            // And a root-key lookup: past the cutover check 2 is required.
+            assert_eq!(
+                // SAFETY: a plain function, callable for the life of the
+                // process, that never calls back into the library.
+                unsafe {
+                    super::airdress_mls_set_root_key_lookup(
+                        result.handle_id,
+                        Some(airdress_root_lookup),
                     )
                 },
                 0
@@ -2534,9 +2575,7 @@ mod tests {
         // The owner's host pins the airdress root under the bare
         // airdress, as every host does today, and knows nothing for the
         // member's subject yet.
-        let owner_root = SigningKey::from_bytes(&[0x51u8.wrapping_add(0x40); 32])
-            .verifying_key()
-            .to_bytes();
+        let owner_root = root_for(ALICE).verifying_key().to_bytes();
         ANSWERS.lock().unwrap().push((ALICE.to_owned(), owner_root));
         assert_eq!(
             // SAFETY: a plain function, callable for the life of the
