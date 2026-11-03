@@ -222,6 +222,10 @@ pub struct Client {
     engine: MlsEngine,
     directory: Directory,
     unfiled_joins: Vec<UnfiledJoin>,
+    /// Joined groups with an envelope left for a replay, and that
+    /// envelope's id. Later envelopes for such a group are left too, until
+    /// the held one is processed: they belong to the epoch after it.
+    held: Vec<(Vec<u8>, String)>,
 }
 
 impl core::fmt::Debug for Client {
@@ -243,6 +247,7 @@ impl Client {
             engine,
             directory: Directory::open(state_dir, state_key)?,
             unfiled_joins: Vec::new(),
+            held: Vec::new(),
         })
     }
 
@@ -274,11 +279,17 @@ impl Client {
     }
 
     /// Handle one received envelope.
+    ///
+    /// Once an application or commit for a joined group is left for a
+    /// replay, every later envelope for that group is left too, until the
+    /// held one is processed or given up: processed now, against the epoch
+    /// before the held one, it would fail and be acknowledged, and be lost.
     pub fn process(&mut self, env: &InboundEnvelope) -> Processed {
         match EnvelopeKind::parse(&env.envelope_kind) {
             Some(EnvelopeKind::Welcome) => self.process_welcome(env),
-            Some(EnvelopeKind::Application) => self.process_application(env),
-            Some(EnvelopeKind::Commit) => self.process_commit(env),
+            Some(kind @ (EnvelopeKind::Application | EnvelopeKind::Commit)) => {
+                self.process_in_order(env, kind)
+            }
             // A sibling asking back in is answered by a device that can
             // commit for the owner; an audio burst is not chat. Neither
             // will mean more on a replay.
@@ -291,6 +302,48 @@ impl Client {
                 reason: format!("unknown envelope kind {}", env.envelope_kind),
             }),
         }
+    }
+
+    /// An application or commit, in order behind any envelope of its group
+    /// left for a replay.
+    fn process_in_order(&mut self, env: &InboundEnvelope, kind: EnvelopeKind) -> Processed {
+        let group_id = message_group_id(&env.ciphertext).ok();
+        if let Some(group_id) = &group_id
+            && self
+                .held
+                .iter()
+                .any(|(g, e)| g == group_id && *e != env.envelope_id)
+        {
+            return Processed {
+                ack: false,
+                event: Event::Failed {
+                    reason: "an earlier envelope for this group is waiting for a replay".to_owned(),
+                    retryable: true,
+                },
+            };
+        }
+        let joined = group_id
+            .as_ref()
+            .is_some_and(|g| self.engine.group_epoch(g).is_some());
+        let processed = if kind == EnvelopeKind::Commit {
+            self.process_commit(env)
+        } else {
+            self.process_application(env)
+        };
+        if let Some(group_id) = group_id {
+            if processed.ack {
+                self.held
+                    .retain(|(g, e)| !(*g == group_id && *e == env.envelope_id));
+            } else if joined
+                && !self
+                    .held
+                    .iter()
+                    .any(|(g, e)| *g == group_id && *e == env.envelope_id)
+            {
+                self.held.push((group_id, env.envelope_id.clone()));
+            }
+        }
+        processed
     }
 
     fn process_welcome(&mut self, env: &InboundEnvelope) -> Processed {

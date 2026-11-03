@@ -281,6 +281,58 @@ fn a_commit_whose_effect_could_not_be_stored_applies_on_replay() {
     );
 }
 
+/// A commit left for a replay holds its group: the message and the commit
+/// of the epoch after it are left too, rather than failing against the
+/// epoch before, and all three apply in order once the replay comes.
+#[test]
+fn envelopes_behind_a_commit_left_for_a_replay_wait_for_it() {
+    let a = Device::new("alice.example", None, 68);
+    let b = Device::new("bob.example", None, 69);
+    let c = Device::new("alice.example", None, 70);
+    let (mut alice, mut bob, group_id) = pair(&a, &b);
+    let carol_kp = c.open().key_packages(1).unwrap().remove(0);
+    let add = alice.prepare_add("conv-a", &[carol_kp]).unwrap();
+    alice.confirm_commit("conv-a").unwrap();
+    let message = alice
+        .encrypt("conv-a", &text("after the add"), "alice.example")
+        .unwrap();
+    let rotation = alice.prepare_add("conv-a", &[]).unwrap();
+    alice.confirm_commit("conv-a").unwrap();
+    let envs: Vec<InboundEnvelope> = [&add.commit, &message, &rotation.commit]
+        .into_iter()
+        .map(|e| deliver(e, "alice.example", "conv-b"))
+        .collect();
+
+    let epoch = bob.engine().group_epoch(&group_id);
+    {
+        let _blocked = UnwritableGroups::of(&b);
+        assert_left_for_replay(&bob.process(&envs[0]));
+    }
+    // Storage is back, but the commit has not been replayed yet.
+    assert_left_for_replay(&bob.process(&envs[1]));
+    assert_left_for_replay(&bob.process(&envs[2]));
+    assert_eq!(bob.engine().group_epoch(&group_id), epoch);
+
+    // The replay, in order.
+    let applied = bob.process(&envs[0]);
+    assert!(
+        matches!(applied.event, Event::Membership { ref added, .. } if added.len() == 1),
+        "{:?}",
+        applied.event
+    );
+    let got = bob.process(&envs[1]);
+    assert!(got.ack);
+    assert_eq!(message_text(&got.event), "after the add");
+    let rotated = bob.process(&envs[2]);
+    assert!(rotated.ack, "{:?}", rotated.event);
+    assert!(
+        matches!(rotated.event, Event::Membership { .. }),
+        "{:?}",
+        rotated.event
+    );
+    assert_eq!(bob.engine().group_epoch(&group_id), epoch.map(|e| e + 2));
+}
+
 /// The owner's device, a device of person A and one of person B, in one
 /// conversation: `(devices, clients)`, the owner's first.
 fn household(base: u8) -> (Vec<Device>, Vec<Client>) {
