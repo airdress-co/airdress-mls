@@ -214,6 +214,10 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
   failed write removes its temp file, and opening removes temp files an
   interrupted write left (including the `.partial` file earlier versions
   wrote).
+- The credential chain itself refuses a `device_id` carrying the
+  identity separator (`0x1F`), as `Malformed`, as it already did for the
+  airdress and `person_id`, instead of relying on the member identity
+  being computed afterwards.
 
 ## v0.6.1 — 2026-10-31
 
