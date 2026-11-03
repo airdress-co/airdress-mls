@@ -150,6 +150,12 @@ pub enum MlsRulesError {
     CrossPersonRemoval {
         /// The airdress both leaves belong to.
         airdress: String,
+        /// Whether the revocation witness decided the refusal: the target
+        /// is another person's device, which the removal rule would admit
+        /// if this device's lookup answered `Revoked` for it. `false` for a
+        /// removal no revocation state admits, such as of an owner device
+        /// by a household member's device.
+        revocable: bool,
     },
     /// A group conversation's rules refused the proposal set (SPEC-145
     /// design D-5): which rule, and nothing about who.
@@ -287,11 +293,14 @@ pub(crate) fn authorise_removal(
     if by.pin_subject()? == target.pin_subject()? {
         return Ok(());
     }
-    if target.is_person() && revocation_witness(target, revocation) {
+    let revocable =
+        target.is_person() && target.device_id.as_deref().is_some_and(|d| !d.is_empty());
+    if revocable && revocation_witness(target, revocation) {
         return Ok(());
     }
     Err(MlsRulesError::CrossPersonRemoval {
         airdress: target.airdress.clone(),
+        revocable,
     })
 }
 
@@ -437,7 +446,11 @@ impl mls_rs::MlsRules for AirdressMlsRules {
                 )
             })?;
         }
+        // A modified client, in the tests, skips the removal rule too.
         proposals.retain_by_type::<RemoveProposal, _, Self::Error>(|info| {
+            if unchecked {
+                return Ok(true);
+            }
             let target = leaf_at(current_roster, info.proposal.to_remove())?;
             let Some(by) = proposer_leaf(*info.sender(), &source, current_roster)? else {
                 // No standing to remove anything.
@@ -602,7 +615,7 @@ mod tests {
     }
 
     fn is_cross_person(r: &Result<(), MlsRulesError>) -> bool {
-        matches!(r, Err(MlsRulesError::CrossPersonRemoval { airdress }) if airdress == HOME)
+        matches!(r, Err(MlsRulesError::CrossPersonRemoval { airdress, .. }) if airdress == HOME)
     }
 
     #[test]
@@ -987,6 +1000,38 @@ mod tests {
         a1.learns_revoked(Holder::Person(PERSON_B), "b1");
         let outcome = a1.engine.process_commit(&group_id, &commit).unwrap();
         assert_eq!(outcome.removed.len(), 1);
+    }
+
+    /// A removal no revocation state admits is a plain refusal, not one
+    /// a refresh of the revocation view could lift: a member's device
+    /// removing an owner device, from a client that skipped its own
+    /// send-side check, is refused even by a receiver that holds the
+    /// owner device revoked.
+    #[test]
+    fn a_member_removing_an_owner_device_is_refused_whatever_the_revocation_view() {
+        let (mut devices, group_id) = household();
+        let index = index_of(&devices, &group_id, "o2");
+        let a1 = device(&mut devices, "a1");
+        a1.engine
+            .propose_remove(&group_id, index)
+            .expect_err("refused on send");
+        crate::group_rules::SEND_UNCHECKED.with(|c| c.set(true));
+        let proposed = a1.engine.propose_remove(&group_id, index);
+        let built = proposed.and_then(|()| a1.engine.commit_pending(&group_id));
+        crate::group_rules::SEND_UNCHECKED.with(|c| c.set(false));
+        let commit = built.unwrap().commit;
+
+        let o1 = device(&mut devices, "o1");
+        o1.learns_revoked(Holder::Owner(HOME), "o2");
+        let err = o1
+            .engine
+            .process_commit(&group_id, &commit)
+            .expect_err("a member's device never removes an owner device");
+        assert!(
+            matches!(err, crate::engine::EngineError::Other(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains(CROSS_PERSON), "{err}");
     }
 
     /// Two persons each hold a `phone-1` in one group. Every device has

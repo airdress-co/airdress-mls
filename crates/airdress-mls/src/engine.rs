@@ -1576,8 +1576,10 @@ impl MlsEngine {
 }
 
 /// Whether `mls-rs` refused a received commit with the removal rule's
-/// [`crate::rules::MlsRulesError::CrossPersonRemoval`]: the refusal a
-/// fresher revocation view may lift (see [`crate::rules`]).
+/// [`crate::rules::MlsRulesError::CrossPersonRemoval`] where the
+/// revocation witness decided it: the refusal a fresher revocation view
+/// may lift (see [`crate::rules`]). A removal no revocation state admits
+/// (an owner device, by another person's device) is not one.
 fn refused_for_revocation_view(error: &mls_rs::error::MlsError) -> bool {
     let mls_rs::error::MlsError::MlsRulesError(inner) = error else {
         return false;
@@ -1586,7 +1588,10 @@ fn refused_for_revocation_view(error: &mls_rs::error::MlsError) -> bool {
         inner
             .inner_dyn_error()
             .downcast_ref::<crate::rules::MlsRulesError>(),
-        Some(crate::rules::MlsRulesError::CrossPersonRemoval { .. })
+        Some(crate::rules::MlsRulesError::CrossPersonRemoval {
+            revocable: true,
+            ..
+        })
     )
 }
 
