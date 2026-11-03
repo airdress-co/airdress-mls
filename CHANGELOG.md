@@ -39,6 +39,33 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
   removal rule's revocation witness both ask for the pair, so revoking
   one person's device no longer answers for another person's device of
   the same `device_id`.
+- `EngineError` has two new variants, `RevocationViewStale` and
+  `Storage`, each with its own `ErrorCode` (values `7` and `8`, read
+  through `airdress_mls_error_code`); an exhaustive match must name them.
+  `MlsEngine::process_welcome` returns `Result<_, EngineError>` instead of
+  `Result<_, String>`; a Welcome naming no held key package is
+  `EngineError::Other(WELCOME_KEY_PACKAGE_NOT_FOUND)`, as before in
+  substance.
+- New answers where there used to be another:
+  - `MlsEngine::process_commit` (and `airdress_mls_process_commit`)
+    refuses a received commit that removes another person's device this
+    device does not hold revoked with `RevocationViewStale` (code 7), not
+    the general engine error. Refresh the revocation state and process
+    the same commit again. In a group conversation that refusal is
+    `GroupRule::RemoveOther`, and stays the general engine error;
+  - `process_welcome`, `decrypt`, `decrypt_with_sender` and
+    `process_commit` (and their C exports) answer `Storage` (code 8) when
+    the new group state could not be written. Nothing was kept, and the
+    same input succeeds once storage does;
+  - the client leaves an envelope whose state write failed unacknowledged
+    (`Failed { retryable: true }`) on every path: Welcome, application
+    and commit. Before, it acknowledged it, as `Failed`, `RejoinNeeded`
+    or a not-retryable `Failed`, and the envelope was lost;
+  - the client leaves a commit refused with `RevocationViewStale`
+    unacknowledged (`Failed { retryable: true }`) for up to
+    `client::MAX_DEFERRALS` deliveries, counted across restarts, and only
+    then asks to rejoin (`RejoinNeeded`). Before, it asked to rejoin at
+    once.
 - `airdress_mls_client::pins::PinStore::acknowledge` takes the key the
   person accepted: `acknowledge(airdress, observed, now)`. It adopts that
   key only if a change from the current pin to it was recorded. Recorded
@@ -99,6 +126,8 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 
 ### Added
 
+- `EngineError::RevocationViewStale`, `EngineError::Storage`,
+  `ErrorCode::RevocationViewStale` (7) and `ErrorCode::Storage` (8).
 - `PinStore::pending_changes()`.
 - `Directory::conversation_of_message()`.
 - `MlsEngine::discard_staged()`: drop what is staged for a group without

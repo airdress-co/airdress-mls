@@ -3489,12 +3489,67 @@ mod tests {
             "this message is older than the keys still on this device"
         );
 
+        // A commit refused for this device's revocation view, and a state
+        // write that failed: each its own code, both left for a replay.
+        let (code, _) = take_coded(FfiBytes::err(EngineError::RevocationViewStale(
+            "x".to_owned(),
+        )));
+        assert_eq!(code, 7);
+        assert_eq!(code, ErrorCode::RevocationViewStale.as_i32());
+        let (code, _) = take_coded(FfiBytes::err(EngineError::Storage("x".to_owned())));
+        assert_eq!(code, 8);
+        assert_eq!(code, ErrorCode::Storage.as_i32());
+
         // Freed errors and null are not codes.
         let raw = FfiBytes::err(String::from("x")).error;
         // SAFETY: an error this crate made, freed once.
         unsafe { super::airdress_mls_free_error(raw) };
         assert_eq!(super::airdress_mls_error_code(raw), -1);
         assert_eq!(super::airdress_mls_error_code(std::ptr::null()), 0);
+    }
+
+    /// A Welcome whose joined group cannot be written answers the storage
+    /// code through the C ABI, and joins once storage takes it.
+    #[cfg(unix)]
+    #[test]
+    fn a_state_write_failure_carries_the_storage_code() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use airdress_mls::ErrorCode;
+
+        let alice = engine(ALICE, 0x56, "alice-storage", true);
+        let bob = engine(BOB, 0x57, "bob-storage", true);
+        let bob_kp = key_package(&bob);
+        let c_alice = CString::new(ALICE).unwrap();
+        // SAFETY: live local buffers and a C string, each with its own
+        // length, outliving the call; the result is freed by take_start.
+        let started = take_start(unsafe {
+            airdress_mls_start_group_bound(
+                alice.id,
+                bob_kp.as_ptr(),
+                bob_kp.len(),
+                b"hello".as_ptr(),
+                b"hello".len(),
+                c_alice.as_ptr(),
+            )
+        })
+        .expect("start");
+        let groups = bob.dir.path().join("groups");
+        std::fs::set_permissions(&groups, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let welcome = || {
+            // SAFETY: a live buffer with its own length.
+            unsafe {
+                airdress_mls_process_welcome(
+                    bob.id,
+                    started.welcome.as_ptr(),
+                    started.welcome.len(),
+                )
+            }
+        };
+        let (code, msg) = take_coded(welcome());
+        std::fs::set_permissions(&groups, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(code, ErrorCode::Storage.as_i32(), "{msg}");
+        take_bytes(welcome()).expect("the same Welcome joins once storage is writable");
     }
 
     /// The argument checks on their own, with no engine: what the Miri
