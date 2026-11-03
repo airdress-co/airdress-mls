@@ -690,14 +690,29 @@ impl FfiBytesList {
     }
 }
 
+/// The most key packages one `airdress_mls_generate_key_packages` call
+/// makes. A pool is refilled a handful at a time; this bounds both the
+/// up-front allocation and how long one call holds the engine lock.
+const MAX_KEY_PACKAGES_PER_CALL: usize = 256;
+
 /// Generate `count` fresh KeyPackages and return their publishable
 /// public messages. Private halves are persisted through the sealed
 /// state store so they survive restart — a KeyPackage whose private
 /// half is lost is a Welcome the client can never join. Packages are
 /// single-use; consumption deletes them from the pool.
+///
+/// `count` above [`MAX_KEY_PACKAGES_PER_CALL`] is refused with
+/// `InvalidArgument` before the engine is locked: the engine reserves
+/// `count` slots up front, and an allocation failure aborts the process
+/// rather than unwinding.
 #[unsafe(no_mangle)]
 pub extern "C" fn airdress_mls_generate_key_packages(handle_id: u64, count: usize) -> FfiBytesList {
     guarded(FfiBytesList::err, || {
+        if count > MAX_KEY_PACKAGES_PER_CALL {
+            return FfiBytesList::err(FfiError::invalid_argument(format!(
+                "count {count} exceeds the limit of {MAX_KEY_PACKAGES_PER_CALL} key packages per call"
+            )));
+        }
         with_engine(
             handle_id,
             || FfiBytesList::err(FfiError::invalid_handle()),
@@ -1116,14 +1131,10 @@ pub unsafe extern "C" fn airdress_mls_decrypt(
                 if engine.is_v2_cutover() {
                     return FfiBytes::err(FfiError::binding_required());
                 }
-                // SPEC-061 FR-22: the variant is distinguishable in Rust;
-                // across the C boundary it is still one sentence, per the
-                // `credential.rs` discipline.
-                FfiBytes::from_result(
-                    engine
-                        .decrypt(group_id, message, "")
-                        .map_err(FfiError::from),
-                )
+                // SPEC-061 FR-22: an engine error keeps its code across the
+                // C boundary (`EpochUnavailable` included), read with
+                // `airdress_mls_error_code`; see `ErrorCode` for the table.
+                FfiBytes::from_result(engine.decrypt(group_id, message, ""))
             },
         )
     })
@@ -3249,6 +3260,36 @@ mod tests {
         assert!(!result.error.is_null(), "expected an error");
         let code = super::airdress_mls_error_code(result.error);
         (code, take_error(result.error))
+    }
+
+    /// A key-package count above the cap is refused with `InvalidArgument`
+    /// before the engine is touched, even for a handle that does not
+    /// exist; the cap itself is still served.
+    #[test]
+    fn key_package_count_is_capped() {
+        use airdress_mls::ErrorCode;
+
+        let alice = engine(ALICE, 0x55, "alice-cap", true);
+        for (handle, count) in [
+            (alice.id, super::MAX_KEY_PACKAGES_PER_CALL + 1),
+            (alice.id, usize::MAX),
+            (u64::MAX, usize::MAX),
+        ] {
+            let list = super::airdress_mls_generate_key_packages(handle, count);
+            assert!(!list.error.is_null(), "count {count} was accepted");
+            assert!(list.items.is_null());
+            assert_eq!(list.len, 0);
+            let code = super::airdress_mls_error_code(list.error);
+            assert_eq!(code, ErrorCode::InvalidArgument.as_i32());
+            let msg = take_error(list.error);
+            assert!(msg.contains("exceeds the limit"), "{msg}");
+        }
+
+        let list = super::airdress_mls_generate_key_packages(alice.id, 2);
+        assert!(list.error.is_null(), "a small count is served");
+        assert_eq!(list.len, 2);
+        // SAFETY: the list, unchanged, freed once.
+        unsafe { super::airdress_mls_free_bytes_list(list) };
     }
 
     /// Every refusal carries a stable code, readable off the error string

@@ -43,7 +43,10 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
     group, never by the envelope's conversation id: a group a rejoin
     superseded still belongs to its conversation
     (`Directory::conversation_of_message`), and a message for a group no
-    conversation holds is ignored.
+    conversation holds is ignored;
+  - `airdress_mls_generate_key_packages` refuses a `count` above 256 with
+    `InvalidArgument`, before the engine is locked. A larger count used to
+    be attempted, and a huge one aborted the process.
 
 ### Added
 
