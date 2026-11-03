@@ -36,6 +36,11 @@ struct Doc {
     groups: BTreeMap<String, String>,
     /// base64 group id → scope
     scopes: BTreeMap<String, String>,
+    /// base64 group id → scope, for a group a rejoin superseded: its late
+    /// application messages still belong to the conversation it was, but
+    /// it is no longer the conversation's group.
+    #[serde(default)]
+    retired: BTreeMap<String, String>,
 }
 
 /// The conversation ↔ group map, sealed under the host's state key.
@@ -87,6 +92,19 @@ impl Directory {
             .map(str::to_owned)
     }
 
+    /// The conversation a message in `group_id` belongs to: the group's
+    /// current conversation, or the one it belonged to before a rejoin
+    /// superseded it. Never the envelope's word.
+    pub fn conversation_of_message(&self, group_id: &[u8]) -> Option<String> {
+        let gid = STANDARD.encode(group_id);
+        self.doc
+            .scopes
+            .get(&gid)
+            .or_else(|| self.doc.retired.get(&gid))
+            .and_then(|s| s.strip_prefix("conv:"))
+            .map(str::to_owned)
+    }
+
     /// Every conversation that has a group.
     #[must_use]
     pub fn conversations(&self) -> Vec<String> {
@@ -121,7 +139,10 @@ impl Directory {
     }
 
     /// Record a group for a conversation, replacing whatever it had.
-    /// For a rejoin: the old group is forgotten in both directions.
+    /// For a rejoin: the old group stops being the conversation's group,
+    /// and its late messages are still attributed to the conversation
+    /// ([`Self::conversation_of_message`]). Returns `false`, and changes
+    /// nothing, when the group is another conversation's.
     ///
     /// # Errors
     ///
@@ -130,18 +151,24 @@ impl Directory {
         &mut self,
         conversation_id: &str,
         group_id: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let scope = scope_of(conversation_id);
         let gid = STANDARD.encode(group_id);
+        // One group speaks for one conversation: never take another's.
+        if self.doc.scopes.get(&gid).is_some_and(|s| *s != scope) {
+            return Ok(false);
+        }
         if let Some(old) = self.doc.groups.remove(&scope) {
             self.doc.scopes.remove(&old);
+            if old != gid {
+                self.doc.retired.insert(old, scope.clone());
+            }
         }
-        if let Some(old_scope) = self.doc.scopes.remove(&gid) {
-            self.doc.groups.remove(&old_scope);
-        }
+        self.doc.retired.remove(&gid);
         self.doc.groups.insert(scope.clone(), gid.clone());
         self.doc.scopes.insert(gid, scope);
-        self.save()
+        self.save()?;
+        Ok(true)
     }
 
     /// Forget a conversation's group (this device was removed from it).
@@ -150,8 +177,14 @@ impl Directory {
     ///
     /// The sealed file could not be written.
     pub fn forget(&mut self, conversation_id: &str) -> Result<(), String> {
-        if let Some(old) = self.doc.groups.remove(&scope_of(conversation_id)) {
-            self.doc.scopes.remove(&old);
+        let scope = scope_of(conversation_id);
+        let before = self.doc.retired.len();
+        self.doc.retired.retain(|_, s| *s != scope);
+        let had = self.doc.groups.remove(&scope);
+        if let Some(old) = &had {
+            self.doc.scopes.remove(old);
+        }
+        if had.is_some() || self.doc.retired.len() != before {
             self.save()?;
         }
         Ok(())
@@ -193,11 +226,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut d = Directory::open(dir.path(), &[1u8; 32]).unwrap();
         d.record("c1", b"old").unwrap();
-        d.record_replacing("c1", b"new").unwrap();
+        assert!(d.record_replacing("c1", b"new").unwrap());
         assert_eq!(d.group_for("c1").unwrap(), b"new");
         assert!(d.conversation_for(b"old").is_none());
+        // The superseded group's late messages still belong to c1, and to
+        // nothing else; it survives a reopen.
+        let mut d = Directory::open(dir.path(), &[1u8; 32]).unwrap();
+        assert_eq!(d.conversation_of_message(b"old").as_deref(), Some("c1"));
+        assert_eq!(d.conversation_of_message(b"new").as_deref(), Some("c1"));
         d.forget("c1").unwrap();
         assert!(d.group_for("c1").is_none());
+        assert!(d.conversation_of_message(b"old").is_none());
+        assert!(d.conversation_of_message(b"new").is_none());
+    }
+
+    #[test]
+    fn replacing_never_takes_another_conversations_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = Directory::open(dir.path(), &[1u8; 32]).unwrap();
+        d.record("c1", b"g1").unwrap();
+        d.record("c2", b"g2").unwrap();
+        assert!(!d.record_replacing("c1", b"g2").unwrap());
+        assert_eq!(d.group_for("c1").unwrap(), b"g1");
+        assert_eq!(d.group_for("c2").unwrap(), b"g2");
+        assert_eq!(d.conversation_of_message(b"g1").as_deref(), Some("c1"));
     }
 
     #[test]

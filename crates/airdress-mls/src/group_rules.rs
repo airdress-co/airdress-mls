@@ -75,6 +75,10 @@ pub enum GroupRule {
     TooManyPersons,
     /// The proposed group extensions do not parse, or drop the group.
     MalformedExtensions,
+    /// A conversation founded without the group extensions (one-to-one,
+    /// self, household) was given some. Only a group founded as one is a
+    /// group conversation; nothing turns another conversation into one.
+    NotAGroup,
 }
 
 impl core::fmt::Display for GroupRule {
@@ -90,6 +94,7 @@ impl core::fmt::Display for GroupRule {
             Self::NoAdminLeft => "a group must keep at least one admin",
             Self::TooManyPersons => "that would make the group too big",
             Self::MalformedExtensions => "the group's settings in this change are unreadable",
+            Self::NotAGroup => "this conversation is not a group and cannot take on group settings",
         })
     }
 }
@@ -351,7 +356,7 @@ fn context_change(
 
 /// Keep an allowed proposal; drop a refused by-reference one this device
 /// is committing; refuse everything else.
-fn keep_or_refuse(
+pub(crate) fn keep_or_refuse(
     allowed: bool,
     direction: CommitDirection,
     source: &ProposalSource,

@@ -252,14 +252,18 @@ impl Client {
                     self.directory
                         .record_replacing(&env.conversation_id, &group_id)
                 } else {
-                    self.directory
-                        .record(&env.conversation_id, &group_id)
-                        .map(|_| ())
+                    self.directory.record(&env.conversation_id, &group_id)
                 };
                 match result {
-                    Ok(()) => Processed::ack(Event::Joined {
+                    Ok(true) => Processed::ack(Event::Joined {
                         conversation_id: env.conversation_id.clone(),
                         group_id,
+                    }),
+                    // The group is already another conversation's: filing it
+                    // under this one too would let one group speak for two.
+                    Ok(false) => Processed::ack(Event::Failed {
+                        reason: "this Welcome is for a group another conversation holds".to_owned(),
+                        retryable: false,
                     }),
                     Err(e) => Processed {
                         ack: false,
@@ -294,12 +298,6 @@ impl Client {
         }
     }
 
-    fn conversation_of(&self, env: &InboundEnvelope, group_id: &[u8]) -> String {
-        self.directory
-            .conversation_for(group_id)
-            .unwrap_or_else(|| env.conversation_id.clone())
-    }
-
     fn process_application(&mut self, env: &InboundEnvelope) -> Processed {
         let Some(group_id) = message_group_id(&env.ciphertext) else {
             return Processed::ack(Event::Failed {
@@ -318,7 +316,18 @@ impl Client {
                 },
             };
         }
-        let conversation_id = self.conversation_of(env, &group_id);
+        // Filed by this device's own record, never the envelope's: the
+        // conversation the group is (or was, before a rejoin superseded
+        // it). A group no conversation holds has no conversation to show
+        // a message in, whatever the envelope says.
+        let Some(conversation_id) = self.directory.conversation_of_message(&group_id) else {
+            return Processed::ack(Event::Ignored {
+                reason: "a message for a group no conversation holds".to_owned(),
+            });
+        };
+        // Past the cutover the engine refuses a message whose authenticated
+        // sending leaf is not of `from_airdress`, so the name below is the
+        // sender's own.
         match self
             .engine
             .decrypt(&group_id, &env.ciphertext, &env.from_airdress)
@@ -372,12 +381,11 @@ impl Client {
         // whose Welcome follows. Asking to rejoin here would be answered
         // with a second Remove and Add (SPEC-166 166-B.14, measured on
         // VM2).
-        if self.directory.conversation_for(&group_id).is_none() {
+        let Some(conversation_id) = self.directory.conversation_for(&group_id) else {
             return Processed::ack(Event::Ignored {
                 reason: "a commit for a group this device was removed from".to_owned(),
             });
-        }
-        let conversation_id = self.conversation_of(env, &group_id);
+        };
         // Built from an epoch this device has passed: a commit that lost
         // the race, or one already applied. Nothing to do.
         if let Some(from) = env.commit_from_epoch

@@ -102,6 +102,7 @@
 //! by-value one on `Send` is our own construction and is an error —
 //! there is no deadlock to avoid and it means this crate has a bug.
 
+use mls_rs::ExtensionList;
 use mls_rs::group::proposal::RemoveProposal;
 use mls_rs::group::{Roster, Sender};
 use mls_rs::identity::SigningIdentity;
@@ -111,6 +112,8 @@ use mls_rs::mls_rules::{
 };
 use mls_rs_core::error::IntoAnyError;
 use mls_rs_core::group::GroupContext;
+
+use crate::group_context::GROUP_EXTENSION_TYPES;
 
 #[cfg(doc)]
 use crate::credential::AirdressIdentity;
@@ -392,6 +395,29 @@ impl mls_rs::MlsRules for AirdressMlsRules {
                     proposals,
                 )
                 .map_err(|e: core::convert::Infallible| match e {});
+        }
+        // Not a group conversation: nothing may turn it into one. Without
+        // this the group extensions, naming any member admin, pass to the
+        // default rules (every leaf advertises the types), and the group
+        // rule set then applies on the next commit. A partial set would
+        // instead make every later commit unreadable.
+        #[cfg(test)]
+        let unchecked = direction == CommitDirection::Send
+            && crate::group_rules::SEND_UNCHECKED.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let unchecked = false;
+        if !unchecked {
+            proposals.retain_by_type::<ExtensionList, _, Self::Error>(|info| {
+                let carries_group = GROUP_EXTENSION_TYPES
+                    .iter()
+                    .any(|t| info.proposal.has_extension(*t));
+                crate::group_rules::keep_or_refuse(
+                    !carries_group,
+                    direction,
+                    info.source(),
+                    crate::group_rules::GroupRule::NotAGroup,
+                )
+            })?;
         }
         proposals.retain_by_type::<RemoveProposal, _, Self::Error>(|info| {
             let target = leaf_at(current_roster, info.proposal.to_remove())?;
