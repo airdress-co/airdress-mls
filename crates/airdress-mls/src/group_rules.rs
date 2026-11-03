@@ -22,9 +22,13 @@
 //! | anything else (`ReInit`, `PreSharedKey`, `ExternalInit`, custom) | is refused: nothing in a group conversation uses them |
 //!
 //! And after every commit: at least one admin is still in the group (FR-16),
-//! and every admin the roles name is in the group. A commit that removes an
-//! admin therefore has to carry the roles without them, and one that removes
-//! the last admin the forced promotion, whoever commits it. An honest
+//! and no admin the roles name joins or leaves the group while named. A
+//! commit that removes an admin therefore has to carry the roles without
+//! them, one that adds back a person the roles still name has to carry the
+//! roles without them too, and one that removes the last admin the forced
+//! promotion, whoever commits it. An admin the roles name who was already
+//! gone before the commit (roles an earlier release left behind) is
+//! tolerated, and dropped by the next roles change. An honest
 //! committing device adds that change itself when its commit needs it
 //! ([`forced_roles`]), so a leave or a removal never wedges the group. A
 //! committing device also refuses to grow the group past
@@ -122,6 +126,14 @@ impl core::fmt::Display for GroupRule {
 
 #[cfg(test)]
 thread_local! {
+    /// The release before the admin-membership rule, for the tests: while
+    /// set, this thread's engines neither add nor require the roles change
+    /// that rule asks for, on either side.
+    pub(crate) static ROLES_UNCHECKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// A modified client, for the tests: while set, this thread's engines
     /// build commits without the group rules, exactly as a client with the
     /// checks patched out would. Receivers are unaffected.
@@ -200,6 +212,25 @@ impl<'a> GroupView<'a> {
     fn is_admin(&self, leaf: &Leaf) -> Result<bool, MlsRulesError> {
         let pin = leaf.pin_subject()?;
         Ok(self.current.roles.admins.iter().any(|a| a == pin))
+    }
+
+    /// An admin the current roles name who is not in the group: what a
+    /// release before the admin-membership rule could leave behind.
+    fn is_stale_admin(&self, person: &str) -> bool {
+        self.current.roles.admins.iter().any(|a| a == person) && !self.before.contains(person)
+    }
+
+    /// [`forced_roles`] for `after`, from the current roles with their
+    /// stale admins dropped first, so a person they name who is added back
+    /// is a member and not an admin.
+    fn forced_roles(
+        &self,
+        roles: &crate::group_context::GroupRoles,
+        after: &[String],
+    ) -> crate::group_context::GroupRoles {
+        let mut kept = roles.clone();
+        kept.admins.retain(|a| !self.is_stale_admin(a));
+        forced_roles(&kept, after)
     }
 }
 
@@ -338,18 +369,27 @@ pub(crate) fn filter(
         }
     })?;
 
-    // A commit this device builds that leaves the roles naming someone who
-    // is gone carries the roles without them, promoting when no admin is
-    // left (FR-16): the change every honest committer is allowed to make.
-    if direction == CommitDirection::Send && !roles_hold(&roles_after, &after) {
+    #[cfg(test)]
+    let roles_unchecked = ROLES_UNCHECKED.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let roles_unchecked = false;
+
+    // A commit this device builds that removes a named admin, or adds back
+    // a person the roles still name, carries the roles without them,
+    // promoting when no admin is left (FR-16): the change every honest
+    // committer is allowed to make.
+    if direction == CommitDirection::Send
+        && !roles_unchecked
+        && !(has_admin(&roles_after, &after) && roles_hold(view, &roles_after, &after))
+    {
         roles_after = add_forced_roles(view, source, proposals, &after, removes_a_person)?;
     }
 
-    // FR-16: an admin stays, and every admin named is in the group.
-    if !roles_after.admins.iter().any(|a| after.contains(a)) {
+    // FR-16: an admin stays, and no named admin joins or leaves.
+    if !has_admin(&roles_after, &after) {
         return Err(MlsRulesError::Group(GroupRule::NoAdminLeft));
     }
-    if !roles_hold(&roles_after, &after) {
+    if !roles_unchecked && !roles_hold(view, &roles_after, &after) {
         return Err(MlsRulesError::Group(GroupRule::AdminNotInGroup));
     }
     // D-11: the committing device holds the caps, on a commit that grows
@@ -400,9 +440,23 @@ fn refuse_unsupported(
     })
 }
 
-/// Whether every admin the roles name is among `after`, and there is one.
-fn roles_hold(roles: &crate::group_context::GroupRoles, after: &[String]) -> bool {
-    !roles.admins.is_empty() && roles.admins.iter().all(|a| after.contains(a))
+/// Whether an admin the roles name is among `after`.
+fn has_admin(roles: &crate::group_context::GroupRoles, after: &[String]) -> bool {
+    roles.admins.iter().any(|a| after.contains(a))
+}
+
+/// Whether every admin the roles name is among `after`, except a stale one
+/// ([`GroupView::is_stale_admin`]), which must stay out: a named admin is
+/// neither removed nor added back by a commit that keeps naming them.
+fn roles_hold(
+    view: &GroupView<'_>,
+    roles: &crate::group_context::GroupRoles,
+    after: &[String],
+) -> bool {
+    roles
+        .admins
+        .iter()
+        .all(|a| after.contains(a) != view.is_stale_admin(a))
 }
 
 /// Replace the commit's context change, if any, with one whose roles are
@@ -434,7 +488,7 @@ fn add_forced_roles(
         .ok()
         .flatten()
         .ok_or_else(malformed)?;
-    base.roles = forced_roles(&base.roles, after);
+    base.roles = view.forced_roles(&base.roles, after);
     let admin = view.is_admin(&Leaf::of(committer.signing_identity())?)?;
     context_change(view, &base, admin, after, removes_a_person).map_err(MlsRulesError::Group)?;
     let mut list = base_list;
@@ -485,7 +539,7 @@ fn context_change(
         return Err(GroupRule::ChangeSequencer);
     }
     if proposed.roles != current.roles {
-        let forced = forced_roles(&current.roles, after);
+        let forced = view.forced_roles(&current.roles, after);
         if proposed.roles.join_order != forced.join_order {
             return Err(GroupRule::ChangeRoles);
         }

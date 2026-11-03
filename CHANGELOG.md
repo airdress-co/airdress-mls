@@ -92,10 +92,14 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
   - `airdress_mls_generate_key_packages` refuses a `count` above 256 with
     `InvalidArgument`, before the engine is locked. A larger count used to
     be attempted, and a huge one aborted the process.
-  - in a group conversation, a commit is refused when its roles name an
-    admin who is not in the group (`AdminNotInGroup`): a commit that
-    removes an admin carries the roles without them. A person removed as
-    an admin and added back is a member, not an admin;
+  - in a group conversation, a commit is refused when an admin its roles
+    name leaves the group in it, or comes back in it (`AdminNotInGroup`):
+    a commit that removes an admin carries the roles without them, and so
+    does one that adds back a person the roles still name. A person
+    removed as an admin and added back is a member, not an admin. An
+    admin the roles already named while absent before the commit (a
+    state earlier releases could leave) is tolerated, so such a group
+    keeps taking commits; the next roles change drops them;
   - in a group conversation, a commit carrying a `ReInit`, `PreSharedKey`,
     `ExternalInit` or custom proposal is refused (`UnsupportedProposal`),
     and so is a `ReInit` in a one-to-one, self or household group;
