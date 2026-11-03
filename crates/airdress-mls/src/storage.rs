@@ -235,6 +235,32 @@ impl SealedStore {
     }
 }
 
+/// Whether a temp file named `name` cannot belong to a write still in
+/// progress (see [`remove_interrupted_writes`]).
+fn is_interrupted(name: &str, entry: &std::fs::DirEntry) -> bool {
+    let old = entry
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age > INTERRUPTED_WRITE_AGE);
+    old || writer_pid(name).is_some_and(|pid| pid != std::process::id() && process_ended(pid))
+}
+
+/// The pid a temp file's name records: `<target>.tmp-<pid>-<n>`.
+fn writer_pid(name: &str) -> Option<u32> {
+    let (_, rest) = name.rsplit_once(TMP_MARKER)?;
+    let (pid, ordinal) = rest.split_once('-')?;
+    ordinal.parse::<u64>().ok()?;
+    pid.parse().ok()
+}
+
+/// Whether `/proc` says process `pid` is not running. `false` where there
+/// is no `/proc` to ask: the age rule decides there.
+fn process_ended(pid: u32) -> bool {
+    Path::new("/proc/self").exists() && !Path::new("/proc").join(pid.to_string()).exists()
+}
+
 static TMP_ORDINAL: AtomicU64 = AtomicU64::new(0);
 
 fn next_tmp_ordinal() -> u64 {
@@ -292,10 +318,22 @@ pub fn write_file_atomically(path: &Path, parts: &[&[u8]]) -> std::io::Result<()
     Ok(())
 }
 
+/// How old a temp file must be before it is taken for an interrupted
+/// write whatever process wrote it. A write takes milliseconds; this is
+/// for the case the writer cannot be asked about (no `/proc`, an
+/// unreadable name, a pid reused by another process).
+pub const INTERRUPTED_WRITE_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Remove the temp files [`write_file_atomically`] leaves in `dir` when
 /// a process dies mid-write: every `*.tmp-*` file, or with `file_name`
 /// only those of that one target (`<file_name>.tmp-*`). Returns how many
 /// were removed. Run it when a store opens, before anything writes.
+///
+/// Nothing locks a state directory, so another engine may be writing in
+/// it right now. A temp file is removed only when it cannot belong to a
+/// write in progress: the process its name records is not running
+/// (where `/proc` says so, and never for this process), or it was last
+/// modified more than [`INTERRUPTED_WRITE_AGE`] ago.
 ///
 /// # Errors
 ///
@@ -317,7 +355,7 @@ pub fn remove_interrupted_writes(dir: &Path, file_name: Option<&str>) -> std::io
                 .is_some_and(|rest| rest.starts_with(TMP_MARKER)),
             None => name.contains(TMP_MARKER),
         };
-        if is_temp && entry.file_type()?.is_file() {
+        if is_temp && entry.file_type()?.is_file() && is_interrupted(name, &entry) {
             match std::fs::remove_file(entry.path()) {
                 Ok(()) => removed += 1,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -783,7 +821,11 @@ mod tests {
             .seal_write("groups", GROUP_AAD_LABEL, &[0xab], b"payload")
             .unwrap();
         for sub in ["groups", "key_packages", "key_packages_public"] {
-            std::fs::write(dir.path().join(sub).join("cd.tmp-4242-7"), b"sealed").unwrap();
+            std::fs::write(
+                dir.path().join(sub).join(format!("cd.tmp-{ENDED_PID}-7")),
+                b"sealed",
+            )
+            .unwrap();
         }
         let reopened = SealedStore::open(dir.path().to_str().unwrap(), &[5u8; 32]).unwrap();
         assert_eq!(names_in(&dir.path().join("groups")), vec!["ab".to_owned()]);
@@ -801,7 +843,12 @@ mod tests {
     #[test]
     fn only_the_named_targets_temp_files_are_removed() {
         let dir = tempfile::tempdir().unwrap();
-        for name in ["pins.sealed.tmp-1-0", "other.sealed.tmp-1-0", "pins.sealed"] {
+        let ended = |target: &str| format!("{target}.tmp-{ENDED_PID}-0");
+        for name in [
+            ended("pins.sealed"),
+            ended("other.sealed"),
+            "pins.sealed".to_owned(),
+        ] {
             std::fs::write(dir.path().join(name), b"x").unwrap();
         }
         assert_eq!(
@@ -810,8 +857,40 @@ mod tests {
         );
         assert_eq!(
             names_in(dir.path()),
-            vec!["other.sealed.tmp-1-0".to_owned(), "pins.sealed".to_owned()]
+            vec![ended("other.sealed"), "pins.sealed".to_owned()]
         );
+    }
+
+    /// Above Linux's largest `pid_max`: no process has this pid.
+    const ENDED_PID: u32 = 4_194_305;
+
+    /// A temp file of a write that may still be in progress — this
+    /// process's, or a running one's — is kept; once it is older than any
+    /// write takes, it is removed whoever wrote it.
+    #[test]
+    fn a_temp_file_of_a_running_writer_is_kept_until_it_is_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = format!("ab.tmp-{}-0", std::process::id());
+        let unreadable = "cd.tmp-x".to_owned();
+        for name in [&own, &unreadable] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        assert_eq!(remove_interrupted_writes(dir.path(), None).unwrap(), 0);
+        assert_eq!(names_in(dir.path()), vec![own.clone(), unreadable.clone()]);
+
+        let old = std::time::SystemTime::now()
+            - INTERRUPTED_WRITE_AGE
+            - std::time::Duration::from_secs(1);
+        for name in [&own, &unreadable] {
+            std::fs::File::options()
+                .write(true)
+                .open(dir.path().join(name))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        assert_eq!(remove_interrupted_writes(dir.path(), None).unwrap(), 2);
+        assert!(names_in(dir.path()).is_empty());
     }
 
     #[test]

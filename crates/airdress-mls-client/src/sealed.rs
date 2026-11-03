@@ -147,18 +147,35 @@ mod tests {
         let path = dir.path().join("pins.sealed");
         let file = SealedFile::new(path, &[7u8; 32], b"test");
         file.write(b"{\"a\":1}").unwrap();
+        // The writer of each temp file ended: its pid is above Linux's
+        // largest `pid_max`.
         for leftover in [
-            "pins.sealed.tmp-4242-0",
+            "pins.sealed.tmp-4194305-0",
             "pins.partial",
-            "other.sealed.tmp-1-0",
+            "other.sealed.tmp-4194305-0",
         ] {
             std::fs::write(dir.path().join(leftover), b"sealed").unwrap();
         }
         assert_eq!(file.read().unwrap().unwrap(), b"{\"a\":1}");
         assert_eq!(
             names_in(dir.path()),
-            vec!["other.sealed.tmp-1-0".to_owned(), "pins.sealed".to_owned()],
+            vec![
+                "other.sealed.tmp-4194305-0".to_owned(),
+                "pins.sealed".to_owned()
+            ],
             "only this file's leftovers are removed"
         );
+    }
+
+    #[test]
+    fn opening_keeps_a_temp_file_another_write_may_still_be_using() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.sealed");
+        let file = SealedFile::new(path, &[7u8; 32], b"test");
+        file.write(b"{}").unwrap();
+        let live = format!("pins.sealed.tmp-{}-9", std::process::id());
+        std::fs::write(dir.path().join(&live), b"sealed").unwrap();
+        file.read().unwrap();
+        assert_eq!(names_in(dir.path()), vec!["pins.sealed".to_owned(), live]);
     }
 }
