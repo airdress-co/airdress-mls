@@ -103,7 +103,7 @@
 //! there is no deadlock to avoid and it means this crate has a bug.
 
 use mls_rs::ExtensionList;
-use mls_rs::group::proposal::RemoveProposal;
+use mls_rs::group::proposal::{ReInitProposal, RemoveProposal};
 use mls_rs::group::{Roster, Sender};
 use mls_rs::identity::SigningIdentity;
 use mls_rs::mls_rules::{
@@ -416,6 +416,16 @@ impl mls_rs::MlsRules for AirdressMlsRules {
                     direction,
                     info.source(),
                     crate::group_rules::GroupRule::NotAGroup,
+                )
+            })?;
+            // Nothing in this crate reinitialises a conversation, and a
+            // `ReInit` would end this one for every member.
+            proposals.retain_by_type::<ReInitProposal, _, Self::Error>(|info| {
+                crate::group_rules::keep_or_refuse(
+                    false,
+                    direction,
+                    info.source(),
+                    crate::group_rules::GroupRule::UnsupportedProposal,
                 )
             })?;
         }

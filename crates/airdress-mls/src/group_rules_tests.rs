@@ -18,21 +18,21 @@ use crate::group_context::{
     GroupExtensions, GroupPolicy, GroupProfile, GroupRoles, GroupSequencer, forced_roles,
 };
 
-const ANA: &str = "ana.test";
-const BEN: &str = "ben.test";
+pub(crate) const ANA: &str = "ana.test";
+pub(crate) const BEN: &str = "ben.test";
 const CLEO: &str = "cleo.test";
 const DAN: &str = "dan.test";
 const EXPIRES: &str = "2099-01-01T00:00:00Z";
 
-struct Device {
+pub(crate) struct Device {
     name: &'static str,
     airdress: &'static str,
-    engine: MlsEngine,
+    pub(crate) engine: MlsEngine,
     _dir: tempfile::TempDir,
 }
 
 impl Device {
-    fn new(airdress: &'static str, name: &'static str, seed: u8) -> Self {
+    pub(crate) fn new(airdress: &'static str, name: &'static str, seed: u8) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = SigningKey::from_bytes(&[seed.wrapping_add(100); 32]);
         let seed = [seed; 32];
@@ -76,15 +76,15 @@ fn creation(creator: &str, policy: GroupPolicy) -> GroupExtensions {
     }
 }
 
-struct Group {
+pub(crate) struct Group {
     devices: Vec<Device>,
-    id: Vec<u8>,
+    pub(crate) id: Vec<u8>,
 }
 
 impl Group {
     /// `devices[0]` creates the group and adds every other device in one
     /// commit, as FR-6 does.
-    fn found(mut devices: Vec<Device>, policy: GroupPolicy) -> Self {
+    pub(crate) fn found(mut devices: Vec<Device>, policy: GroupPolicy) -> Self {
         // A `v: 2` owner's pin subject is its airdress.
         let creator = devices[0].airdress;
         let id = devices[0]
@@ -107,16 +107,16 @@ impl Group {
         Self { devices, id }
     }
 
-    fn get(&mut self, name: &str) -> &mut Device {
+    pub(crate) fn get(&mut self, name: &str) -> &mut Device {
         self.devices.iter_mut().find(|d| d.name == name).unwrap()
     }
 
-    fn epoch(&self, name: &str) -> u64 {
+    pub(crate) fn epoch(&self, name: &str) -> u64 {
         let d = self.devices.iter().find(|d| d.name == name).unwrap();
         d.engine.group_epoch(&self.id).unwrap()
     }
 
-    fn extensions(&self) -> GroupExtensions {
+    pub(crate) fn extensions(&self) -> GroupExtensions {
         self.devices[0]
             .engine
             .group_extensions(&self.id)
@@ -124,7 +124,7 @@ impl Group {
             .unwrap()
     }
 
-    fn index_of(&self, name: &str) -> u32 {
+    pub(crate) fn index_of(&self, name: &str) -> u32 {
         let d = self
             .devices
             .iter()
@@ -141,7 +141,7 @@ impl Group {
 
     /// `by` commits what it staged; every other device that is in the
     /// group applies it.
-    fn commit(&mut self, by: &str) -> Result<Vec<u8>, String> {
+    pub(crate) fn commit(&mut self, by: &str) -> Result<Vec<u8>, String> {
         let id = self.id.clone();
         let committer = self.get(by);
         let outcome = committer.engine.commit_pending(&id)?;
@@ -156,7 +156,7 @@ impl Group {
 
     /// `by`, a modified client, commits what it staged with the rules off;
     /// every honest receiver refuses it with `rule` and stays put.
-    fn refused_everywhere(&mut self, by: &str, rule: GroupRule) {
+    pub(crate) fn refused_everywhere(&mut self, by: &str, rule: GroupRule) {
         let id = self.id.clone();
         SEND_UNCHECKED.with(|c| c.set(true));
         let built = self.get(by).engine.commit_pending(&id);
@@ -179,7 +179,7 @@ impl Group {
     }
 }
 
-fn three() -> Group {
+pub(crate) fn three() -> Group {
     Group::found(
         vec![
             Device::new(ANA, "ana", 1),
@@ -190,7 +190,7 @@ fn three() -> Group {
     )
 }
 
-fn rule_error(result: Result<Vec<u8>, String>, rule: GroupRule) {
+pub(crate) fn rule_error(result: Result<Vec<u8>, String>, rule: GroupRule) {
     let err = result.expect_err("the honest committer cannot build it");
     assert!(err.contains(&rule.to_string()), "{err}");
 }
@@ -319,9 +319,98 @@ fn the_last_admin_leaving_forces_a_promotion() {
     g.get("ben").engine.process_proposal(&id, &leave).unwrap();
     g.get("cleo").engine.process_proposal(&id, &leave).unwrap();
 
-    // Without the promotion: refused on both sides.
-    rule_error(g.commit("ben"), GroupRule::NoAdminLeft);
+    // Without the promotion: refused by every honest receiver.
     g.refused_everywhere("ben", GroupRule::NoAdminLeft);
+}
+
+#[test]
+fn after_the_last_admin_leaves_the_next_commit_carries_the_promotion() {
+    let mut g = three();
+    let id = g.id.clone();
+    let leave = g.get("ana").engine.propose_self_remove(&id).unwrap();
+    g.get("ben").engine.process_proposal(&id, &leave).unwrap();
+    g.get("cleo").engine.process_proposal(&id, &leave).unwrap();
+
+    // Cleo commits something else entirely; her commit carries the leave
+    // and the promotion it needs.
+    let titled = g_ext_titled(&g, "Ski trip, again");
+    g.get("cleo")
+        .engine
+        .propose_extensions(&id, titled)
+        .unwrap();
+    g.commit("cleo").unwrap();
+    let after = g.get("ben").engine.group_extensions(&id).unwrap().unwrap();
+    assert_eq!(
+        after.roles.admins,
+        [BEN],
+        "the earliest-joined remaining person"
+    );
+    assert_eq!(after.profile.title, "Ski trip, again");
+    assert!(g.get("ben").engine.group_epoch(&id) > Some(1));
+
+    // And with nothing staged at all.
+    let mut g = three();
+    let id = g.id.clone();
+    let leave = g.get("ana").engine.propose_self_remove(&id).unwrap();
+    g.get("ben").engine.process_proposal(&id, &leave).unwrap();
+    g.get("cleo").engine.process_proposal(&id, &leave).unwrap();
+    g.commit("ben").unwrap();
+    let after = g.get("cleo").engine.group_extensions(&id).unwrap().unwrap();
+    assert_eq!(after.roles.admins, [BEN]);
+}
+
+#[test]
+fn a_removed_admin_is_not_an_admin_when_added_back() {
+    let mut g = three();
+    let id = g.id.clone();
+    let mut two_admins = g.extensions();
+    two_admins.roles.admins.push(BEN.into());
+    two_admins.roles.join_order = vec![ANA.into(), BEN.into(), CLEO.into()];
+    g.get("ana")
+        .engine
+        .propose_extensions(&id, two_admins)
+        .unwrap();
+    g.commit("ana").unwrap();
+    assert_eq!(g.extensions().roles.admins, [ANA, BEN]);
+
+    // A commit removing an admin without taking them off the roles is
+    // refused by every honest receiver.
+    let ben = g.index_of("ben");
+    g.get("ana").engine.propose_remove(&id, ben).unwrap();
+    g.refused_everywhere("ana", GroupRule::AdminNotInGroup);
+
+    let mut g = three();
+    let id = g.id.clone();
+    let mut two_admins = g.extensions();
+    two_admins.roles.admins.push(BEN.into());
+    two_admins.roles.join_order = vec![ANA.into(), BEN.into(), CLEO.into()];
+    g.get("ana")
+        .engine
+        .propose_extensions(&id, two_admins)
+        .unwrap();
+    g.commit("ana").unwrap();
+    // The honest removal takes Ben off the roles in the same commit.
+    let ben = g.index_of("ben");
+    g.get("ana").engine.propose_remove(&id, ben).unwrap();
+    g.commit("ana").unwrap();
+    assert_eq!(g.extensions().roles.admins, [ANA]);
+    g.devices.retain(|d| d.name != "ben");
+
+    // Ben comes back as a member, and only as a member.
+    let back = Device::new(BEN, "ben-again", 7);
+    let kp = back.engine.generate_key_package().unwrap();
+    g.get("ana").engine.propose_add(&id, &kp).unwrap();
+    g.commit("ana").unwrap();
+    let pins: Vec<String> = g
+        .get("cleo")
+        .engine
+        .group_roster(&id)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.pin_subject)
+        .collect();
+    assert!(pins.iter().any(|p| p == BEN), "{pins:?}");
+    assert_eq!(g.extensions().roles.admins, [ANA]);
 }
 
 #[test]
@@ -504,4 +593,34 @@ fn the_committer_holds_the_leaf_cap_too() {
     let refused = g.commit("ben");
     LEAF_CAP.with(|c| c.set(crate::group_context::GROUP_LEAF_CAP));
     rule_error(refused, GroupRule::TooManyPersons);
+}
+
+#[test]
+fn a_group_past_its_caps_still_takes_commits_that_do_not_grow_it() {
+    let mut g = Group::found(
+        vec![
+            Device::new(ANA, "ana", 1),
+            Device::new(BEN, "ben", 2),
+            Device::new(CLEO, "cleo", 3),
+            Device::new(DAN, "dan", 4),
+        ],
+        GroupPolicy::creation_default(),
+    );
+    let id = g.id.clone();
+    // Both caps lowered below what the group already holds.
+    PERSON_CAP.with(|c| c.set(2));
+    LEAF_CAP.with(|c| c.set(2));
+    let rotation = g.commit("ben");
+    let dan = g.index_of("dan");
+    g.get("ana").engine.propose_remove(&id, dan).unwrap();
+    let removal = g.commit("ana");
+    let ben2 = Device::new(BEN, "ben2", 5);
+    let kp = ben2.engine.generate_key_package().unwrap();
+    g.get("ben").engine.propose_add(&id, &kp).unwrap();
+    let growth = g.commit("ben");
+    PERSON_CAP.with(|c| c.set(crate::group_context::GROUP_MAX_PERSONS));
+    LEAF_CAP.with(|c| c.set(crate::group_context::GROUP_LEAF_CAP));
+    assert!(rotation.is_ok(), "a key rotation: {rotation:?}");
+    assert!(removal.is_ok(), "a removal: {removal:?}");
+    rule_error(growth, GroupRule::TooManyPersons);
 }
