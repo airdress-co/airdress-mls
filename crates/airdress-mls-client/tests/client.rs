@@ -16,6 +16,17 @@ use airdress_mls_client::{
 use base64::Engine as _;
 use ed25519_dalek::SigningKey;
 
+/// One root per airdress, as a real deployment has: every device of
+/// an airdress is delegated by the same root, so the root-key lookup
+/// below can answer by airdress alone.
+fn root_for(airdress: &str) -> SigningKey {
+    let mut seed = [0x5au8; 32];
+    for (i, byte) in airdress.bytes().enumerate() {
+        seed[i % 32] ^= byte.wrapping_add(u8::try_from(i % 251).unwrap_or(0));
+    }
+    SigningKey::from_bytes(&seed)
+}
+
 struct Device {
     airdress: String,
     seed: [u8; 32],
@@ -28,7 +39,7 @@ struct Device {
 impl Device {
     fn new(airdress: &str, n: u8) -> Self {
         let seed = [n; 32];
-        let root = SigningKey::from_bytes(&[n.wrapping_add(100); 32]);
+        let root = root_for(airdress);
         let session = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
         let delegation = signed_delegation_json_v2(
             &root,
@@ -62,6 +73,10 @@ impl Device {
         // (fail closed); every device here is active.
         engine.set_revocation_lookup(std::sync::Arc::new(|_: &str| {
             Some(airdress_mls::credential::DeviceStatus::Active)
+        }));
+        // Past the cutover check 2 needs a root-key lookup too.
+        engine.set_root_key_lookup(std::sync::Arc::new(|subject: &str| {
+            Some(root_for(subject).verifying_key().to_bytes())
         }));
         Client::open(engine, &self.dir.path().join("client"), &self.key).unwrap()
     }

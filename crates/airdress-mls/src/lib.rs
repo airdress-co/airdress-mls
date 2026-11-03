@@ -252,6 +252,30 @@ mod tests {
     }
 
     #[test]
+    fn from_seed_refuses_a_delegation_signed_for_another_airdress() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let seed = [42u8; 32];
+        let delegation = crate::credential::test_support::signed_delegation_json(
+            &root,
+            "alice.test",
+            &ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .to_bytes(),
+        );
+        let err = MlsEngine::from_seed(
+            "bob.test",
+            &seed,
+            &root.verifying_key().to_bytes(),
+            &delegation,
+            dir.path().to_str().unwrap(),
+            &[3u8; 32],
+        )
+        .expect_err("an engine must not call itself an airdress its delegation does not name");
+        assert!(err.contains("airdress"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn round_trip_welcome_and_application() {
         let mut alice = MlsEngine::new("alice.test").unwrap();
         let mut bob = MlsEngine::new("bob.test").unwrap();

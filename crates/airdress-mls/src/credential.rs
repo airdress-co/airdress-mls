@@ -710,6 +710,34 @@ pub fn verify_identity_at(
     )
 }
 
+/// Refuse an identity whose `airdress` is not the one its delegation
+/// names.
+///
+/// The delegation's `airdress` is inside the signed bytes; an
+/// identity's own `airdress` field is not. Requiring the two to be
+/// equal is what makes the unsigned field safe to read as "the
+/// airdress the root vouched for".
+///
+/// # Errors
+///
+/// [`CredentialVerifyError::Malformed`] when the delegation carries no
+/// `airdress` string, or carries a different one.
+pub(crate) fn check_signed_airdress(
+    airdress: &str,
+    delegation: &Map<String, Value>,
+) -> Result<(), CredentialVerifyError> {
+    let signed = delegation
+        .get("airdress")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CredentialVerifyError::Malformed("delegation missing airdress".into()))?;
+    if signed != airdress {
+        return Err(CredentialVerifyError::Malformed(
+            "identity airdress differs from the delegation's airdress".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Checks 1, 3, 4 and 5 always; check 2 when a root lookup is
 /// present. The lookup-less form exists ONLY for the pre-cutover
 /// compat mode of [`AirdressIdentityProvider`] — strict verification
@@ -747,6 +775,13 @@ fn verify_chain(
         &ed25519_dalek::Signature::from_bytes(&sig_bytes),
     )
     .map_err(|_| CredentialVerifyError::DelegationSignatureInvalid)?;
+
+    // The airdress the root signed is the one inside the delegation;
+    // the identity's top-level `airdress` is an unsigned copy. Every
+    // later reader (check 2's pin subject, `airdress_of`, the sender
+    // binding, the removal rule) reads the copy, so the copy must be
+    // exactly what was signed.
+    check_signed_airdress(&identity.airdress, &identity.delegation)?;
 
     // Check 2 — the published root key. This is what turns the
     // delegation from a self-assertion into an identity chain; a miss
@@ -1078,6 +1113,11 @@ impl AirdressIdentityProvider {
     /// Enter the SPEC-061 v2 cutover: `v: 1` identities stop being
     /// accepted (FR-20). One-way, per NFR-15 — a reversible cutover
     /// is a four-state matrix nobody tests.
+    ///
+    /// Past the cutover every leaf needs check 2 and check 5: until a
+    /// root-key lookup and a revocation lookup are both registered,
+    /// every leaf is refused (`RootKeyUnavailable`,
+    /// `RevocationUnavailable`).
     pub fn set_v2_cutover(&self) {
         self.v2_cutover
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1241,6 +1281,13 @@ impl AirdressIdentityProvider {
                 }
             }
             ParsedIdentity::Structured(identity) => {
+                // Past the cutover check 2 is not optional: a host that
+                // entered it without registering a root-key lookup
+                // refuses every leaf, exactly as for the revocation
+                // lookup, rather than accepting any self-signed root.
+                if lookup.is_none() && self.is_v2_cutover() {
+                    return Err(CredentialVerifyError::RootKeyUnavailable);
+                }
                 let revocation = self.revocation_for_check()?;
                 verify_chain(
                     &identity,
@@ -1915,6 +1962,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_identity_whose_airdress_differs_from_its_signed_delegation_is_refused() {
+        // One root key published for two airdresses: check 2 alone
+        // cannot tell them apart, so the signed airdress has to.
+        let root = SigningKey::from_bytes(&[11u8; 32]);
+        let root_pub = root.verifying_key().to_bytes();
+        let (mut identity, session_pub) =
+            v2_identity(&root, "alice.test", 22, "device-phone", FAR_FUTURE);
+        identity.airdress = "bob.test".to_owned();
+        let lookup = move |_: &str| Some(root_pub);
+        let active = |_: &str| Some(DeviceStatus::Active);
+        assert!(matches!(
+            verify_identity_at(&identity, &session_pub, &lookup, Some(&active), NOW),
+            Err(CredentialVerifyError::Malformed(_))
+        ));
+
+        // The same through the provider, which is what mls-rs calls.
+        let provider = AirdressIdentityProvider::new();
+        provider.set_root_key_lookup(std::sync::Arc::new(lookup));
+        provider.set_clock(std::sync::Arc::new(FixedClock(NOW)));
+        assert!(matches!(
+            provider.validate_external_sender(&leaf_for(&identity, &session_pub), None, None),
+            Err(CredentialVerifyError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn a_delegation_that_names_no_airdress_is_refused() {
+        let root = SigningKey::from_bytes(&[11u8; 32]);
+        let root_pub = root.verifying_key().to_bytes();
+        let session_pub = SigningKey::from_bytes(&[22u8; 32])
+            .verifying_key()
+            .to_bytes();
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "device_session_public_key".to_owned(),
+            json!(base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                session_pub
+            )),
+        );
+        let canonical = crate::canonical::canonical_delegation_bytes(&obj).unwrap();
+        let signature = ed25519_dalek::Signer::sign(&root, &canonical);
+        obj.insert(
+            "signature".to_owned(),
+            json!(base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                signature.to_bytes()
+            )),
+        );
+        let identity = AirdressIdentity {
+            version: IdentityVersion::V1,
+            airdress: "alice.test".to_owned(),
+            root_public_key: root_pub,
+            delegation: obj,
+        };
+        assert!(matches!(
+            verify_identity_without_revocation(&identity, &session_pub, &move |_: &str| Some(
+                root_pub
+            )),
+            Err(CredentialVerifyError::Malformed(_))
+        ));
+    }
+
     // -- FR-16: the member identity is per-device --
 
     #[test]
@@ -2420,6 +2531,40 @@ mod tests {
             provider.validate_external_sender(&v2_leaf, None, None),
             Err(CredentialVerifyError::ClockUnavailable)
         );
+    }
+
+    #[test]
+    fn past_the_cutover_a_leaf_is_refused_until_a_root_key_lookup_is_registered() {
+        let root = SigningKey::from_bytes(&[11u8; 32]);
+        let root_pub = root.verifying_key().to_bytes();
+        let (v2, v2_pub) = v2_identity(
+            &root,
+            "alice.humans.airdress.co",
+            33,
+            "device-phone",
+            FAR_FUTURE,
+        );
+        let leaf = leaf_for(&v2, &v2_pub);
+
+        let provider = AirdressIdentityProvider::new();
+        provider.set_clock(std::sync::Arc::new(FixedClock(NOW)));
+        provider.set_revocation_lookup(std::sync::Arc::new(|_: &str| Some(DeviceStatus::Active)));
+        // Before the cutover, compatibility mode still accepts the leaf
+        // without check 2.
+        provider
+            .validate_external_sender(&leaf, None, None)
+            .expect("pre-cutover compat mode runs without a root lookup");
+
+        provider.set_v2_cutover();
+        assert_eq!(
+            provider.validate_external_sender(&leaf, None, None),
+            Err(CredentialVerifyError::RootKeyUnavailable)
+        );
+
+        provider.set_root_key_lookup(std::sync::Arc::new(move |_: &str| Some(root_pub)));
+        provider
+            .validate_external_sender(&leaf, None, None)
+            .expect("with a root lookup the leaf verifies");
     }
 
     /// A clock before 1970, as `SystemClock` reads one.
