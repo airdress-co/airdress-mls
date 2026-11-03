@@ -101,13 +101,19 @@ impl MlsEngine {
         if extensions.profile.v != GROUP_EXTENSION_VERSION {
             return Err("unsupported group extension version".to_owned());
         }
-        if self.group_extensions(group_id)?.is_none() {
+        let group = self.load_group(group_id)?;
+        if GroupExtensions::from_list(&group.context().extensions)?.is_none() {
             return Err("this group is not a group conversation".to_owned());
         }
-        let staged = self.staged.entry(group_id.to_vec()).or_default();
+        let epoch = group.current_epoch();
+        drop(group);
         // One context change per commit: the latest replaces the last.
-        staged.retain(|p| !matches!(p, StagedProposal::Extensions(_)));
-        staged.push(StagedProposal::Extensions(extensions));
+        if let Some(batch) = self.staged.get_mut(group_id) {
+            batch
+                .proposals
+                .retain(|p| !matches!(p, StagedProposal::Extensions(_)));
+        }
+        self.stage(group_id, epoch, StagedProposal::Extensions(extensions));
         Ok(())
     }
 

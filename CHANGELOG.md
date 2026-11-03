@@ -58,11 +58,21 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
   - in a group conversation, a member who is not an admin may not change a
     context extension outside the four group extensions
     (`ChangeOtherExtensions`).
+    conversation holds is ignored.
+  - `MlsEngine::commit_pending` (and `airdress_mls_commit_pending`)
+    refuses proposals staged at an earlier epoch than the group is at, and
+    drops them: a `Remove` names a leaf index, which can hold another
+    member by then. Propose again from a fresh read of the tree;
+  - `MlsEngine::confirm_commit` (and `airdress_mls_confirm_commit`)
+    refuses, and drops the held commit, when the group has moved to
+    another epoch since the commit was built.
 
 ### Added
 
 - `PinStore::pending_changes()`.
 - `Directory::conversation_of_message()`.
+- `MlsEngine::discard_staged()`: drop what is staged for a group without
+  committing.
 
 ### Fixed
 
@@ -87,6 +97,16 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
   rotation or a settings change.
 ### Changed
 
+- **A held commit is confirmed onto the group as it is on disk then.**
+  `commit_pending` keeps the new epoch's secrets rather than a copy of the
+  group, so a message decrypted while the commit waits leaves its
+  key used after `confirm_commit`, instead of the copy taken at build time
+  restoring it. Messages of the old epoch keep decrypting meanwhile.
+- `MlsEngine::abort_commit` drops what is staged for the group even when
+  no commit is pending (it still answers that nothing was pending).
+- `Client::prepare_add` and `Client::prepare_remove` stage a batch all or
+  nothing: when one item is refused, none of the batch is left for the
+  next commit.
 - `MlsEngine::from_seed` deletes pooled key packages whose leaf does not
   advertise the group extension types, both halves, and makes one
   replacement for each, so `stored_key_packages` republishes only packages

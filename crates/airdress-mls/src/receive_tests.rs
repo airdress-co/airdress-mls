@@ -115,11 +115,8 @@ fn naming_bob_admin() -> GroupExtensions {
 /// Bob builds a commit carrying `proposal` with his rules switched off.
 fn unchecked_commit(t: &mut OneToOne, proposal: StagedProposal) -> Vec<u8> {
     SEND_UNCHECKED.with(|c| c.set(true));
-    t.bob
-        .staged
-        .entry(t.group.clone())
-        .or_default()
-        .push(proposal);
+    let epoch = t.bob.group_epoch(&t.group).unwrap();
+    t.bob.stage(&t.group, epoch, proposal);
     let built = t.bob.commit_pending(&t.group);
     SEND_UNCHECKED.with(|c| c.set(false));
     built.unwrap().commit
@@ -158,11 +155,12 @@ fn a_one_to_one_never_becomes_a_group() {
 #[test]
 fn an_honest_sender_cannot_build_group_extensions_into_a_one_to_one() {
     let mut t = one_to_one();
-    t.bob
-        .staged
-        .entry(t.group.clone())
-        .or_default()
-        .push(StagedProposal::Extensions(naming_bob_admin()));
+    let epoch = t.bob.group_epoch(&t.group).unwrap();
+    t.bob.stage(
+        &t.group,
+        epoch,
+        StagedProposal::Extensions(naming_bob_admin()),
+    );
     assert!(t.bob.commit_pending(&t.group).is_err());
 }
 
@@ -293,15 +291,13 @@ fn with_an_extra_extension(g: &Group) -> ExtensionList {
 #[test]
 fn only_an_admin_changes_the_groups_other_extensions() {
     let mut g = three();
-    let id = g.id.clone();
     let extra = with_an_extra_extension(&g);
+    // Stages into the group under test: each `three()` is a new group.
     let stage = |g: &mut Group, who: &str, list: &ExtensionList| {
-        g.get(who)
-            .engine
-            .staged
-            .entry(id.clone())
-            .or_default()
-            .push(StagedProposal::RawExtensions(list.clone()));
+        let id = g.id.clone();
+        let engine = &mut g.get(who).engine;
+        let epoch = engine.group_epoch(&id).unwrap();
+        engine.stage(&id, epoch, StagedProposal::RawExtensions(list.clone()));
     };
     stage(&mut g, "ben", &extra);
     rule_error(g.commit("ben"), GroupRule::ChangeOtherExtensions);
@@ -312,6 +308,10 @@ fn only_an_admin_changes_the_groups_other_extensions() {
     let extra = with_an_extra_extension(&g);
     stage(&mut g, "ana", &extra);
     assert!(g.commit("ana").is_ok(), "an admin may");
+    assert!(
+        g.extensions().to_list().is_ok(),
+        "the group still reads after the admin's change"
+    );
 }
 
 #[test]

@@ -317,6 +317,65 @@ fn an_aborted_commit_leaves_the_group_where_it_was() {
     assert_eq!(alice.engine().group_epoch(&group).unwrap(), before);
 }
 
+/// A batch is staged all or nothing: when one of its items is refused, the
+/// ones before it are not carried out by the next commit.
+#[test]
+fn a_refused_batch_leaves_nothing_staged() {
+    let a = Device::new("alice.example", 31);
+    let b = Device::new("bob.example", 32);
+    let c = Device::new("alice.example", 33);
+    let d = Device::new("alice.example", 34);
+    let mut alice = a.open();
+    let mut bob = b.open();
+    let mut carol = c.open();
+    let dave = d.open();
+    let kp = bob.key_packages(1).unwrap().remove(0);
+    let out = alice
+        .establish("conv", "bob.example", &kp, &text("x"), "alice.example")
+        .unwrap();
+    bob.process(&deliver(&out[0], "alice.example", "conv-b"));
+    let carol_kp = carol.key_packages(1).unwrap().remove(0);
+    let prepared = alice.prepare_add("conv", &[carol_kp]).unwrap();
+    alice.confirm_commit("conv").unwrap();
+    bob.process(&deliver(&prepared.commit, "alice.example", "conv-b"));
+    carol.process(&deliver(
+        &prepared.welcome.unwrap(),
+        "alice.example",
+        "conv",
+    ));
+    let group = alice.directory().group_for("conv").unwrap();
+
+    // A removal whose second identity names nobody.
+    let carol_identity = alice
+        .engine()
+        .group_members(&group)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.identity)
+        .find(|id| id.ends_with(b"device-33"))
+        .unwrap();
+    assert!(
+        alice
+            .prepare_remove("conv", &[carol_identity, b"nobody".to_vec()])
+            .is_err()
+    );
+    // An add whose second package is not one.
+    let dave_kp = dave.key_packages(1).unwrap().remove(0);
+    assert!(
+        alice
+            .prepare_add("conv", &[dave_kp, b"not a key package".to_vec()])
+            .is_err()
+    );
+
+    let next = alice.engine_mut().commit_pending(&group).unwrap();
+    assert!(
+        next.removed.is_empty(),
+        "part of a refused removal was committed"
+    );
+    assert!(next.added.is_empty(), "part of a refused add was committed");
+    alice.abort_commit("conv").unwrap();
+}
+
 #[test]
 fn kinds_this_client_does_not_handle_are_acknowledged() {
     let a = Device::new("alice.example", 31);
