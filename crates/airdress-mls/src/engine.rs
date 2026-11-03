@@ -304,12 +304,11 @@ pub struct MlsEngine {
     /// through, so the engine can ask which epochs survived the
     /// retention trim (SPEC-061 FR-22) without decoding the record.
     groups: SealedGroupStore,
-    /// Groups carrying a commit that has been applied in memory and
-    /// deliberately NOT persisted, awaiting
-    /// [`MlsEngine::confirm_commit`] or [`MlsEngine::abort_commit`]
-    /// (SPEC-061 FR-7). See the two-phase note on
-    /// [`MlsEngine::commit_pending`].
-    pending: std::collections::HashMap<Vec<u8>, Group<MlsConfig>>,
+    /// Groups carrying a commit that has been built and deliberately
+    /// NOT persisted, awaiting [`MlsEngine::confirm_commit`] or
+    /// [`MlsEngine::abort_commit`] (SPEC-061 FR-7). See the two-phase
+    /// note on [`MlsEngine::commit_pending`].
+    pending: std::collections::HashMap<Vec<u8>, HeldCommit>,
     /// Proposals staged for this group's next commit, held **by
     /// value** so the commit is the only thing that has to reach the
     /// group (design §6.1: one `mls_commit` envelope, no proposal
@@ -322,7 +321,35 @@ pub struct MlsEngine {
     /// held by reference, through
     /// [`MlsEngine::process_proposal`](Self::process_proposal); this
     /// map is only for proposals this device originates.
-    staged: std::collections::HashMap<Vec<u8>, Vec<StagedProposal>>,
+    staged: std::collections::HashMap<Vec<u8>, StagedBatch>,
+}
+
+/// A commit built by [`MlsEngine::commit_pending`] and held for the
+/// operator's answer: the secrets of the epoch it creates, not a copy of
+/// the group.
+///
+/// Holding the whole group would freeze the old epoch's secret tree as it
+/// stood when the commit was built. Messages decrypted while the commit
+/// waits consume keys of that epoch on disk, and writing the frozen copy
+/// back at confirmation would restore them. Confirmation instead applies
+/// these secrets to the group as it is on disk then.
+struct HeldCommit {
+    /// The epoch the commit was built from.
+    from_epoch: u64,
+    secrets: mls_rs::group::CommitSecrets,
+}
+
+/// The proposals staged for one group, and the epoch they were staged
+/// at: the oldest, when more than one.
+///
+/// A `Remove` names a leaf index, and a leaf index names a member only
+/// within one epoch: another member's commit can empty that leaf and put
+/// someone new in it. So a batch staged at an earlier epoch is never
+/// committed; [`MlsEngine::commit_pending`] refuses it and drops it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StagedBatch {
+    epoch: u64,
+    proposals: Vec<StagedProposal>,
 }
 
 /// A proposal this device originated, waiting to be folded into its
@@ -1050,12 +1077,32 @@ impl MlsEngine {
         MlsMessage::from_bytes(key_package).map_err(|e| format!("bad kp: {e}"))?;
         // Refuse now if the group is not ours, rather than at commit
         // time when the caller has forgotten why it staged this.
-        self.load_group(group_id)?;
+        let epoch = self.load_group(group_id)?.current_epoch();
+        self.stage(group_id, epoch, StagedProposal::Add(key_package.to_vec()));
+        Ok(())
+    }
+
+    /// Add a proposal to the group's staged batch, which keeps the epoch
+    /// of its oldest member (see [`StagedBatch`]).
+    fn stage(&mut self, group_id: &[u8], epoch: u64, proposal: StagedProposal) {
         self.staged
             .entry(group_id.to_vec())
-            .or_default()
-            .push(StagedProposal::Add(key_package.to_vec()));
-        Ok(())
+            .or_insert_with(|| StagedBatch {
+                epoch,
+                proposals: Vec::new(),
+            })
+            .proposals
+            .push(proposal);
+    }
+
+    /// Drop every proposal staged for this group without committing.
+    ///
+    /// A caller staging several proposals for one commit calls this when
+    /// one of them is refused, so the next commit on the group carries
+    /// none of the batch rather than the part staged before the refusal.
+    /// Discarding nothing is not an error.
+    pub fn discard_staged(&mut self, group_id: &[u8]) {
+        self.staged.remove(group_id);
     }
 
     /// Stage a `Remove` of the leaf at `index` for this group's next
@@ -1086,11 +1133,9 @@ impl MlsEngine {
     pub fn propose_remove(&mut self, group_id: &[u8], index: u32) -> Result<(), String> {
         let group = self.load_group(group_id)?;
         self.refuse_unauthorised_removal(&group, index)?;
+        let epoch = group.current_epoch();
         drop(group);
-        self.staged
-            .entry(group_id.to_vec())
-            .or_default()
-            .push(StagedProposal::Remove(index));
+        self.stage(group_id, epoch, StagedProposal::Remove(index));
         Ok(())
     }
 
@@ -1230,16 +1275,36 @@ impl MlsEngine {
     /// fresh read of the tree on its next pass, which is the same
     /// contract `abort_commit` already gives it.
     ///
+    /// ## Proposals staged at an earlier epoch are not carried out
+    ///
+    /// A staged `Remove` names a leaf index, which is only meaningful in
+    /// the epoch the removal was checked against. If the group has moved
+    /// on since (another member's commit was processed), the batch is
+    /// refused and dropped, and the caller proposes again from a fresh
+    /// read of the tree.
+    ///
     /// # Errors
     ///
     /// The group is unknown, a commit is already awaiting
-    /// confirmation, or `mls-rs` refuses the commit.
+    /// confirmation, the staged proposals were made at another epoch, or
+    /// `mls-rs` refuses the commit.
     pub fn commit_pending(&mut self, group_id: &[u8]) -> Result<CommitOutcome, String> {
         if self.pending.contains_key(group_id) {
             return Err("a commit for this group is already awaiting confirmation".to_owned());
         }
-        let staged = self.staged.remove(group_id).unwrap_or_default();
+        let staged = self.staged.remove(group_id);
         let mut group = self.load_group(group_id)?;
+        let from_epoch = group.current_epoch();
+        if let Some(batch) = &staged
+            && batch.epoch != from_epoch
+        {
+            return Err(format!(
+                "the proposals staged for this group were made at epoch {}, and it is now at \
+                 epoch {from_epoch}; they were dropped, propose them again",
+                batch.epoch
+            ));
+        }
+        let staged = staged.map(|b| b.proposals).unwrap_or_default();
         let before = self.identity_set(&group)?;
         let mut builder = group.commit_builder();
         for proposal in &staged {
@@ -1262,9 +1327,14 @@ impl MlsEngine {
                     .map_err(|e| format!("group extensions: {e}"))?,
             };
         }
-        let output = builder.build().map_err(|e| format!("commit: {e}"))?;
+        // Detached: the secrets of the new epoch are held apart from the
+        // group, and applied here only to this copy, which is never
+        // written, to read the outcome.
+        let (output, secrets) = builder
+            .build_detached()
+            .map_err(|e| format!("commit: {e}"))?;
         group
-            .apply_pending_commit()
+            .apply_detached_commit(secrets.clone())
             .map_err(|e| format!("apply: {e}"))?;
         let commit = output
             .commit_message
@@ -1288,22 +1358,47 @@ impl MlsEngine {
             self_removed: false,
             members: after.0,
         };
-        self.pending.insert(group_id.to_vec(), group);
+        self.pending.insert(
+            group_id.to_vec(),
+            HeldCommit {
+                from_epoch,
+                secrets,
+            },
+        );
         Ok(outcome)
     }
 
     /// Persist a commit built by [`MlsEngine::commit_pending`], after
     /// the operator has accepted it.
     ///
+    /// The commit is applied to the group as it is on disk now, not as it
+    /// was when the commit was built: a message decrypted in between has
+    /// used its key, and that key stays gone. Messages of the old epoch
+    /// keep decrypting while the commit waits, and after it, from the
+    /// retained epochs.
+    ///
     /// # Errors
     ///
-    /// No commit is awaiting confirmation for this group, or the
-    /// sealed store refuses the write.
+    /// No commit is awaiting confirmation for this group, the group has
+    /// moved past the epoch the commit was built from (the held commit is
+    /// dropped), or the sealed store refuses the write.
     pub fn confirm_commit(&mut self, group_id: &[u8]) -> Result<u64, String> {
-        let mut group = self
+        let held = self
             .pending
             .remove(group_id)
             .ok_or("no commit is awaiting confirmation for this group")?;
+        let mut group = self.load_group(group_id)?;
+        if group.current_epoch() != held.from_epoch {
+            return Err(format!(
+                "the group moved to epoch {} after this commit was built from epoch {}; it \
+                 was dropped",
+                group.current_epoch(),
+                held.from_epoch
+            ));
+        }
+        group
+            .apply_detached_commit(held.secrets)
+            .map_err(|e| format!("apply: {e}"))?;
         group
             .write_to_storage()
             .map_err(|e| format!("persist group: {e}"))?;
@@ -1319,18 +1414,22 @@ impl MlsEngine {
     /// not an undo: `mls-rs` has no undo, and a hand-rolled one would
     /// be wrong in a way that only surfaces under concurrency.
     ///
+    /// Staged proposals are dropped too, even when no commit was
+    /// pending: a caller that aborts after one of a batch was refused
+    /// must not leave the rest for the next commit.
+    ///
     /// # Errors
     ///
     /// No commit was awaiting confirmation for this group.
     pub fn abort_commit(&mut self, group_id: &[u8]) -> Result<u64, String> {
-        self.pending
-            .remove(group_id)
-            .ok_or("no commit is awaiting confirmation for this group")?;
-        // Staged proposals are dropped too. A retry after catch-up
+        // Staged proposals are dropped first. A retry after catch-up
         // re-proposes: leaf indices can have moved under the commit
         // that won, so replaying the old ones would remove the wrong
         // member (design §6.3).
         self.staged.remove(group_id);
+        self.pending
+            .remove(group_id)
+            .ok_or("no commit is awaiting confirmation for this group")?;
         // Prove the reload works rather than asserting it: the caller
         // is about to use this group again.
         let group = self.load_group(group_id)?;

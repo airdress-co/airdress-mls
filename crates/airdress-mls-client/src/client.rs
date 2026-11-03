@@ -513,9 +513,12 @@ impl Client {
             .group_for(conversation_id)
             .ok_or(SendError::NoGroup)?;
         for kp in key_packages {
-            self.engine
-                .propose_add(&group_id, kp)
-                .map_err(SendError::Engine)?;
+            if let Err(e) = self.engine.propose_add(&group_id, kp) {
+                // All or nothing: what was staged before the refusal must
+                // not ride along on the next commit.
+                self.engine.discard_staged(&group_id);
+                return Err(SendError::Engine(e));
+            }
         }
         self.prepare(conversation_id, &group_id)
     }
@@ -540,13 +543,16 @@ impl Client {
             .group_members(&group_id)
             .map_err(SendError::Engine)?;
         for identity in identities {
-            let member = members
+            let staged = members
                 .iter()
                 .find(|m| &m.identity == identity)
-                .ok_or_else(|| SendError::Engine("no such member in this group".to_owned()))?;
-            self.engine
-                .propose_remove(&group_id, member.index)
-                .map_err(SendError::Engine)?;
+                .ok_or_else(|| "no such member in this group".to_owned())
+                .and_then(|member| self.engine.propose_remove(&group_id, member.index));
+            if let Err(e) = staged {
+                // All or nothing, as in `prepare_add`.
+                self.engine.discard_staged(&group_id);
+                return Err(SendError::Engine(e));
+            }
         }
         self.prepare(conversation_id, &group_id)
     }
