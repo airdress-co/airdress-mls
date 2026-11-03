@@ -68,7 +68,7 @@ impl Device {
         if cutover {
             engine.set_v2_cutover();
         }
-        engine.set_revocation_lookup(std::sync::Arc::new(|_: &str| {
+        engine.set_revocation_lookup(std::sync::Arc::new(|_: &str, _: &str| {
             Some(airdress_mls::credential::DeviceStatus::Active)
         }));
         // Past the cutover check 2 needs a root-key lookup too.

@@ -48,7 +48,7 @@ fn device(airdress: &str, name: &str, seed: u8, dir: &tempfile::TempDir) -> MlsE
             .contains(&a)
             .then(|| root_of(a).verifying_key().to_bytes())
     }));
-    engine.set_revocation_lookup(Arc::new(|_: &str| Some(DeviceStatus::Active)));
+    engine.set_revocation_lookup(Arc::new(|_: &str, _: &str| Some(DeviceStatus::Active)));
     engine.set_v2_cutover();
     engine
 }

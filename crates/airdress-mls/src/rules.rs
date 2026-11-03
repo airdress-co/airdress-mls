@@ -28,7 +28,7 @@
 //! the **revocation witness** holds:
 //!
 //! > the host's check-5 [`RevocationLookup`], asked for the target
-//! > leaf's `device_id`, answers [`DeviceStatus::Revoked`].
+//! > leaf's pin subject and `device_id`, answers [`DeviceStatus::Revoked`].
 //!
 //! The witness is evaluated by **each device against its own lookup**,
 //! on both directions: the committer when it builds the commit, every
@@ -294,13 +294,19 @@ pub(crate) fn authorise_removal(
 }
 
 /// Whether this device's check-5 lookup answers `Revoked` for the
-/// target's `device_id`. Every other outcome — `Active`, no answer, no
-/// lookup, no `device_id` — is "no witness".
+/// target's pin subject and `device_id`, asked together as check 5 asks
+/// them. Every other outcome — `Active`, no answer, no lookup, no
+/// `device_id`, no readable pin subject — is "no witness".
 fn revocation_witness(target: &Leaf, revocation: Option<&dyn RevocationLookup>) -> bool {
-    let (Some(revocation), Some(device_id)) = (revocation, target.device_id.as_deref()) else {
+    let (Some(revocation), Some(device_id), Ok(subject)) = (
+        revocation,
+        target.device_id.as_deref(),
+        target.pin_subject.as_deref(),
+    ) else {
         return false;
     };
-    !device_id.is_empty() && revocation.device_status(device_id) == Some(DeviceStatus::Revoked)
+    !device_id.is_empty()
+        && revocation.device_status(subject, device_id) == Some(DeviceStatus::Revoked)
 }
 
 /// [`authorise_removal`] for two signing identities: the engine's early
@@ -569,9 +575,23 @@ mod tests {
         )
     }
 
-    fn revoked(devices: &'static [&'static str]) -> impl RevocationLookup {
-        move |d: &str| {
-            Some(if devices.contains(&d) {
+    /// The pin subject a holder's leaves carry.
+    fn subject(holder: Holder) -> String {
+        match holder {
+            Holder::Owner(airdress) => airdress.to_owned(),
+            Holder::Person(person) => crate::credential::pin_subject_for_person(HOME, person),
+        }
+    }
+
+    /// A lookup answering `Revoked` for exactly the listed devices, each
+    /// named by its holder and `device_id`.
+    fn revoked(devices: &[(Holder, &str)]) -> impl RevocationLookup + use<> {
+        let set: HashSet<(String, String)> = devices
+            .iter()
+            .map(|&(holder, device)| (subject(holder), device.to_owned()))
+            .collect();
+        move |s: &str, d: &str| {
+            Some(if set.contains(&(s.to_owned(), d.to_owned())) {
                 DeviceStatus::Revoked
             } else {
                 DeviceStatus::Active
@@ -620,7 +640,7 @@ mod tests {
         let owner = Holder::Owner(HOME);
         let a = Holder::Person(PERSON_A);
         let b = Holder::Person(PERSON_B);
-        let witness = revoked(&["b1"]);
+        let witness = revoked(&[(b, "b1")]);
         for by in [identity(owner, "o1"), identity(a, "a1")] {
             assert_eq!(
                 check_removal(&by, &identity(b, "b1"), Some(&witness)),
@@ -635,11 +655,32 @@ mod tests {
         }
     }
 
+    /// A `device_id` is unique only under one person: two persons may
+    /// both name a device `phone-1`, and revoking one of them leaves the
+    /// other live.
+    #[test]
+    fn a_revoked_device_id_witnesses_only_for_its_own_person() {
+        let owner = Holder::Owner(HOME);
+        let a = Holder::Person(PERSON_A);
+        let b = Holder::Person(PERSON_B);
+        let witness = revoked(&[(b, "phone-1")]);
+        let by = identity(owner, "o1");
+        assert_eq!(
+            check_removal(&by, &identity(b, "phone-1"), Some(&witness)),
+            Ok(())
+        );
+        assert!(is_cross_person(&check_removal(
+            &by,
+            &identity(a, "phone-1"),
+            Some(&witness)
+        )));
+    }
+
     #[test]
     fn a_member_never_removes_an_owner_device_even_a_revoked_one() {
         let owner = Holder::Owner(HOME);
         let a = Holder::Person(PERSON_A);
-        let witness = revoked(&["o2"]);
+        let witness = revoked(&[(owner, "o2")]);
         assert!(is_cross_person(&check_removal(
             &identity(a, "a1"),
             &identity(owner, "o2"),
@@ -660,7 +701,7 @@ mod tests {
     fn no_answer_is_no_witness() {
         let owner = Holder::Owner(HOME);
         let b = Holder::Person(PERSON_B);
-        let unknown = |_: &str| -> Option<DeviceStatus> { None };
+        let unknown = |_: &str, _: &str| -> Option<DeviceStatus> { None };
         assert!(is_cross_person(&check_removal(
             &identity(owner, "o1"),
             &identity(b, "b1"),
@@ -672,7 +713,7 @@ mod tests {
     fn the_revoked_exception_never_crosses_an_airdress() {
         let stranger = Holder::Owner(ELSEWHERE);
         let b = Holder::Person(PERSON_B);
-        let witness = revoked(&["b1"]);
+        let witness = revoked(&[(b, "b1")]);
         assert_eq!(
             check_removal(
                 &identity(stranger, "x1"),
@@ -692,7 +733,7 @@ mod tests {
     fn without_a_person_leaf_the_rule_is_per_airdress_as_before() {
         let owner = Holder::Owner(HOME);
         let stranger = Holder::Owner(ELSEWHERE);
-        let witness = revoked(&["o2", "x1"]);
+        let witness = revoked(&[(owner, "o2"), (stranger, "x1")]);
         let root = SigningKey::from_bytes(&[3u8; 32]);
         let v1_json = signed_delegation_json(&root, HOME, &[5u8; 32]);
         let serde_json::Value::Object(map) = serde_json::from_str(&v1_json).unwrap() else {
@@ -745,7 +786,7 @@ mod tests {
     struct Device {
         name: &'static str,
         engine: MlsEngine,
-        revoked: Arc<Mutex<HashSet<String>>>,
+        revoked: Arc<Mutex<HashSet<(String, String)>>>,
         _dir: tempfile::TempDir,
     }
 
@@ -766,12 +807,14 @@ mod tests {
             .unwrap();
             let revoked = Arc::new(Mutex::new(HashSet::new()));
             let view = Arc::clone(&revoked);
-            engine.set_revocation_lookup(Arc::new(move |d: &str| {
-                Some(if view.lock().unwrap().contains(d) {
-                    DeviceStatus::Revoked
-                } else {
-                    DeviceStatus::Active
-                })
+            engine.set_revocation_lookup(Arc::new(move |s: &str, d: &str| {
+                Some(
+                    if view.lock().unwrap().contains(&(s.to_owned(), d.to_owned())) {
+                        DeviceStatus::Revoked
+                    } else {
+                        DeviceStatus::Active
+                    },
+                )
             }));
             Self {
                 name,
@@ -781,9 +824,12 @@ mod tests {
             }
         }
 
-        /// This device's host learns that `device` is revoked.
-        fn learns_revoked(&self, device: &str) {
-            self.revoked.lock().unwrap().insert(device.to_owned());
+        /// This device's host learns that `holder`'s `device` is revoked.
+        fn learns_revoked(&self, holder: Holder, device: &str) {
+            self.revoked
+                .lock()
+                .unwrap()
+                .insert((subject(holder), device.to_owned()));
         }
     }
 
@@ -874,7 +920,7 @@ mod tests {
         let index = index_of(&devices, &group_id, "o2");
         // Even with its own host claiming the owner device is revoked.
         let a1 = device(&mut devices, "a1");
-        a1.learns_revoked("o2");
+        a1.learns_revoked(Holder::Owner(HOME), "o2");
         assert_eq!(
             a1.engine.propose_remove(&group_id, index),
             Err(CROSS_PERSON.to_owned())
@@ -899,7 +945,7 @@ mod tests {
         for committer in ["o1", "a1"] {
             let (mut devices, group_id) = household();
             for d in &devices {
-                d.learns_revoked("b1");
+                d.learns_revoked(Holder::Person(PERSON_B), "b1");
             }
             remove(&mut devices, &group_id, committer, "b1");
         }
@@ -914,7 +960,7 @@ mod tests {
         let (mut devices, group_id) = household();
         let index = index_of(&devices, &group_id, "b1");
         let o1 = device(&mut devices, "o1");
-        o1.learns_revoked("b1"); // Stale, or a lie: nobody else agrees.
+        o1.learns_revoked(Holder::Person(PERSON_B), "b1"); // Stale, or a lie: nobody else agrees.
         o1.engine.propose_remove(&group_id, index).unwrap();
         let commit = o1.engine.commit_pending(&group_id).unwrap().commit;
         o1.engine.confirm_commit(&group_id).unwrap();
@@ -931,9 +977,80 @@ mod tests {
 
         // The receiver's host refreshes its revocation state: the
         // operator did revoke it after all. The same commit applies.
-        a1.learns_revoked("b1");
+        a1.learns_revoked(Holder::Person(PERSON_B), "b1");
         let outcome = a1.engine.process_commit(&group_id, &commit).unwrap();
         assert_eq!(outcome.removed.len(), 1);
+    }
+
+    /// Two persons each hold a `phone-1` in one group. Every device has
+    /// heard that person A's `phone-1` is revoked: it is removable, and
+    /// person B's `phone-1` is not, neither when building a commit nor
+    /// when receiving one.
+    #[test]
+    fn in_a_household_group_a_shared_device_id_is_revoked_per_person() {
+        let a = Holder::Person(PERSON_A);
+        let b = Holder::Person(PERSON_B);
+        let mut devices = vec![
+            Device::new(Holder::Owner(HOME), "o1", 31),
+            Device::new(Holder::Owner(HOME), "o2", 32),
+            Device::new(a, "phone-1", 33),
+            Device::new(b, "phone-1", 34),
+        ];
+        let group_id = group(&mut devices);
+        for d in &devices {
+            d.learns_revoked(a, "phone-1");
+        }
+        let index_of_holder = |devices: &[Device], holder: Holder| {
+            let wanted = [subject(holder).as_bytes(), &[0x1F_u8], b"phone-1"].concat();
+            devices[0]
+                .engine
+                .group_members(&group_id)
+                .unwrap()
+                .into_iter()
+                .find(|m| m.identity == wanted)
+                .unwrap()
+                .index
+        };
+
+        // Building: person B's phone-1 is not removable.
+        let b_index = index_of_holder(&devices, b);
+        assert_eq!(
+            devices[0].engine.propose_remove(&group_id, b_index),
+            Err(CROSS_PERSON.to_owned())
+        );
+
+        // Person A's is, and every remaining device applies it.
+        let a_index = index_of_holder(&devices, a);
+        devices[0]
+            .engine
+            .propose_remove(&group_id, a_index)
+            .unwrap();
+        let commit = devices[0].engine.commit_pending(&group_id).unwrap().commit;
+        devices[0].engine.confirm_commit(&group_id).unwrap();
+        for peer in [1, 3] {
+            let outcome = devices[peer]
+                .engine
+                .process_commit(&group_id, &commit)
+                .unwrap();
+            assert_eq!(outcome.removed.len(), 1);
+        }
+
+        // Receiving: o1's host also holds person B's phone-1 revoked; o2's
+        // does not, and refuses the commit removing it.
+        devices[0].learns_revoked(b, "phone-1");
+        let b_index = index_of_holder(&devices, b);
+        devices[0]
+            .engine
+            .propose_remove(&group_id, b_index)
+            .unwrap();
+        let commit = devices[0].engine.commit_pending(&group_id).unwrap().commit;
+        devices[0].engine.confirm_commit(&group_id).unwrap();
+        let err = devices[1]
+            .engine
+            .process_commit(&group_id, &commit)
+            .expect_err("person B's phone-1 is live on o2")
+            .to_string();
+        assert!(err.contains(CROSS_PERSON), "{err}");
     }
 
     /// A `v: 2` group across two airdresses, as before persons existed:
@@ -948,7 +1065,7 @@ mod tests {
         let group_id = group(&mut devices);
         let index = index_of(&devices, &group_id, "o2");
         let x1 = device(&mut devices, "x1");
-        x1.learns_revoked("o2");
+        x1.learns_revoked(Holder::Owner(HOME), "o2");
         assert_eq!(
             x1.engine.propose_remove(&group_id, index),
             Err("only a device of the same airdress may remove that airdress's devices".to_owned())

@@ -472,8 +472,9 @@ pub unsafe extern "C" fn airdress_mls_create_engine_from_seed(
 /// public key its cache holds for that subject (24h TTL, populated at
 /// first contact), or 0 when it has none — which rejects the peer's
 /// leaf. A host that does not resolve person roots returns 0 for any
-/// subject containing 0x1F. The callback must be thread-safe and must
-/// not call back into this library.
+/// subject containing 0x1F. The callback runs under contract 4: on the
+/// calling thread, from the isolate that registered it, and never
+/// calling back into this library.
 pub type AirdressRootKeyLookupFn =
     extern "C" fn(airdress: *const c_char, out_root_public_key: *mut u8) -> i32;
 
@@ -522,18 +523,34 @@ pub unsafe extern "C" fn airdress_mls_set_root_key_lookup(
 /// Host callback answering "is this device revoked?" (SPEC-061
 /// FR-19, check 5).
 ///
+/// Called with two NUL-terminated UTF-8 strings: the leaf's pin
+/// subject, exactly as [`AirdressRootKeyLookupFn`] receives it for the
+/// same leaf (the bare airdress for an owner's device,
+/// `airdress ‖ 0x1F ‖ person_id` for another person's), and the
+/// device's `device_id`. A `device_id` is unique only under one pin
+/// subject — two persons of one airdress may both hold a `phone-1` — so
+/// the host keys its revocation state by the pair and answers for that
+/// pair alone.
+///
 /// Return `1` for an active device, `0` for a revoked one, and
 /// anything else — conventionally `-1` — for "cannot answer", which
-/// REJECTS the leaf. The callback must be thread-safe and must not
-/// call back into this library.
-pub type AirdressRevocationLookupFn = extern "C" fn(device_id: *const c_char) -> i32;
+/// REJECTS the leaf. The callback runs under contract 4: on the
+/// calling thread, from the isolate that registered it, and never
+/// calling back into this library.
+pub type AirdressRevocationLookupFn =
+    extern "C" fn(subject: *const c_char, device_id: *const c_char) -> i32;
 
 struct CallbackRevocationLookup(AirdressRevocationLookupFn);
 
 impl airdress_mls::credential::RevocationLookup for CallbackRevocationLookup {
-    fn device_status(&self, device_id: &str) -> Option<airdress_mls::credential::DeviceStatus> {
+    fn device_status(
+        &self,
+        subject: &str,
+        device_id: &str,
+    ) -> Option<airdress_mls::credential::DeviceStatus> {
+        let c_subject = std::ffi::CString::new(subject).ok()?;
         let c_device_id = std::ffi::CString::new(device_id).ok()?;
-        match (self.0)(c_device_id.as_ptr()) {
+        match (self.0)(c_subject.as_ptr(), c_device_id.as_ptr()) {
             1 => Some(airdress_mls::credential::DeviceStatus::Active),
             0 => Some(airdress_mls::credential::DeviceStatus::Revoked),
             // Unknown answers are "cannot answer", not "fine" — the
@@ -2229,7 +2246,10 @@ mod tests {
 
     /// The revocation lookup the test engines register: every device
     /// is active.
-    extern "C" fn every_device_active(_device_id: *const std::os::raw::c_char) -> i32 {
+    extern "C" fn every_device_active(
+        _subject: *const std::os::raw::c_char,
+        _device_id: *const std::os::raw::c_char,
+    ) -> i32 {
         1
     }
 
@@ -2615,6 +2635,82 @@ mod tests {
             airdress_mls_process_welcome(member.id, started.welcome.as_ptr(), started.welcome.len())
         })
         .expect("the member joins");
+    }
+
+    /// `(pin subject, device_id)` pairs the test's revocation callback
+    /// answers revoked, and the pairs it was asked for.
+    static REVOKED_PAIRS: std::sync::Mutex<Vec<(String, String)>> =
+        std::sync::Mutex::new(Vec::new());
+    static ASKED_PAIRS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+    /// A host's revocation state keyed as the C ABI asks it: by pin
+    /// subject and `device_id` together.
+    extern "C" fn pair_table_revocation(
+        subject: *const std::os::raw::c_char,
+        device_id: *const std::os::raw::c_char,
+    ) -> i32 {
+        // SAFETY: the library passes two live NUL-terminated strings.
+        let pair = unsafe {
+            (
+                CStr::from_ptr(subject).to_string_lossy().into_owned(),
+                CStr::from_ptr(device_id).to_string_lossy().into_owned(),
+            )
+        };
+        let revoked = REVOKED_PAIRS.lock().unwrap().contains(&pair);
+        ASKED_PAIRS.lock().unwrap().push(pair);
+        i32::from(!revoked)
+    }
+
+    /// The revocation callback receives the leaf's pin subject with its
+    /// `device_id`, so a host's answer for one subject's `phone-1` never
+    /// decides another subject's `phone-1`.
+    #[test]
+    fn the_revocation_callback_is_asked_for_the_subject_and_the_device_id() {
+        let alice = engine(ALICE, 0x61, "alice-desk", true);
+        let bob = engine(BOB, 0x62, "phone-1", true);
+        assert_eq!(
+            // SAFETY: a plain function, callable for the life of the
+            // process, that never calls back into the library.
+            unsafe {
+                super::airdress_mls_set_revocation_lookup(alice.id, Some(pair_table_revocation))
+            },
+            0
+        );
+        let c_bob = CString::new(BOB).unwrap();
+        let start = |kp: &[u8]| {
+            // SAFETY: live local buffers and C strings, each with its own
+            // length, outliving the call; the result is freed by take_start.
+            take_start(unsafe {
+                airdress_mls_start_group_bound(
+                    alice.id,
+                    kp.as_ptr(),
+                    kp.len(),
+                    b"hello".as_ptr(),
+                    b"hello".len(),
+                    c_bob.as_ptr(),
+                )
+            })
+        };
+
+        // Another subject's phone-1 is revoked: Bob's is not.
+        REVOKED_PAIRS
+            .lock()
+            .unwrap()
+            .push((ALICE.to_owned(), "phone-1".to_owned()));
+        start(&key_package(&bob)).expect("Bob's phone-1 is live");
+        assert!(
+            ASKED_PAIRS
+                .lock()
+                .unwrap()
+                .contains(&(BOB.to_owned(), "phone-1".to_owned()))
+        );
+
+        // Bob's own phone-1 revoked: refused.
+        REVOKED_PAIRS
+            .lock()
+            .unwrap()
+            .push((BOB.to_owned(), "phone-1".to_owned()));
+        assert!(start(&key_package(&bob)).is_err());
     }
 
     /// **SPEC-061 task 7.2 — the self thread of a single-device owner.**
