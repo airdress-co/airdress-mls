@@ -176,7 +176,7 @@ pub enum SendError {
     AlreadyEstablished,
     /// The engine refused.
     Engine(String),
-    /// The directory could not be written.
+    /// The directory, or the engine's state, could not be written.
     Storage(String),
 }
 
@@ -186,7 +186,7 @@ impl core::fmt::Display for SendError {
             Self::NoGroup => f.write_str("this conversation has no group on this device yet"),
             Self::AlreadyEstablished => f.write_str("this conversation already has a group"),
             Self::Engine(e) => write!(f, "the MLS engine refused: {e}"),
-            Self::Storage(e) => write!(f, "the directory could not be written: {e}"),
+            Self::Storage(e) => write!(f, "this device's state could not be written: {e}"),
         }
     }
 }
@@ -793,15 +793,18 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// No group or no held commit.
+    /// No group or no held commit; [`SendError::Storage`] when the new
+    /// state could not be written, in which case the commit stays held
+    /// and the same call succeeds once storage does.
     pub fn confirm_commit(&mut self, conversation_id: &str) -> Result<u64, SendError> {
         let group_id = self
             .directory
             .group_for(conversation_id)
             .ok_or(SendError::NoGroup)?;
-        self.engine
-            .confirm_commit(&group_id)
-            .map_err(SendError::Engine)
+        self.engine.confirm_commit(&group_id).map_err(|e| match e {
+            EngineError::Storage(e) => SendError::Storage(e),
+            other => SendError::Engine(other.to_string()),
+        })
     }
 
     /// The operator refused the held commit: drop it.

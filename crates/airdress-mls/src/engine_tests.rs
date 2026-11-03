@@ -185,6 +185,39 @@ fn a_commit_built_before_the_group_moved_on_is_not_confirmed() {
     );
 }
 
+/// A held commit whose confirmation could not be written stays held, and
+/// confirms once storage takes the write: the operator has accepted it,
+/// and the held commit is the only copy of the new epoch's secrets.
+#[test]
+fn a_commit_whose_confirmation_could_not_be_written_stays_held() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (mut phone, mut bob, group) = pair(&dirs);
+    let held = phone.commit_pending(&group).unwrap();
+
+    let groups = dirs[0].path().join("groups");
+    std::fs::set_permissions(&groups, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let refused = phone.confirm_commit(&group);
+    std::fs::set_permissions(&groups, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        matches!(refused, Err(super::EngineError::Storage(_))),
+        "{refused:?}"
+    );
+    assert_eq!(phone.group_epoch(&group), Some(held.epoch - 1));
+    assert!(
+        phone.commit_pending(&group).is_err(),
+        "the commit is still awaiting confirmation"
+    );
+
+    assert_eq!(phone.confirm_commit(&group).unwrap(), held.epoch);
+    bob.process_commit(&group, &held.commit).unwrap();
+    let message = bob.encrypt(&group, b"in the new epoch", BOB).unwrap();
+    assert_eq!(
+        phone.decrypt(&group, &message, BOB).unwrap(),
+        b"in the new epoch"
+    );
+}
+
 #[test]
 fn aborting_with_no_commit_pending_still_drops_what_was_staged() {
     let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();

@@ -1609,7 +1609,8 @@ pub unsafe extern "C" fn airdress_mls_commit_pending(
 /// Persist a commit built by `airdress_mls_commit_pending` (phase two).
 /// Returns the resulting epoch, `-1` for an invalid handle, `-2` when
 /// no commit was awaiting confirmation, the write failed, the group id
-/// was refused, or an internal error happened.
+/// was refused, or an internal error happened. A failed write keeps the
+/// commit held: call this again once storage is writable.
 ///
 /// # Safety
 ///
