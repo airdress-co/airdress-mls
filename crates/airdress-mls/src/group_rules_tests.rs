@@ -11,7 +11,7 @@
 
 use ed25519_dalek::SigningKey;
 
-use super::{GroupRule, LEAF_CAP, PERSON_CAP, SEND_UNCHECKED};
+use super::{GroupRule, LEAF_CAP, PERSON_CAP, ROLES_UNCHECKED, SEND_UNCHECKED};
 use crate::credential::test_support::signed_delegation_json_v2;
 use crate::engine::{MlsEngine, message_epoch};
 use crate::group_context::{
@@ -411,6 +411,76 @@ fn a_removed_admin_is_not_an_admin_when_added_back() {
         .collect();
     assert!(pins.iter().any(|p| p == BEN), "{pins:?}");
     assert_eq!(g.extensions().roles.admins, [ANA]);
+}
+
+/// Roles an earlier release left naming an admin who is gone: Ana and Ben
+/// are admins, and Ben was removed by a commit that kept him on the roles.
+fn with_a_departed_admin_still_named() -> Group {
+    let mut g = three();
+    let id = g.id.clone();
+    let mut two_admins = g.extensions();
+    two_admins.roles.admins.push(BEN.into());
+    two_admins.roles.join_order = vec![ANA.into(), BEN.into(), CLEO.into()];
+    g.get("ana")
+        .engine
+        .propose_extensions(&id, two_admins)
+        .unwrap();
+    g.commit("ana").unwrap();
+    ROLES_UNCHECKED.with(|c| c.set(true));
+    let ben = g.index_of("ben");
+    g.get("ana").engine.propose_remove(&id, ben).unwrap();
+    let removed = g.commit("ana");
+    ROLES_UNCHECKED.with(|c| c.set(false));
+    removed.unwrap();
+    g.devices.retain(|d| d.name != "ben");
+    assert_eq!(g.extensions().roles.admins, [ANA, BEN]);
+    g
+}
+
+#[test]
+fn a_group_whose_roles_name_a_departed_admin_still_takes_commits() {
+    let mut g = with_a_departed_admin_still_named();
+    let id = g.id.clone();
+
+    // A key rotation from a client that adds no roles change.
+    let epoch = g.epoch("ana");
+    SEND_UNCHECKED.with(|c| c.set(true));
+    let built = g.get("cleo").engine.commit_pending(&id);
+    SEND_UNCHECKED.with(|c| c.set(false));
+    let rotation = built.unwrap().commit;
+    g.get("cleo").engine.confirm_commit(&id).unwrap();
+    g.get("ana").engine.process_commit(&id, &rotation).unwrap();
+    assert_eq!(g.epoch("ana"), epoch + 1);
+
+    // An admin's title change, and a member's key rotation, honestly.
+    let mut retitled = g.extensions();
+    retitled.profile.title = "Ski trip 2".into();
+    g.get("ana")
+        .engine
+        .propose_extensions(&id, retitled)
+        .unwrap();
+    g.commit("ana").unwrap();
+    g.commit("cleo").unwrap();
+    assert_eq!(g.extensions().profile.title, "Ski trip 2");
+}
+
+#[test]
+fn a_departed_admin_still_named_comes_back_as_a_member() {
+    let mut g = with_a_departed_admin_still_named();
+    let id = g.id.clone();
+    let back = Device::new(BEN, "ben-again", 7);
+    let kp = back.engine.generate_key_package().unwrap();
+    g.get("ana").engine.propose_add(&id, &kp).unwrap();
+    g.commit("ana").unwrap();
+    assert_eq!(g.extensions().roles.admins, [ANA]);
+
+    // Adding him back without taking him off the roles is refused.
+    let mut g = with_a_departed_admin_still_named();
+    let id = g.id.clone();
+    let back = Device::new(BEN, "ben-again", 7);
+    let kp = back.engine.generate_key_package().unwrap();
+    g.get("ana").engine.propose_add(&id, &kp).unwrap();
+    g.refused_everywhere("ana", GroupRule::AdminNotInGroup);
 }
 
 #[test]
