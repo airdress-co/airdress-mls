@@ -120,6 +120,10 @@ impl SealedStore {
         for sub in ["groups", "key_packages", "key_packages_public"] {
             std::fs::create_dir_all(root.join(sub))
                 .map_err(|e| StorageError(format!("create {sub} dir: {e}")))?;
+            // A write interrupted by a crash leaves its temp file, and
+            // each one holds a whole sealed item; nothing ever reads one.
+            remove_interrupted_writes(&root.join(sub), None)
+                .map_err(|e| StorageError(format!("clean {sub} dir: {e}")))?;
         }
         Ok(Self {
             root: Arc::from(root),
@@ -162,27 +166,8 @@ impl SealedStore {
             )
             .map_err(|_| StorageError("seal failed".to_owned()))?;
 
-        let final_path = self.path(sub, id);
-        let tmp_path =
-            final_path.with_extension(format!("tmp-{}-{}", std::process::id(), next_tmp_ordinal()));
-
-        let mut file = std::fs::File::create(&tmp_path)
-            .map_err(|e| StorageError(format!("create temp file: {e}")))?;
-        file.write_all(&nonce)
-            .and_then(|()| file.write_all(&ciphertext))
-            .and_then(|()| file.sync_all())
-            .map_err(|e| StorageError(format!("write temp file: {e}")))?;
-        drop(file);
-        std::fs::rename(&tmp_path, &final_path)
-            .map_err(|e| StorageError(format!("rename into place: {e}")))?;
-        // Best-effort directory fsync so the rename itself is durable.
-        if let Ok(dir) = std::fs::File::open(final_path.parent().unwrap_or_else(|| Path::new(".")))
-        {
-            // Best effort: the rename above already happened, and a
-            // filesystem without directory fsync is not an error here.
-            dir.sync_all().ok();
-        }
-        Ok(())
+        write_file_atomically(&self.path(sub, id), &[&nonce, &ciphertext])
+            .map_err(|e| StorageError(format!("write sealed file: {e}")))
     }
 
     /// Read and unseal `<sub>/<hex id>`. `Ok(None)` when absent; an
@@ -254,6 +239,111 @@ static TMP_ORDINAL: AtomicU64 = AtomicU64::new(0);
 
 fn next_tmp_ordinal() -> u64 {
     TMP_ORDINAL.fetch_add(1, Ordering::Relaxed)
+}
+
+/// What a temp file's name carries after the target's name.
+const TMP_MARKER: &str = ".tmp-";
+
+/// Write `parts`, concatenated, to `path` so that a crash leaves either
+/// the old file or the new one, never half of either.
+///
+/// The bytes go to a temp file beside `path` (`<name>.tmp-<pid>-<n>`,
+/// mode 0600 on Unix), which is fsynced and renamed into place; then the
+/// directory is fsynced so the rename itself is durable. On any error
+/// the temp file is removed, so a failed write leaves nothing behind.
+/// A temp file left by a process that died mid-write is removed by
+/// [`remove_interrupted_writes`].
+///
+/// # Errors
+///
+/// Creating, writing, syncing or renaming the temp file failed.
+pub fn write_file_atomically(path: &Path, parts: &[&[u8]]) -> std::io::Result<()> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| std::io::Error::other("target path has no UTF-8 file name"))?;
+    let tmp_path = path.with_file_name(format!(
+        "{name}{TMP_MARKER}{}-{}",
+        std::process::id(),
+        next_tmp_ordinal()
+    ));
+    // Not ours to remove if creating it fails.
+    let mut file = create_private(&tmp_path)?;
+    let written = (|| {
+        for part in parts {
+            file.write_all(part)?;
+        }
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)
+    })();
+    if let Err(e) = written {
+        // Best effort: the error being returned is the one that matters,
+        // and a temp file that cannot be removed now is removed at the
+        // next open.
+        std::fs::remove_file(&tmp_path).ok();
+        return Err(e);
+    }
+    // Best-effort directory fsync so the rename itself is durable; a
+    // filesystem without directory fsync is not an error here.
+    if let Ok(dir) = std::fs::File::open(path.parent().unwrap_or_else(|| Path::new("."))) {
+        dir.sync_all().ok();
+    }
+    Ok(())
+}
+
+/// Remove the temp files [`write_file_atomically`] leaves in `dir` when
+/// a process dies mid-write: every `*.tmp-*` file, or with `file_name`
+/// only those of that one target (`<file_name>.tmp-*`). Returns how many
+/// were removed. Run it when a store opens, before anything writes.
+///
+/// # Errors
+///
+/// `dir` cannot be listed, or a temp file in it cannot be removed.
+pub fn remove_interrupted_writes(dir: &Path, file_name: Option<&str>) -> std::io::Result<usize> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let is_temp = match file_name {
+            Some(target) => name
+                .strip_prefix(target)
+                .is_some_and(|rest| rest.starts_with(TMP_MARKER)),
+            None => name.contains(TMP_MARKER),
+        };
+        if is_temp && entry.file_type()?.is_file() {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(unix)]
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 fn parse_hex(name: &str) -> Option<Vec<u8>> {
@@ -563,9 +653,17 @@ impl SealedKeyPackageStore {
     /// storage id. The id is stable across restarts, so a host that
     /// publishes packages under it can tell which of the stored
     /// packages have already been handed out.
+    ///
+    /// Only packages whose private half is still stored are returned: a
+    /// public half without one belongs to a package already consumed.
     pub fn stored_public_with_ids(&self) -> Result<Vec<StoredItem>, StorageError> {
         let mut out = Vec::new();
+        let private: std::collections::HashSet<Vec<u8>> =
+            self.0.list_ids("key_packages")?.into_iter().collect();
         for id in self.0.list_ids("key_packages_public")? {
+            if !private.contains(&id) {
+                continue;
+            }
             if let Some(msg) =
                 self.0
                     .open_read("key_packages_public", KEY_PACKAGE_PUBLIC_AAD_LABEL, &id)?
@@ -590,9 +688,12 @@ impl SealedKeyPackageStore {
 impl mls_rs_core::key_package::KeyPackageStorage for SealedKeyPackageStore {
     type Error = StorageError;
 
+    /// The public half goes first. A crash between the two deletes then
+    /// leaves a private half nobody is offered, rather than a public
+    /// half the host would publish again for a package already used.
     fn delete(&mut self, id: &[u8]) -> Result<(), Self::Error> {
-        self.0.delete("key_packages", id)?;
-        self.0.delete("key_packages_public", id)
+        self.0.delete("key_packages_public", id)?;
+        self.0.delete("key_packages", id)
     }
 
     fn insert(&mut self, id: Vec<u8>, pkg: KeyPackageData) -> Result<(), Self::Error> {
@@ -650,6 +751,109 @@ mod tests {
             .open_read("groups", GROUP_AAD_LABEL, &[0xab, 0xcd])
             .expect_err("corrupt file must refuse");
         assert!(err.0.contains("unseal failed"), "unexpected error: {err}");
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SealedStore::open(dir.path().to_str().unwrap(), &[5u8; 32]).unwrap();
+        // A directory where the item belongs: the rename into place fails
+        // after the temp file was written in full.
+        std::fs::create_dir(store.path("groups", &[0xab])).unwrap();
+        store
+            .seal_write("groups", GROUP_AAD_LABEL, &[0xab], b"payload")
+            .expect_err("the rename onto a directory fails");
+        assert_eq!(names_in(&dir.path().join("groups")), vec!["ab".to_owned()]);
+    }
+
+    #[test]
+    fn open_removes_temp_files_left_by_interrupted_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SealedStore::open(dir.path().to_str().unwrap(), &[5u8; 32]).unwrap();
+        store
+            .seal_write("groups", GROUP_AAD_LABEL, &[0xab], b"payload")
+            .unwrap();
+        for sub in ["groups", "key_packages", "key_packages_public"] {
+            std::fs::write(dir.path().join(sub).join("cd.tmp-4242-7"), b"sealed").unwrap();
+        }
+        let reopened = SealedStore::open(dir.path().to_str().unwrap(), &[5u8; 32]).unwrap();
+        assert_eq!(names_in(&dir.path().join("groups")), vec!["ab".to_owned()]);
+        assert!(names_in(&dir.path().join("key_packages")).is_empty());
+        assert!(names_in(&dir.path().join("key_packages_public")).is_empty());
+        assert_eq!(
+            &reopened
+                .open_read("groups", GROUP_AAD_LABEL, &[0xab])
+                .unwrap()
+                .unwrap()[..],
+            b"payload"
+        );
+    }
+
+    #[test]
+    fn only_the_named_targets_temp_files_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["pins.sealed.tmp-1-0", "other.sealed.tmp-1-0", "pins.sealed"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        assert_eq!(
+            remove_interrupted_writes(dir.path(), Some("pins.sealed")).unwrap(),
+            1
+        );
+        assert_eq!(
+            names_in(dir.path()),
+            vec!["other.sealed.tmp-1-0".to_owned(), "pins.sealed".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_consumed_key_package_loses_its_public_half_first() {
+        use mls_rs_core::key_package::KeyPackageStorage as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = SealedStore::open(dir.path().to_str().unwrap(), &[5u8; 32]).unwrap();
+        let mut store = SealedKeyPackageStore(sealed.clone());
+        sealed
+            .seal_write("key_packages", KEY_PACKAGE_AAD_LABEL, &[0x01], b"private")
+            .unwrap();
+        // The public half cannot be deleted (a directory stands in its
+        // place), so the delete stops after its first step.
+        std::fs::create_dir(sealed.path("key_packages_public", &[0x01])).unwrap();
+        std::fs::write(sealed.path("key_packages_public", &[0x01]).join("x"), b"x").unwrap();
+        store
+            .delete(&[0x01])
+            .expect_err("the public half is not deletable");
+        assert_eq!(
+            store.pool_ids().unwrap(),
+            vec![vec![0x01]],
+            "the private half stays until the public half is gone"
+        );
+    }
+
+    #[test]
+    fn a_public_half_without_its_private_half_is_not_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = SealedStore::open(dir.path().to_str().unwrap(), &[5u8; 32]).unwrap();
+        let store = SealedKeyPackageStore(sealed.clone());
+        for id in [[0x01u8], [0x02]] {
+            sealed
+                .seal_write("key_packages", KEY_PACKAGE_AAD_LABEL, &id, b"private")
+                .unwrap();
+            store.insert_public(&id, &[id[0]; 4]).unwrap();
+        }
+        // What an interrupted delete of 0x01 left behind.
+        sealed.delete("key_packages", &[0x01]).unwrap();
+        assert_eq!(
+            store.stored_public_with_ids().unwrap(),
+            vec![(vec![0x02], vec![0x02; 4])]
+        );
     }
 
     #[test]
