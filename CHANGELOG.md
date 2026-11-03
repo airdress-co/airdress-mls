@@ -248,6 +248,13 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
   `RejoinNeeded` for a commit refused for the revocation view). Before,
   the oldest count was dropped, so a stream of envelopes for groups never
   joined kept every count below `MAX_DEFERRALS` and no bound ever fired.
+- Once the client leaves an application or commit for a joined group
+  for a replay, it leaves every later envelope for that group too
+  (`Failed { retryable: true }`) until the held one is processed or given
+  up. Before, a later envelope was processed against the epoch before the
+  held commit, failed, and was acknowledged (`Failed` or `RejoinNeeded`),
+  and lost. The hold is kept in memory; a restart starts without it, as
+  the operator replays from the oldest unacknowledged envelope.
 
 ## v0.6.1 — 2026-10-31
 
