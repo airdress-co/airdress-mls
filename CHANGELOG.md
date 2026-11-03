@@ -102,7 +102,6 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
   - in a group conversation, a member who is not an admin may not change a
     context extension outside the four group extensions
     (`ChangeOtherExtensions`).
-    conversation holds is ignored.
   - `MlsEngine::commit_pending` (and `airdress_mls_commit_pending`)
     refuses proposals staged at an earlier epoch than the group is at, and
     drops them: a `Remove` names a leaf index, which can hold another
@@ -123,6 +122,12 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
     until a root-key lookup is registered (`set_root_key_lookup`,
     `airdress_mls_set_root_key_lookup`), as it already was for the
     revocation lookup. A host that enters the cutover registers both.
+- `airdress_mls::rules::MlsRulesError::CrossPersonRemoval` has a second
+  field, `revocable: bool`: whether the revocation witness decided the
+  refusal. A received commit is `RevocationViewStale` only when it is
+  `true`; a removal no revocation state admits (an owner device, by a
+  household member's device) stays the general engine error, and the
+  client asks to rejoin at once.
 
 ### Added
 
