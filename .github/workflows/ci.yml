@@ -15,7 +15,9 @@ permissions:
 jobs:
   test:
     name: Build, lint and test
-    timeout-minutes: 20
+    # Three builds now (clippy, the instrumented test build, the doc
+    # tests), then the docs and the scan: 20 minutes was a cold-cache risk.
+    timeout-minutes: 30
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -258,20 +260,24 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install nightly --profile minimal
-      - run: cargo +nightly install cargo-fuzz --version 0.13.2 --locked
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: cargo-fuzz@0.13.2
       # The fuzz crate is its own workspace. Its lock is the root lock, so
       # the fuzzer tests the dependency versions that ship.
       - name: Use the workspace lock
         run: cp Cargo.lock fuzz/Cargo.lock
       - name: Build every target
         working-directory: fuzz
-        run: cargo +nightly fuzz build
+        # --target: the prebuilt cargo-fuzz is a musl binary and would
+        # otherwise build for musl, where the sanitizer cannot link.
+        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
       - name: Run each for 30 seconds
         working-directory: fuzz
         run: |
           set -euo pipefail
           for target in $(cargo +nightly fuzz list); do
-            cargo +nightly fuzz run "$target" -- -max_total_time=30
+            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=30
           done
 
   asan:
@@ -285,13 +291,15 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - run: rustup toolchain install nightly --profile minimal
+      - run: rustup toolchain install nightly --profile minimal --component rust-src
+      # std is rebuilt with the sanitizer too (-Zbuild-std), so an overflow
+      # in an alloc path reached across the FFI is seen, and the sanitized
+      # crates never mix with an unsanitized std.
       - name: FFI tests under ASan
         env:
           RUSTFLAGS: -Zsanitizer=address
-          RUSTDOCFLAGS: -Zsanitizer=address
           ASAN_OPTIONS: detect_leaks=1
-        run: cargo +nightly test --locked -p airdress-mls-ffi --lib --target x86_64-unknown-linux-gnu
+        run: cargo +nightly test --locked -Zbuild-std -p airdress-mls-ffi --lib --target x86_64-unknown-linux-gnu
 
   zizmor:
     name: Workflow audit (zizmor)
@@ -304,8 +312,12 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      # Public repository: findings go to the Security tab.
+      # On main, findings go to the Security tab. A pull request's token
+      # cannot write there (a fork's never can), so on a PR the job fails
+      # on a finding instead.
       - uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1
+        with:
+          advanced-security: ${{ github.event_name == 'push' }}
 
   mutants:
     # Advisory: a surviving mutant is a test worth writing, not a merge
@@ -331,7 +343,7 @@ jobs:
         run: |
           set -euo pipefail
           git diff "origin/${BASE_REF}...HEAD" > git.diff
-          cargo mutants --in-diff git.diff --in-place --workspace -- --lib
+          cargo mutants --in-diff git.diff --in-place --workspace
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
