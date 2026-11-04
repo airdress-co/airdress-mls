@@ -702,9 +702,11 @@ impl SealedKeyPackageStore {
             if !private.contains(&id) {
                 continue;
             }
-            if let Some(msg) =
+            // An unreadable one is skipped, not fatal: it cannot be
+            // handed out, and the rest of the pool still can.
+            if let Ok(Some(msg)) =
                 self.0
-                    .open_read("key_packages_public", KEY_PACKAGE_PUBLIC_AAD_LABEL, &id)?
+                    .open_read("key_packages_public", KEY_PACKAGE_PUBLIC_AAD_LABEL, &id)
             {
                 out.push((id, msg.to_vec()));
             }

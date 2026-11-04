@@ -668,7 +668,9 @@ impl MlsEngine {
         let mut store = self.key_packages.clone();
         let mut retired = 0;
         for id in self.key_packages.pool_ids().map_err(|e| e.to_string())? {
-            let Some(data) = store.get(&id).map_err(|e| e.to_string())? else {
+            // One this device cannot unseal is left for its own use to
+            // refuse: an unreadable package must not stop the engine.
+            let Ok(Some(data)) = store.get(&id) else {
                 continue;
             };
             if !leaf_advertises_group_extensions(&data.key_package_bytes) {
