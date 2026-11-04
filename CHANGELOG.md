@@ -22,6 +22,12 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 
 ### Breaking
 
+- Nothing.
+
+## v0.7.0 — 2026-11-04
+
+### Breaking
+
 - **C ABI change, in place: `AirdressRevocationLookupFn`** (the callback
   `airdress_mls_set_revocation_lookup` takes) is now
   `int32_t (*)(const char *subject, const char *device_id)`. This breaks
