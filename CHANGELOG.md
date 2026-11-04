@@ -24,6 +24,22 @@ airdress-cli (both linking `airdress-mls` as a Rust library at a tag).
 
 - Nothing.
 
+## v0.7.1 — 2026-11-04
+
+### Breaking
+
+- Nothing.
+
+### Fixed
+
+- Opening an engine no longer fails when a pooled key package cannot be
+  unsealed (damaged, or sealed under another state key). The sweep that
+  replaces key packages without the group extensions, new in v0.7.0,
+  read every one and stopped at the first it could not read, so the
+  engine did not start at all. It now leaves such a package alone, as
+  before, and `stored_key_packages` skips it rather than failing the
+  whole list.
+
 ## v0.7.0 — 2026-11-04
 
 ### Breaking
