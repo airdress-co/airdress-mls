@@ -241,8 +241,13 @@ fn aborting_with_no_commit_pending_still_drops_what_was_staged() {
 /// A key package made the way an engine made them before it advertised
 /// the group extension types: the same store, no `extension_types`.
 fn store_a_package_without_group_extensions(dir: &tempfile::TempDir) {
+    store_a_package_without_group_extensions_under(dir, &STATE_KEY);
+}
+
+/// The same, sealed under `state_key`.
+fn store_a_package_without_group_extensions_under(dir: &tempfile::TempDir, state_key: &[u8; 32]) {
     let store =
-        SealedKeyPackageStore(SealedStore::open(dir.path().to_str().unwrap(), &STATE_KEY).unwrap());
+        SealedKeyPackageStore(SealedStore::open(dir.path().to_str().unwrap(), state_key).unwrap());
     let key = SigningKey::from_bytes(&[42; 32]);
     let identity = SigningIdentity::new(
         BasicCredential::new(b"older-engine".to_vec()).into_credential(),
@@ -314,6 +319,33 @@ fn opening_replaces_key_packages_that_lack_the_group_extensions() {
     assert!(every_stored_package_advertises_the_group_extensions(
         &engine
     ));
+}
+
+/// A pooled key package this device cannot unseal (damaged, or sealed
+/// under another key) is left alone at open, as before the sweep: it
+/// fails on its own when used, and the engine still opens.
+#[test]
+fn opening_skips_a_key_package_it_cannot_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let current = device(ALICE, "alice-phone", 1, &dir)
+        .stored_key_packages()
+        .unwrap();
+    store_a_package_without_group_extensions_under(&dir, &[8u8; 32]);
+    let files = |sub: &str| std::fs::read_dir(dir.path().join(sub)).unwrap().count();
+    let (private, public) = (files("key_packages"), files("key_packages_public"));
+
+    let engine = device(ALICE, "alice-phone", 1, &dir);
+    assert_eq!(
+        engine.stored_key_packages().unwrap(),
+        current,
+        "the unreadable package is not handed out"
+    );
+    assert_eq!(
+        files("key_packages"),
+        private,
+        "the unreadable half was deleted"
+    );
+    assert_eq!(files("key_packages_public"), public);
 }
 
 #[test]
